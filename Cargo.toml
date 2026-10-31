@@ -10,10 +10,10 @@ winresource = "0.1.34"
 [dependencies]
 # system_clipboard включает обмен с буфером ОС (arboard) вместо
 # внутреннего буфера процесса: без него Ctrl+C/Ctrl+V работали бы только внутри игры. Крейты уже в lock-файле.
-bevy = { version = "0.20.0", default-features = false, features = ["2d", "ui", "audio", "system_clipboard", "bevy_anti_alias", "smaa_luts", "zstd_rust", "sysinfo_plugin"] }
+bevy = { version = "0.20.1", default-features = false, features = ["2d", "3d_api", "bevy_pbr", "ui", "audio", "system_clipboard", "bevy_anti_alias", "smaa_luts", "zstd_rust", "sysinfo_plugin"] }
 # Форматы декодера bevy_audio (rodio/symphonia).
 # Без нужной фичи звук падает НЕ на загрузке, а на воспроизведении.
-bevy_audio = { version = "0.20.0", default-features = false, features = ["mp3", "wav", "vorbis"] }
+bevy_audio = { version = "0.20.1", default-features = false, features = ["mp3", "wav", "vorbis"] }
 
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 # Версия та же, что тянет bevy 0.20 через bevy_winit: нужна для прямой
@@ -54,4 +54,3 @@ lto = "fat"
 #lto = "thin"
 codegen-units = 1
 #strip = "symbols"
-

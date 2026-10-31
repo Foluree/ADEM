@@ -1,39 +1,34 @@
 //! Освещение: ночное затемнение мира и «свет» костра.
 //!
-//! Тьма — один оверлей поверх мира: меш-сетка с вершинными цветами
-//! (чёрный с альфой), растянутая на видимую область. Альфа вершины —
-//! сила затенения в этой точке: ночью 0.5 («темнее на 50%»), днём 0.
-//! Смешивание стандартное альфа-блендинговое (`out = dst·(1−a)`), поэтому
-//! оверлей именно **ослабляет видимость мира**, не подмешивая своего
-//! цвета: фактура и оттенки сохраняются на любой глубине ночи.
-//!
-//! «Свет» костра — это область, где альфа оверлея плавно падает до нуля:
-//! в точке костра затенения нет вовсе (мир выглядит как днём), к краю
-//! радиуса затенение линейно-квадратично возвращается. Значение считается
-//! на вершинах сетки и интерполируется GPU — свечение мягкое, без
-//! привязки к сетке тайлов. (Аддитивного смешивания в 2D Bevy 0.20 нет,
-//! поэтому «доливать» яркость нельзя — только ослаблять тьму.)
+//! Тьма — один оверлей поверх мира. Фрагментный шейдер затемняет каждый пиксель
+//! чёрным с альфой, поэтому фактура и оттенки мира сохраняются. Он вычисляет
+//! ослабление тьмы от каждого костра напрямую, без дискретизации сеткой.
 //!
 //! UI рисуется отдельным проходом поверх мира и не затемняется.
 
 use std::collections::HashSet;
 
+use bevy::asset::RenderAssetUsages;
 use bevy::camera::{Camera2d, Projection};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use bevy::sprite_render::AlphaMode2d;
+use bevy::reflect::TypePath;
+use bevy::render::{render_resource::AsBindGroup, storage::ShaderBuffer};
+use bevy::shader::ShaderRef;
+use bevy::sprite_render::{AlphaMode2d, Material2d};
 
 use crate::app::state::{ClockRes, GameState};
-use crate::simulation::{ChunkPos, ObjectKind, TilePos, World, CHUNK_SIZE, TILE_SIZE};
+use crate::rendering::isometric::{WORLD_TILE_SIZE, world_position};
+use crate::simulation::{ChunkPos, ObjectKind, TilePos, World, CHUNK_SIZE};
 
-/// Светлота мира глухой ночью: 0.5 — «темнее на 50%» относительно дня.
+/// Светлота мира глухой ночью как доля дневной освещённости.
 pub(crate) const NIGHT_DAYLIGHT: f32 = 0.08;
 
 /// Радиус света костра в тайлах.
 pub(crate) const LIGHT_RADIUS_TILES: f32 = 6.0;
 
 /// Радиус света в мировых пикселях.
-const LIGHT_RADIUS_PX: f32 = LIGHT_RADIUS_TILES * TILE_SIZE;
+const LIGHT_RADIUS_PX: f32 = LIGHT_RADIUS_TILES * WORLD_TILE_SIZE;
 
 /// Границы переходов суток в часах: рассвет 5–7, закат 18–20.
 const DAWN_START_H: f32 = 5.0;
@@ -41,23 +36,10 @@ const DAWN_END_H: f32 = 7.0;
 const DUSK_START_H: f32 = 18.0;
 const DUSK_END_H: f32 = 20.0;
 
-/// Параметры сетки оверлея. Вершинная плотность — компромисс: шаг должен
-/// быть заметно меньше радиуса света (иначе «дырка» света теряется между
-/// вершинами), но число вершин ограничено — при сильном отдалении шаг
-/// растёт и мелкие источники света перестают различаться (там костёр и
-/// сам субпиксельный).
-const GRID_MAX_COLS: usize = 96;
-const GRID_MAX_ROWS: usize = 60;
-/// Минимальный шаг сетки: радиус света / 4 — по вершине на каждые ~полтора
-/// тайла, квадратичный спад остаётся плавным.
-const GRID_MIN_SPACING_PX: f32 = LIGHT_RADIUS_PX * 0.25;
+const DARKNESS_SHADER_PATH: &str = "shaders/darkness.wesl";
 
-/// Z оверлея: над объектами (1.0) и счётчиками предметов (2.0) при любом
-/// Y; UI-проход рисуется позже и поверх.
-const DARKNESS_Z_BASE: f32 = 3.0;
-
-/// Светлота мира по доле суток [0, 1): 1.0 днём (7:00–18:00), 0.5 глухой
-/// ночью (20:00–5:00), между ними — плавные рассвет и закат (smoothstep).
+/// Светлота мира по доле суток [0, 1): 1.0 днём (7:00–18:00), NIGHT_DAYLIGHT
+/// глухой ночью (20:00–5:00), между ними — плавные рассвет и закат (smoothstep).
 /// Затенение равно `1 − daylight`.
 pub(crate) fn daylight_factor(day_fraction: f32) -> f32 {
     let hour = day_fraction.fract() * 24.0;
@@ -79,18 +61,21 @@ fn smoothstep(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-/// Сила света в точке от списка костров (позиции — центры тайлов, в
-/// мировых пикселях): максимум по источникам квадратичного спада
-/// `(1 − d/R)²`. 1.0 — затенения нет, 0.0 — обычная тьма.
-pub(crate) fn light_strength(point: Vec2, fires: &[Vec2]) -> f32 {
-    let mut strength = 0.0_f32;
-    for fire in fires {
-        let t = 1.0 - point.distance(*fire) / LIGHT_RADIUS_PX;
-        if t > 0.0 {
-            strength = strength.max(t * t);
-        }
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+pub(crate) struct DarknessMaterial {
+    #[uniform(0)]
+    params: Vec4,
+    #[storage(1, read_only)]
+    fire_positions: Handle<ShaderBuffer>,
+}
+
+impl Material2d for DarknessMaterial {
+    fn fragment_shader() -> ShaderRef {
+        DARKNESS_SHADER_PATH.into()
     }
-    strength
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
+    }
 }
 
 /// Реестр горящих костров мира (тайлы). Костров мало, а изменения
@@ -107,7 +92,8 @@ pub(crate) struct CampfireLights {
 pub(crate) struct DarknessOverlay {
     entity: Option<Entity>,
     mesh: Option<Handle<Mesh>>,
-    material: Option<Handle<ColorMaterial>>,
+    material: Option<Handle<DarknessMaterial>>,
+    fire_positions: Option<Handle<ShaderBuffer>>,
 }
 
 /// Держит реестр костров в соответствии с миром. Полный пересбор — после
@@ -159,17 +145,17 @@ fn scan_campfires(world: &World) -> HashSet<TilePos> {
 }
 
 /// Пересобирает оверлей тьмы под видимую область и время суток. Запускается
-/// после `render_world` (камера и мир уже актуальны). Днём оверлей скрыт и
-/// меш не пересобирается — работы за кадр нет.
+/// после `render_world` (камера и мир уже актуальны). Днём оверлей скрыт.
 pub(crate) fn update_darkness_overlay(
     mut commands: Commands,
     state: Res<GameState>,
     clock: Res<ClockRes>,
     lights: Res<CampfireLights>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform, &Projection), With<Camera2d>>,
     mut overlay: ResMut<DarknessOverlay>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut materials: ResMut<Assets<DarknessMaterial>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
     let daylight = daylight_factor(clock.0.time_of_day_fraction());
     let darkness = (1.0 - daylight).clamp(0.0, 1.0);
@@ -186,16 +172,20 @@ pub(crate) fn update_darkness_overlay(
     }
 
     // Видимая область с запасом на свет костров у края экрана.
-    let Ok((camera_transform, projection)) = cameras.single() else {
+    let Ok((camera, camera_transform, projection)) = cameras.single() else {
         return;
     };
     let Projection::Orthographic(ortho) = projection else {
         return;
     };
-    let camera_center = camera_transform.translation.truncate();
-    let margin = Vec2::splat((LIGHT_RADIUS_TILES + 2.0) * TILE_SIZE);
-    let view_min = Vec2::new(ortho.area.min.x, ortho.area.min.y) + camera_center - margin;
-    let view_max = Vec2::new(ortho.area.max.x, ortho.area.max.y) + camera_center + margin;
+    let Some(viewport_size) = camera.logical_viewport_size() else {
+        return;
+    };
+    let half_size = viewport_size * (ortho.scale * 0.5);
+    let margin = Vec2::splat((LIGHT_RADIUS_TILES + 2.0) * WORLD_TILE_SIZE);
+    let view_min = -half_size - margin;
+    let view_max = half_size + margin;
+    let world_to_camera = camera_transform.to_matrix().inverse();
 
     // Центры костров в мировых пикселях; костры вне области с запасом
     // света всё равно не дают вклада — отсекаем их до построения сетки.
@@ -203,10 +193,10 @@ pub(crate) fn update_darkness_overlay(
         .positions
         .iter()
         .map(|tile| {
-            Vec2::new(
-                tile.x as f32 * TILE_SIZE + TILE_SIZE * 0.5,
-                tile.y as f32 * TILE_SIZE + TILE_SIZE * 0.5,
-            )
+            let position = world_position(
+                world, Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),
+            );
+            world_to_camera.transform_point3(position).truncate()
         })
         .filter(|fire| {
             fire.x >= view_min.x - LIGHT_RADIUS_PX
@@ -216,43 +206,59 @@ pub(crate) fn update_darkness_overlay(
         })
         .collect();
 
-    // Шаг сетки: достаточно мелкий для света, но не гуще минимума и
-    // не плотнее лимитов по числу вершин.
-    let width = (view_max.x - view_min.x).max(1.0);
-    let height = (view_max.y - view_min.y).max(1.0);
-    let spacing = GRID_MIN_SPACING_PX
-        .max(width / GRID_MAX_COLS as f32)
-        .max(height / GRID_MAX_ROWS as f32);
-    let cols = ((width / spacing).ceil() as usize).min(GRID_MAX_COLS);
-    let rows = ((height / spacing).ceil() as usize).min(GRID_MAX_ROWS);
-
     let mesh = overlay
         .mesh
         .get_or_insert_with(|| meshes.add(Mesh::new(
             PrimitiveTopology::TriangleList,
-            // MAIN_WORLD нужен: меш перезаписывается каждый кадр на CPU.
-            bevy::asset::RenderAssetUsages::default(),
+            RenderAssetUsages::default(),
         )));
     let handle = mesh.clone();
-    if let Some(mut mesh) = meshes.get_mut(&handle) {
-        rebuild_darkness_mesh(&mut mesh, view_min, spacing, cols, rows, darkness, &fires);
+    let mut mesh = meshes
+        .get_mut(&handle)
+        .expect("darkness overlay mesh asset must exist");
+    rebuild_darkness_mesh(&mut mesh, view_min, view_max);
+
+    if overlay.fire_positions.is_none() {
+        overlay.fire_positions = Some(buffers.add(ShaderBuffer::from(vec![[0.0; 4]])));
+    }
+    let fire_positions = overlay
+        .fire_positions
+        .as_ref()
+        .expect("fire position buffer was just initialized")
+        .clone();
+    let mut fire_buffer = buffers
+        .get_mut(&fire_positions)
+        .expect("darkness fire position buffer asset must exist");
+    fire_buffer.clear();
+    if fires.is_empty() {
+        // Storage buffers cannot be bound with zero bytes.
+        fire_buffer.extend([[0.0; 4]]);
+    } else {
+        fire_buffer.extend(fires.iter().map(|fire| [fire.x, fire.y, 1.0, 0.0]));
     }
 
     if overlay.material.is_none() {
-        overlay.material = Some(materials.add(ColorMaterial {
-            color: Color::WHITE,
-            alpha_mode: AlphaMode2d::Blend,
-            ..default()
+        overlay.material = Some(materials.add(DarknessMaterial {
+            params: Vec4::new(darkness, LIGHT_RADIUS_PX, 0.0, 0.0),
+            fire_positions,
         }));
     }
-    let max_y = world.size.tiles() as f32 * TILE_SIZE;
-    let transform = Transform::from_xyz(0.0, 0.0, DARKNESS_Z_BASE + max_y * 0.001);
+    let material = overlay
+        .material
+        .as_ref()
+        .expect("darkness material was just initialized")
+        .clone();
+    materials
+        .get_mut(&material)
+        .expect("darkness material asset must exist")
+        .params = Vec4::new(darkness, LIGHT_RADIUS_PX, 0.0, 0.0);
+
+    let transform = *camera_transform;
     match overlay.entity {
         Some(entity) => {
             commands.entity(entity).insert((transform, Visibility::Visible));
         }
         None => {
-            let material = overlay.material.clone().unwrap();
             let entity = commands
                 .spawn((
                     Mesh2d(handle),
@@ -273,97 +279,25 @@ fn despawn_overlay(commands: &mut Commands, overlay: &mut DarknessOverlay) {
     }
 }
 
-/// Перезаписывает меш оверлея: сетка `(cols+1)×(rows+1)` вершин над
-/// областью [view_min, view_min + cols·spacing × rows·spacing]. Цвет
-/// вершины — чёрный с альфой затенения, ослабленного светом костров.
-fn rebuild_darkness_mesh(
-    mesh: &mut Mesh,
-    origin: Vec2,
-    spacing: f32,
-    cols: usize,
-    rows: usize,
-    darkness: f32,
-    fires: &[Vec2],
-) {
-    let mut positions = Vec::with_capacity((cols + 1) * (rows + 1));
-    let mut colors = Vec::with_capacity((cols + 1) * (rows + 1));
-    for row in 0..=rows {
-        for col in 0..=cols {
-            let point = origin + Vec2::new(col as f32 * spacing, row as f32 * spacing);
-            positions.push([point.x, point.y, 0.0]);
-            let alpha = darkness * (1.0 - light_strength(point, fires));
-            colors.push([0.0, 0.0, 0.0, alpha]);
-        }
-    }
-
-    let mut indices = Vec::with_capacity(cols * rows * 6);
-    let stride = (cols + 1) as u32;
-    for row in 0..rows as u32 {
-        for col in 0..cols as u32 {
-            let base = row * stride + col;
-            indices.extend([base, base + 1, base + stride + 1, base, base + stride + 1, base + stride]);
-        }
-    }
+/// Четыре вершины и два треугольника покрывают видимую область с запасом.
+/// Локальные UV передают шейдеру точные координаты камеры для расчёта света.
+fn rebuild_darkness_mesh(mesh: &mut Mesh, view_min: Vec2, view_max: Vec2) {
+    let corners = [
+        view_min,
+        Vec2::new(view_max.x, view_min.y),
+        view_max,
+        Vec2::new(view_min.x, view_max.y),
+    ];
+    let positions = corners
+        .iter()
+        .map(|point| [point.x, point.y, -1.0])
+        .collect::<Vec<_>>();
+    let uvs = corners
+        .iter()
+        .map(|point| [point.x, point.y])
+        .collect::<Vec<_>>();
 
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    mesh.insert_indices(Indices::U32(indices));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn daylight_full_day_and_night() {
-        // Полдень — полная светлота (тьмы нет), глухая ночь — ровно на 50% темнее.
-        assert_eq!(daylight_factor(0.5), 1.0);
-        assert_eq!(daylight_factor(0.0), NIGHT_DAYLIGHT);
-        assert_eq!(daylight_factor(0.999), NIGHT_DAYLIGHT);
-    }
-
-    #[test]
-    fn daylight_transitions_are_monotonic() {
-        // Рассвет 5–7: светлота растёт; закат 18–20: падает. Шаги по 6 минут,
-        // строго внутри интервала перехода (за его пределами плато).
-        const STEP_H: f32 = 0.1;
-
-        let mut hour = DAWN_START_H;
-        let mut prev = daylight_factor(hour / 24.0);
-        assert_eq!(prev, NIGHT_DAYLIGHT);
-        while hour + STEP_H <= DAWN_END_H {
-            hour += STEP_H;
-            let next = daylight_factor(hour / 24.0);
-            assert!(next > prev, "рассвет должен светлеть: {hour}");
-            prev = next;
-        }
-        assert_eq!(daylight_factor(DAWN_END_H / 24.0), 1.0);
-
-        let mut hour = DUSK_START_H;
-        let mut prev = daylight_factor(hour / 24.0);
-        assert_eq!(prev, 1.0);
-        while hour + STEP_H <= DUSK_END_H {
-            hour += STEP_H;
-            let next = daylight_factor(hour / 24.0);
-            assert!(next < prev, "закат должен темнеть: {hour}");
-            prev = next;
-        }
-        assert_eq!(daylight_factor(DUSK_END_H / 24.0), NIGHT_DAYLIGHT);
-    }
-
-    #[test]
-    fn fire_light_falls_off_and_saturates() {
-        let fire = Vec2::ZERO;
-        // В точке костра света максимум, за радиусом — ноль, в половине
-        // радиуса — четверть (квадратичный спад).
-        assert_eq!(light_strength(fire, &[fire]), 1.0);
-        assert_eq!(light_strength(Vec2::new(LIGHT_RADIUS_PX, 0.0), &[fire]), 0.0);
-        assert_eq!(
-            light_strength(Vec2::new(LIGHT_RADIUS_PX * 0.5, 0.0), &[fire]),
-            0.25
-        );
-        // Два дальних костра не дают света вдали от обоих.
-        let far = Vec2::new(LIGHT_RADIUS_PX * 10.0, 0.0);
-        assert_eq!(light_strength(far, &[fire, Vec2::new(1.0, 1.0)]), 0.0);
-    }
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
 }

@@ -8,13 +8,15 @@
 use std::collections::{HashMap, HashSet};
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::{Camera2d, Projection};
+use bevy::camera::{Camera, Camera2d, Projection};
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::sprite_render::{AlphaMode2d, ColorMaterial};
 
 use crate::app::input::{WeaponFx, WeaponFxKind};
+use crate::app::camera::update_camera_transforms;
 use crate::app::state::{GameMode, GameState, PlayerRes, SimTick, TickAccumulator, player_render_pos};
+use crate::rendering::isometric::{WORLD_TILE_SIZE, world_position};
 use crate::simulation::time::TICKS_PER_SEC;
 use crate::simulation::{ItemKind, ProjectileKind, StuckSpear, TILE_SIZE};
 
@@ -50,28 +52,7 @@ const THRUST_SPRITE_TILES: f32 = 0.8;
 const THROWN_SPEAR_SPRITE_TILES: f32 = 0.9;
 /// Размер текстуры лука относительно тайла (вдвое меньше прежнего показа).
 const BOW_SPRITE_TILES: f32 = 0.5;
-/// Насколько эффект оружия поднимается над z-формулой существ: эффект
-/// должен рисоваться поверх спрайта игрока.
-const FX_Z_LIFT: f32 = 0.05;
-/// Запасной z, пока мир не создан (эффекты всё равно не спавнятся).
-const FALLBACK_FX_Z: f32 = 2.5;
-
-/// Z эффекта оружия в точке `y` (мировые px): та же формула z-сортировки,
-/// что у существ и игрока (`z = 1 + (max_y − y)·0.001`), плюс небольшой
-/// подъём. Фиксированная константа была бы ошибкой: z игрока растёт по
-/// мере удаления от верхнего края карты, и на большой карте эффект
-/// рисовался бы под спрайтом игрока.
-fn weapon_fx_z(y: f32, max_y: f32) -> f32 {
-    1.0 + (max_y - y) * 0.001 + FX_Z_LIFT
-}
-
-/// Верх карты в мировых пикселях (для z-формулы); `None` — мир не создан.
-fn world_max_y(state: &GameState) -> Option<f32> {
-    state
-        .world
-        .as_ref()
-        .map(|w| w.size.tiles() as f32 * TILE_SIZE)
-}
+/// Насколько эффект оружия сдвинут к камере, чтобы перекрыть спрайт игрока.
 /// Цвет следа: серо-белый, полупрозрачный (альфа 0.5 в начале взмаха).
 const SWING_COLOR: Color = Color::srgba(0.85, 0.85, 0.9, 0.5);
 
@@ -82,7 +63,7 @@ struct WeaponFxEffect {
     duration: f32,
     kind: WeaponFxKind,
     /// Точка, откуда эффект (центр игрока при применении).
-    origin: Vec2,
+    origin: Vec3,
     /// Направление на прицел (радианы).
     aim_angle: f32,
     /// Для лезвия: угол в начале анимации (прицел минус полдуги).
@@ -126,6 +107,7 @@ fn spawn_weapon_fx(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     textures: Res<TileTextures>,
+    cameras: Query<&Transform, With<Camera2d>>,
     overlay: Query<(Entity, &WeaponFxEffect)>,
     mut commands: Commands,
 ) {
@@ -133,9 +115,18 @@ fn spawn_weapon_fx(
         .mesh
         .get_or_insert_with(|| meshes.add(build_swing_mesh()))
         .clone();
-    let max_y = world_max_y(&state);
+    let Ok(camera_transform) = cameras.single() else {
+        return;
+    };
+    let camera_rotation = camera_transform.rotation;
     for fx_msg in messages.read() {
-        let aim_angle = (fx_msg.aim.y - fx_msg.origin.y).atan2(fx_msg.aim.x - fx_msg.origin.x);
+        let Some(world) = state.world.as_ref() else {
+            continue;
+        };
+        let origin = world_position(world, fx_msg.origin / TILE_SIZE);
+        let aim = world_position(world, fx_msg.aim / TILE_SIZE);
+        let aim_local = camera_rotation.inverse() * (aim - origin);
+        let aim_angle = aim_local.y.atan2(aim_local.x);
         // Предмет поверх игрока (копьё, лук) показывается одним эффектом:
         // новая анимация прерывает предыдущую, иначе при быстрых кликах
         // текстуры плодились бы поверх игрока.
@@ -157,18 +148,13 @@ fn spawn_weapon_fx(
                 commands.spawn((
                     Mesh2d(mesh.clone()),
                     MeshMaterial2d(material.clone()),
-                    Transform::from_xyz(
-                        fx_msg.origin.x,
-                        fx_msg.origin.y,
-                        max_y.map(|m| weapon_fx_z(fx_msg.origin.y, m))
-                            .unwrap_or(FALLBACK_FX_Z),
-                    )
-                    .with_rotation(Quat::from_rotation_z(start_angle)),
+                    Transform::from_translation(origin + camera_rotation * Vec3::Z * FX_Z_LIFT)
+                        .with_rotation(camera_rotation * Quat::from_rotation_z(start_angle)),
                     WeaponFxEffect {
                         age: 0.0,
                         duration: BLADE_DURATION_SECS,
                         kind: WeaponFxKind::Blade,
-                        origin: fx_msg.origin,
+                        origin,
                         aim_angle,
                         start_angle,
                     },
@@ -198,13 +184,8 @@ fn spawn_weapon_fx(
                         custom_size: Some(Vec2::splat(TILE_SIZE * size)),
                         ..default()
                     },
-                    Transform::from_xyz(
-                        fx_msg.origin.x,
-                        fx_msg.origin.y,
-                        max_y.map(|m| weapon_fx_z(fx_msg.origin.y, m))
-                            .unwrap_or(FALLBACK_FX_Z),
-                    )
-                    .with_rotation(Quat::from_rotation_z(rotation)),
+                    Transform::from_translation(origin + camera_rotation * Vec3::Z * FX_Z_LIFT)
+                        .with_rotation(camera_rotation * Quat::from_rotation_z(rotation)),
                     WeaponFxEffect {
                         age: 0.0,
                         duration: match fx_msg.kind {
@@ -212,7 +193,7 @@ fn spawn_weapon_fx(
                             _ => BOW_SHOT_FX_TICKS / TICKS_PER_SEC as f32,
                         },
                         kind: fx_msg.kind,
-                        origin: fx_msg.origin,
+                        origin,
                         aim_angle,
                         start_angle: aim_angle,
                     },
@@ -232,9 +213,14 @@ fn update_weapon_fx(
     player: Res<PlayerRes>,
     acc: Res<TickAccumulator>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    cameras: Query<&Transform, With<Camera2d>>,
     mut effects: Query<(Entity, &mut WeaponFxEffect, Option<&MeshMaterial2d<ColorMaterial>>)>,
     mut commands: Commands,
 ) {
+    let Ok(camera_transform) = cameras.single() else {
+        return;
+    };
+    let camera_rotation = camera_transform.rotation;
     for (entity, mut effect, material) in &mut effects {
         effect.age += time.delta_secs();
         let progress = (effect.age / effect.duration).clamp(0.0, 1.0);
@@ -245,16 +231,14 @@ fn update_weapon_fx(
             .as_ref()
             .filter(|_| state.mode == GameMode::Player)
             .map(|p| player_render_pos(p, &acc));
-        // Z-сортировка как у существ: эффект всегда чуть выше спрайта
-        // игрока на текущей глубине карты.
-        let max_y = world_max_y(&state);
-        let fx_z = |y: f32| max_y.map(|m| weapon_fx_z(y, m)).unwrap_or(FALLBACK_FX_Z);
         match effect.kind {
             WeaponFxKind::Blade => {
                 let angle = effect.start_angle + BLADE_SWEEP * progress;
                 commands.entity(entity).insert(
-                    Transform::from_xyz(effect.origin.x, effect.origin.y, fx_z(effect.origin.y))
-                        .with_rotation(Quat::from_rotation_z(angle)),
+                    Transform::from_translation(
+                        effect.origin + camera_rotation * Vec3::Z * FX_Z_LIFT,
+                    )
+                    .with_rotation(camera_rotation * Quat::from_rotation_z(angle)),
                 );
                 if let Some(material) = material
                     && let Some(mut material) = materials.get_mut(&material.0)
@@ -269,10 +253,14 @@ fn update_weapon_fx(
                 // ориентацию после первого кадра анимации.
                 let offset = (std::f32::consts::PI * progress).sin() * THRUST_REACH_PX;
                 let (sin, cos) = effect.aim_angle.sin_cos();
-                let (x, y) = (effect.origin.x + cos * offset, effect.origin.y + sin * offset);
+                let position = effect.origin
+                    + camera_rotation * Vec3::new(cos * offset, sin * offset, 0.0)
+                    + camera_rotation * Vec3::Z * FX_Z_LIFT;
                 commands.entity(entity).insert(
-                    Transform::from_xyz(x, y, fx_z(y))
-                    .with_rotation(Quat::from_rotation_z(effect.aim_angle - SPRITE_ANGLE_OFFSET)),
+                    Transform::from_translation(position).with_rotation(
+                        camera_rotation
+                            * Quat::from_rotation_z(effect.aim_angle - SPRITE_ANGLE_OFFSET),
+                    ),
                 );
             }
             WeaponFxKind::Bow => {
@@ -284,12 +272,18 @@ fn update_weapon_fx(
                     commands.entity(entity).despawn();
                     continue;
                 };
-                let (x, y) = (p.x * TILE_SIZE, p.y * TILE_SIZE);
+                let Some(world) = state.world.as_ref() else {
+                    continue;
+                };
+                let position = world_position(world, Vec2::new(p.x, p.y))
+                    + camera_rotation * Vec3::Z * FX_Z_LIFT;
                 commands.entity(entity).insert(
-                    Transform::from_xyz(x, y, fx_z(y))
-                        .with_rotation(Quat::from_rotation_z(
-                            effect.aim_angle - SPRITE_ANGLE_OFFSET + BOW_EXTRA_ROTATION,
-                        )),
+                    Transform::from_translation(position).with_rotation(
+                        camera_rotation
+                            * Quat::from_rotation_z(
+                                effect.aim_angle - SPRITE_ANGLE_OFFSET + BOW_EXTRA_ROTATION,
+                            ),
+                    ),
                 );
             }
         }
@@ -315,14 +309,14 @@ const ARROW_LINE_PX: f32 = 10.0;
 /// Толщина линии стрелы на ЭКРАНЕ в пикселях — не масштабируется зумом:
 /// мировая толщина пересчитывается из масштаба камеры каждый кадр.
 const ARROW_LINE_SCREEN_PX: f32 = 0.25;
-/// Насколько снаряд визуально приподнят на экране за высоту полёта:
-/// высота в тайлах пересчитывается в мировые пиксели с этим множителем
-/// (топ-даун псевдоперспектива).
+/// Какую долю высоты полёта показывать как мировую высоту снаряда.
 const HEIGHT_LIFT: f32 = 0.75;
 
 /// Оружейные текстуры (копьё, лук) нарисованы направленными вверх-вправо
 /// (≈45°); поправка выравнивает рисунок вдоль направления атаки/полёта.
 const SPRITE_ANGLE_OFFSET: f32 = std::f32::consts::FRAC_PI_4;
+/// Смещение к камере в мировом пространстве, чтобы эффект перекрывал спрайт.
+const FX_Z_LIFT: f32 = 0.1;
 
 /// Общие ресурсы снарядов: меш единичного квадрата и материал линии
 /// стрелы. Материал кэшируется: создание нового каждый кадр оставляло бы
@@ -367,7 +361,7 @@ struct ArrowLine;
 fn update_projectile_sprites(
     mut commands: Commands,
     state: Res<GameState>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform, &Projection), With<Camera2d>>,
     textures: Res<TileTextures>,
     mut fx: ResMut<ProjectileFx>,
     mut sprites: ResMut<ProjectileSprites>,
@@ -380,18 +374,19 @@ fn update_projectile_sprites(
         }
         return;
     };
-    let Ok((camera_transform, projection)) = cameras.single() else {
+    let Ok((camera, camera_transform, projection)) = cameras.single() else {
         return;
     };
     let Projection::Orthographic(ortho) = projection else {
         return;
     };
-    let camera_center = camera_transform.translation.truncate();
-    let margin = Vec2::splat(2.0 * TILE_SIZE);
-    let view_min = Vec2::new(ortho.area.min.x, ortho.area.min.y) + camera_center - margin;
-    let view_max = Vec2::new(ortho.area.max.x, ortho.area.max.y) + camera_center + margin;
-    // Мировая толщина линии стрелы: экранная, делённая на масштаб камеры.
-    let arrow_width = (ARROW_LINE_SCREEN_PX / ortho.scale).clamp(0.1, 64.0);
+    let Some(viewport_size) = camera.logical_viewport_size() else {
+        return;
+    };
+    let camera_global = GlobalTransform::from(*camera_transform);
+    let camera_rotation = camera_transform.rotation;
+    let margin = 2.0 * TILE_SIZE / ortho.scale;
+    let arrow_width = (ARROW_LINE_SCREEN_PX * ortho.scale).clamp(0.1, 64.0);
 
     let arrow_mesh = fx
         .arrow_mesh
@@ -408,25 +403,33 @@ fn update_projectile_sprites(
         })
         .clone();
 
-    let max_y = world.size.tiles() as f32 * TILE_SIZE;
     let mut visible = HashSet::new();
     for projectile in &world.projectiles {
         let pos = projectile.pos();
-        let x = pos.x * TILE_SIZE;
-        let y = pos.y * TILE_SIZE + projectile.height() * TILE_SIZE * HEIGHT_LIFT;
-        if x < view_min.x || x > view_max.x || y < view_min.y || y > view_max.y {
+        let mut world_pos = world_position(world, Vec2::new(pos.x, pos.y));
+        world_pos.z += projectile.height() * WORLD_TILE_SIZE * HEIGHT_LIFT;
+        let Ok(viewport_pos) = camera.world_to_viewport(&camera_global, world_pos) else {
+            continue;
+        };
+        if viewport_pos.x < -margin
+            || viewport_pos.x > viewport_size.x + margin
+            || viewport_pos.y < -margin
+            || viewport_pos.y > viewport_size.y + margin
+        {
             continue;
         }
         visible.insert(projectile.id);
         let heading = projectile.heading();
-        let z = 2.0 + (max_y - y) * 0.001;
+        let heading_vector = camera_rotation.inverse() * Vec3::new(heading.cos(), heading.sin(), 0.0);
+        let screen_heading = heading_vector.y.atan2(heading_vector.x);
+        world_pos += camera_rotation * Vec3::Z * FX_Z_LIFT;
 
         match projectile.kind {
             ProjectileKind::Arrow => {
                 // Линия: единичный квадрат, растянутый трансформом в отрезок
                 // вдоль направления полёта. Меш и материал общие.
-                let transform = Transform::from_xyz(x, y, z)
-                    .with_rotation(Quat::from_rotation_z(heading))
+                let transform = Transform::from_translation(world_pos)
+                    .with_rotation(camera_rotation * Quat::from_rotation_z(screen_heading))
                     .with_scale(Vec3::new(ARROW_LINE_PX, arrow_width, 1.0));
                 match sprites.map.get(&projectile.id).copied() {
                     Some(entity) => {
@@ -451,8 +454,10 @@ fn update_projectile_sprites(
                     custom_size: Some(Vec2::splat(TILE_SIZE * THROWN_SPEAR_SPRITE_TILES)),
                     ..default()
                 };
-                let transform = Transform::from_xyz(x, y, z)
-                    .with_rotation(Quat::from_rotation_z(heading - SPRITE_ANGLE_OFFSET));
+                let transform = Transform::from_translation(world_pos).with_rotation(
+                    camera_rotation
+                        * Quat::from_rotation_z(screen_heading - SPRITE_ANGLE_OFFSET),
+                );
                 match sprites.map.get(&projectile.id).copied() {
                     Some(entity) => {
                         commands.entity(entity).insert((sprite, transform));
@@ -486,7 +491,7 @@ fn update_projectile_sprites(
 fn update_stuck_spear_sprites(
     mut commands: Commands,
     state: Res<GameState>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     textures: Res<TileTextures>,
     mut sprites: ResMut<StuckSpearSprites>,
 ) {
@@ -496,32 +501,34 @@ fn update_stuck_spear_sprites(
         }
         return;
     };
-    let Ok((camera_transform, projection)) = cameras.single() else {
+    let Ok((camera, camera_transform)) = cameras.single() else {
         return;
     };
-    let Projection::Orthographic(ortho) = projection else {
+    let Some(viewport_size) = camera.logical_viewport_size() else {
         return;
     };
-    let camera_center = camera_transform.translation.truncate();
-    let margin = Vec2::splat(2.0 * TILE_SIZE);
-    let view_min = Vec2::new(ortho.area.min.x, ortho.area.min.y) + camera_center - margin;
-    let view_max = Vec2::new(ortho.area.max.x, ortho.area.max.y) + camera_center + margin;
+    let camera_global = GlobalTransform::from(*camera_transform);
+    let camera_rotation = camera_transform.rotation;
+    let margin = 2.0 * TILE_SIZE;
 
-    let max_y = world.size.tiles() as f32 * TILE_SIZE;
     let mut visible = HashSet::new();
     for spear in &world.stuck_spears {
-        let x = spear.pos.x * TILE_SIZE;
-        let y = spear.pos.y * TILE_SIZE;
-        if x < view_min.x || x > view_max.x || y < view_min.y || y > view_max.y {
+        let world_pos = world_position(world, Vec2::new(spear.pos.x, spear.pos.y));
+        let Ok(viewport_pos) = camera.world_to_viewport(&camera_global, world_pos) else {
+            continue;
+        };
+        if viewport_pos.x < -margin
+            || viewport_pos.x > viewport_size.x + margin
+            || viewport_pos.y < -margin
+            || viewport_pos.y > viewport_size.y + margin
+        {
             continue;
         }
         let key = spear_key(spear);
-        if !visible.insert(key) || sprites.map.contains_key(&key) {
-            // Побитовый дубль (второе копьё ровно на том же месте) или
-            // спрайт уже существует: рисовать второй раз нечего.
+        if !visible.insert(key) {
+            // Побитовый дубль (второе копьё ровно на том же месте).
             continue;
         }
-        let z = 1.0 + (max_y - y) * 0.001;
         // Воткнувшееся копьё смотрит туда, куда летело; наклон входа
         // показан лёгким «укорачиванием» спрайта: чем отвеснее падение,
         // тем короче видимая проекция.
@@ -531,10 +538,22 @@ fn update_stuck_spear_sprites(
             custom_size: Some(Vec2::splat(TILE_SIZE * 1.4 * (1.0 - steep * 0.35))),
             ..default()
         };
-        let transform = Transform::from_xyz(x, y, z)
-            .with_rotation(Quat::from_rotation_z(spear.heading - SPRITE_ANGLE_OFFSET));
-        let entity = commands.spawn((sprite, transform)).id();
-        sprites.map.insert(key, entity);
+        let heading_vector = camera_rotation.inverse()
+            * Vec3::new(spear.heading.cos(), spear.heading.sin(), 0.0);
+        let screen_heading = heading_vector.y.atan2(heading_vector.x);
+        let transform = Transform::from_translation(world_pos + camera_rotation * Vec3::Z * FX_Z_LIFT)
+            .with_rotation(
+                camera_rotation * Quat::from_rotation_z(screen_heading - SPRITE_ANGLE_OFFSET),
+            );
+        match sprites.map.get(&key).copied() {
+            Some(entity) => {
+                commands.entity(entity).insert((sprite, transform));
+            }
+            None => {
+                let entity = commands.spawn((sprite, transform)).id();
+                sprites.map.insert(key, entity);
+            }
+        }
     }
 
     let stale: Vec<StuckSpearKey> = sprites
@@ -575,8 +594,17 @@ impl Plugin for CombatFxPlugin {
             .init_resource::<ProjectileFx>()
             .init_resource::<ProjectileSprites>()
             .init_resource::<StuckSpearSprites>()
-            .add_systems(Update, spawn_weapon_fx)
-            .add_systems(Update, update_weapon_fx)
-            .add_systems(Update, (update_projectile_sprites, update_stuck_spear_sprites).after(SimTick));
+            .add_systems(
+                Update,
+                (spawn_weapon_fx, update_weapon_fx)
+                    .chain()
+                    .after(update_camera_transforms),
+            )
+            .add_systems(
+                Update,
+                (update_projectile_sprites, update_stuck_spear_sprites)
+                    .after(SimTick)
+                    .after(update_camera_transforms),
+            );
     }
 }

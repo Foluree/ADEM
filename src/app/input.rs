@@ -4,7 +4,7 @@
 //! UI не меняет мир напрямую: все действия уходят командами в очередь
 //! симуляции (`simulation/commands.rs`).
 
-use bevy::camera::{Camera2d, Projection};
+use bevy::camera::Camera2d;
 use bevy::input::mouse::{MouseButton, MouseMotion};
 use bevy::input_focus::InputFocus;
 use bevy::prelude::*;
@@ -20,6 +20,12 @@ use crate::simulation::items::ItemKind;
 use crate::simulation::objects::{ObjectKind, WorldObject};
 use crate::simulation::player::{Player, WorldPos};
 use crate::simulation::{TILE_SIZE, TilePos, World};
+use crate::rendering::isometric::{
+    WORLD_TILE_SIZE, ground_position_from_viewport, terrain_tile_from_viewport, world_position,
+};
+use crate::rendering::{
+    WOLF_SPRITE_PX, WOLF_VISIBLE_BOTTOM, WOLF_VISIBLE_LEFT, WOLF_VISIBLE_RIGHT, WOLF_VISIBLE_TOP,
+};
 use crate::ui::bottom_panel::{PanelMenu, PanelMenuState};
 use crate::ui::pause_menu::BindingCapture;
 use crate::ui::{BlocksWorldInput, cursor_over_ui, text_input_focused};
@@ -50,7 +56,7 @@ pub struct WeaponFx {
     pub aim: Vec2,
 }
 
-/// Направление движения от биндов WASD (ось X вправо, ось Y вверх).
+/// Направление движения игрока в координатах сетки мира.
 /// Ноль — стоит на месте; нормализация и скорость — в симуляции.
 /// Читается тиковой системой движения, поэтому направление — состояние,
 /// а не поток команд.
@@ -80,6 +86,13 @@ pub(crate) fn move_dir(keys: &ButtonInput<KeyCode>, settings: &Settings) -> (f32
     (x, y)
 }
 
+/// Преобразует экранное направление в диагональные оси изометрической сетки:
+/// экранные вверх/вправо соответствуют (x+y, y-x) в координатах мира.
+fn player_grid_dir(screen_dir: (f32, f32)) -> (f32, f32) {
+    let (screen_x, screen_y) = screen_dir;
+    (screen_x + screen_y, screen_y - screen_x)
+}
+
 /// Минимальный интервал повторной добычи при зажатой ЛКМ, секунды реального
 /// времени (не игрового: ускорение мира не должно превращать удержание
 /// в очередь команд).
@@ -97,7 +110,19 @@ impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PlayerInput>()
             .add_message::<WeaponFx>()
-            .add_systems(Update, (toggle_player_mode, player_move_input, world_click_input, player_drop_input, player_pickup_input, editor_delete_input, editor_entity_drag));
+            .add_systems(
+                Update,
+                (
+                    toggle_player_mode,
+                    player_move_input,
+                    world_click_input,
+                    player_drop_input,
+                    player_pickup_input,
+                    editor_delete_input,
+                    editor_entity_drag,
+                )
+                    .after(crate::app::camera::update_camera_transforms),
+            );
     }
 }
 
@@ -112,7 +137,7 @@ fn toggle_player_mode(
     windows: Query<&Window>,
     mut state: ResMut<GameState>,
     mut player: ResMut<PlayerRes>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
     capture: Res<BindingCapture>,
     focus: Res<InputFocus>,
@@ -167,7 +192,7 @@ fn player_move_input(
     let dir = if text_input_focused(&focus, &text_inputs) || state.active_menu.is_some() {
         (0.0, 0.0)
     } else {
-        move_dir(&keys, &settings)
+        player_grid_dir(move_dir(&keys, &settings))
     };
     input.dir = dir;
 }
@@ -192,7 +217,7 @@ pub(crate) fn world_click_input(
     clock: Res<ClockRes>,
     mut queue: ResMut<CommandQueueRes>,
     mut fx: MessageWriter<WeaponFx>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
     mut drag: Local<Option<TilePos>>,
     mut hold: Local<HarvestHold>,
@@ -269,7 +294,7 @@ pub(crate) fn world_click_input(
     let Some(tile) = cursor_world_tile(window, &cameras, Some(world)) else {
         return;
     };
-    let aim = cursor_world_pos(window, &cameras).unwrap_or_default();
+    let aim = cursor_world_pos(window, &cameras, world).unwrap_or_default();
     let origin = Vec2::new(p.pos.x * TILE_SIZE, p.pos.y * TILE_SIZE);
     let held = p.selected_item();
 
@@ -295,9 +320,7 @@ pub(crate) fn world_click_input(
         {
             *secs += time.delta_secs();
         }
-        if mouse.just_released(MouseButton::Left)
-            && let Some(secs) = spear_hold.take()
-        {
+        if mouse.just_released(MouseButton::Left) && let Some(secs) = spear_hold.take() {
             if secs < SPEAR_THROW_HOLD_SECS {
                 // Укол: анимация выпада только когда кулдаун прошлой атаки
                 // вышел (иначе симуляция удар отклонит, а текстура была бы
@@ -363,7 +386,7 @@ fn player_drop_input(
     state: Res<GameState>,
     mut queue: ResMut<CommandQueueRes>,
     player: Res<PlayerRes>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
     focus: Res<InputFocus>,
     text_inputs: Query<(), With<TextInput>>,
@@ -416,7 +439,7 @@ fn player_pickup_input(
     mut queue: ResMut<CommandQueueRes>,
     player: Res<PlayerRes>,
     mut hold: Local<HarvestHold>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
 ) {
     if state.mode != GameMode::Player || state.paused {
@@ -469,7 +492,7 @@ fn rmb_action(
     queue: &mut CommandQueueRes,
     state: &GameState,
     windows: &Query<&Window>,
-    cameras: &Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: &Query<(&Camera, &Transform), With<Camera2d>>,
 ) {
     let Some(world) = state.world.as_ref() else {
         return;
@@ -519,7 +542,7 @@ pub(crate) fn editor_delete_input(
     state: Res<GameState>,
     menu: Res<PanelMenuState>,
     mut queue: ResMut<CommandQueueRes>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
     mut drag_distance: Local<Option<f32>>,
 ) {
@@ -568,13 +591,10 @@ pub(crate) fn editor_delete_input(
     if cursor_over_ui(window, &blockers) {
         return;
     }
-    let Some(point) = cursor_world_pos(window, &cameras) else {
-        return;
-    };
     let Some(world) = state.world.as_ref() else {
         return;
     };
-    let Some(tile) = world_tile_at(world, point) else {
+    let Some(tile) = cursor_world_tile(window, &cameras, Some(world)) else {
         return;
     };
     match target_class {
@@ -584,29 +604,27 @@ pub(crate) fn editor_delete_input(
             }
         }
         DeleteClass::Entities => {
-            if let Some(id) = entity_at(world, point) {
+            if let Some(id) = entity_at(world, window, &cameras) {
                 queue.0.push(Command::RemoveEntity { id });
             }
         }
     }
 }
 
-/// Перетаскивание существ колёсиком мыши в редакторе: нажатие на существо
-/// «берёт» его, пока кнопка зажата — существо следует за курсором, отпускание
-/// освобождает. Позиция непрерывная (между тайлами), но зажимается в границы
-/// мира. Каждый кадр уходит отдельная команда `MoveEntity`: UI не меняет мир
-/// напрямую, как и остальные действия редактора.
+/// СКМ перетаскивает существо в редакторе: нажатие на него
+/// «берёт» существо, пока кнопка зажата — оно следует за курсором,
+/// отпускание освобождает. Каждый кадр уходит команда `MoveEntity`.
 pub(crate) fn editor_entity_drag(
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
     focus: Res<WindowFocusState>,
     state: Res<GameState>,
     mut queue: ResMut<CommandQueueRes>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
     mut dragged: Local<Option<u64>>,
 ) {
-    // Потеря фокуса окна: отпускание колёсика могло не дойти до игры
+    // Потеря фокуса окна: отпускание кнопки могло не дойти до игры
     // (например, кнопку отпустили в другом окне), поэтому перетаскивание
     // завершаем сразу, не дожидаясь следующего нажатия.
     if state.mode != GameMode::Observer || !focus.focused {
@@ -626,10 +644,10 @@ pub(crate) fn editor_entity_drag(
         let Some(world) = state.world.as_ref() else {
             return;
         };
-        let Some(point) = cursor_world_pos(window, &cameras) else {
+        let Some(_point) = cursor_world_pos(window, &cameras, world) else {
             return;
         };
-        *dragged = entity_at(world, point);
+        *dragged = entity_at(world, window, &cameras);
     }
 
     let Some(id) = *dragged else {
@@ -649,7 +667,7 @@ pub(crate) fn editor_entity_drag(
     // завершает перетаскивание.
     if !cursor_over_ui(window, &blockers)
         && let Some(world) = state.world.as_ref()
-        && let Some(point) = cursor_world_pos(window, &cameras)
+        && let Some(point) = cursor_world_pos(window, &cameras, world)
     {
         // Курсор в пикселях мира, позиция существа — в тайлах. Край мира
         // зажимаем чуть внутрь, чтобы существо не вышло за границу.
@@ -666,59 +684,79 @@ pub(crate) fn editor_entity_drag(
     }
 }
 
-/// Существо, по которому кликнули. Спрайт существа вдвое больше тайла,
-/// поэтому цель выбирается не по тайлу центра, а по расстоянию до точки
-/// клика: ближайшее существо, чей спрайт накрывает эту точку (с допуском
-/// на диагональ спрайта). На одном месте может оказаться несколько
-/// существ — удаляется то, по которому кликнули точнее.
-fn entity_at(world: &World, point: Vec2) -> Option<u64> {
-    // Половина диагонали спрайта 2×2 тайла: (TILE_SIZE·√2) ≈ 1.41 тайла.
-    const PICK_RADIUS: f32 = TILE_SIZE * 1.45;
-    let radius2 = PICK_RADIUS * PICK_RADIUS;
-    let distance2 = |pos: WorldPos| {
-        let dx = pos.x * TILE_SIZE - point.x;
-        let dy = pos.y * TILE_SIZE - point.y;
-        dx * dx + dy * dy
+/// Выбирает существо по прямоугольнику экранного спрайта: луч пересекает
+/// поверхность земли, а не сам спрайт, поднятый над тайлом.
+fn entity_at(
+    world: &World,
+    window: &Window,
+    cameras: &Query<(&Camera, &Transform), With<Camera2d>>,
+) -> Option<u64> {
+    let cursor = window.cursor_position()?;
+    let Ok((camera, camera_transform)) = cameras.single() else {
+        return None;
     };
-    world
-        .entities
-        .iter()
-        .map(|entity| (entity.id, distance2(entity.pos)))
-        .filter(|(_, distance)| *distance <= radius2)
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(id, _)| id)
+    let camera_global = GlobalTransform::from(*camera_transform);
+    let camera_up = camera_transform.rotation * Vec3::Y;
+    let camera_right = camera_transform.rotation * Vec3::X;
+    let half_width = WOLF_SPRITE_PX * (WOLF_VISIBLE_RIGHT - WOLF_VISIBLE_LEFT) * 0.5;
+    let half_height = WOLF_SPRITE_PX * (WOLF_VISIBLE_BOTTOM - WOLF_VISIBLE_TOP) * 0.5;
+    let mut nearest: Option<(u64, f32)> = None;
+
+    for entity in world.entities.iter() {
+        let ground = world_position(world, Vec2::new(entity.pos.x, entity.pos.y));
+        let alpha_center_x = (WOLF_VISIBLE_LEFT + WOLF_VISIBLE_RIGHT) * 0.5;
+        let alpha_center_y = (WOLF_VISIBLE_TOP + WOLF_VISIBLE_BOTTOM) * 0.5;
+        let flip = if entity.facing == crate::simulation::Facing::Left {
+            -1.0
+        } else {
+            1.0
+        };
+        let center = ground
+            + camera_right * (flip * WOLF_SPRITE_PX * (alpha_center_x - 0.5))
+            + camera_up * (WOLF_SPRITE_PX * (WOLF_VISIBLE_BOTTOM - alpha_center_y));
+        let Ok(center_screen) = camera.world_to_viewport(&camera_global, center) else {
+            continue;
+        };
+        let Ok(right_screen) =
+            camera.world_to_viewport(&camera_global, center + camera_right * half_width)
+        else {
+            continue;
+        };
+        let Ok(up_screen) =
+            camera.world_to_viewport(&camera_global, center + camera_up * half_height)
+        else {
+            continue;
+        };
+        let screen_half_width = (right_screen - center_screen).length();
+        let screen_half_height = (up_screen - center_screen).length();
+        let delta = cursor - center_screen;
+        if delta.x.abs() > screen_half_width || delta.y.abs() > screen_half_height {
+            continue;
+        }
+        let distance = delta.length_squared();
+        if nearest.is_none_or(|(_, best)| distance < best) {
+            nearest = Some((entity.id, distance));
+        }
+    }
+
+    nearest.map(|(id, _)| id)
 }
 
-/// Мировая позиция курсора в пикселях. `None` — курсор вне окна или
-/// 2D-камера ещё не готова. Публичная: используется рендером (голограмма
-/// постройки) и меню строительства.
+/// Позиция курсора в прежних единицах симуляции (32 px на тайл).
+/// `None` — луч камеры не пересёк рельеф мира.
 pub(crate) fn cursor_world_pos(
     window: &Window,
-    cameras: &Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: &Query<(&Camera, &Transform), With<Camera2d>>,
+    world: &World,
 ) -> Option<Vec2> {
     let cursor = window.cursor_position()?;
-    let Ok((transform, projection)) = cameras.single() else {
+    let Ok((camera, transform)) = cameras.single() else {
         return None;
     };
-    let Projection::Orthographic(ortho) = projection else {
-        return None;
-    };
-
-    // Курсор — в логических пикселях окна; смещение от центра экрана
-    // умножается на масштаб ортокамеры (как в панорамировании camera.rs).
-    // Ось Y курсора растёт вниз, мировая — вверх.
-    let half = Vec2::new(window.width(), window.height()) * 0.5;
-    let offset = Vec2::new(cursor.x - half.x, half.y - cursor.y) * ortho.scale;
-    Some(transform.translation.xy() + offset)
-}
-
-/// Тайл мира по мировой позиции. `None` — за границами карты (камера
-/// может смотреть и мимо мира).
-fn world_tile_at(world: &World, point: Vec2) -> Option<TilePos> {
-    let size = world.size.tiles() as i32;
-    let tx = (point.x / TILE_SIZE).floor() as i32;
-    let ty = (point.y / TILE_SIZE).floor() as i32;
-    (tx >= 0 && ty >= 0 && tx < size && ty < size).then_some(TilePos { x: tx, y: ty })
+    let point = ground_position_from_viewport(
+        camera, &GlobalTransform::from(*transform), cursor, world,
+    )?;
+    Some(point.truncate() / WORLD_TILE_SIZE * TILE_SIZE)
 }
 
 /// Тайл мира под курсором окна. `None` — курсор вне окна или за границами
@@ -726,8 +764,21 @@ fn world_tile_at(world: &World, point: Vec2) -> Option<TilePos> {
 /// рендером (голограмма постройки) и меню строительства.
 pub(crate) fn cursor_world_tile(
     window: &Window,
-    cameras: &Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: &Query<(&Camera, &Transform), With<Camera2d>>,
     world: Option<&World>,
 ) -> Option<TilePos> {
-    world_tile_at(world?, cursor_world_pos(window, cameras)?)
+    let world = world?;
+    let cursor = window.cursor_position()?;
+    let Ok((camera, transform)) = cameras.single() else {
+        return None;
+    };
+    let tile = terrain_tile_from_viewport(
+        camera, &GlobalTransform::from(*transform), cursor, world,
+    )?;
+    let size = world.size.tiles() as i32;
+    (tile.x >= 0 && tile.y >= 0 && tile.x < size && tile.y < size).then_some(tile)
 }
+
+#[cfg(test)]
+#[path = "../tests/input.rs"]
+mod tests;

@@ -327,7 +327,7 @@ fn construction_place_input(
     state: Res<GameState>,
     construction: Res<ConstructionUi>,
     mut queue: ResMut<CommandQueueRes>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
     mut drag: Local<Option<crate::simulation::TilePos>>,
 ) {

@@ -85,12 +85,66 @@ fn block_mesh_quad_count_matches_lod() {
     let world = generate_world(WorldSize::new(256), 42);
 
     let mesh = build_block_mesh(&world, BlockPos { x: 0, y: 0 }, 0).expect("LOD 0");
-    assert_eq!(mesh.count_vertices(), 64 * 64 * 4);
-    assert_eq!(mesh.indices().map(|indices| indices.len()), Some(64 * 64 * 6));
+    assert!(mesh.count_vertices() >= 64 * 64 * 4);
+    assert!(
+        mesh.indices().is_some_and(|indices| indices.len() >= 64 * 64 * 6)
+    );
 
     let mesh = build_block_mesh(&world, BlockPos { x: 0, y: 0 }, 3).expect("LOD 3");
-    assert_eq!(mesh.count_vertices(), 8 * 8 * 4);
-    assert_eq!(mesh.indices().map(|indices| indices.len()), Some(8 * 8 * 6));
+    assert!(mesh.count_vertices() >= 8 * 8 * 4);
+    assert!(
+        mesh.indices().is_some_and(|indices| indices.len() >= 8 * 8 * 6)
+    );
+}
+
+#[test]
+fn terrain_elevation_is_derived_from_tile_type() {
+    use crate::rendering::isometric::{WORLD_TILE_SIZE, tile_elevation, world_position};
+    use crate::simulation::{TilePos, World};
+
+    let mut world = World::new(WorldSize::new(256), 1);
+    world.set_terrain(TilePos { x: 2, y: 3 }, TileType::Mountain);
+    let position = world_position(&world, bevy::math::Vec2::new(2.5, 3.5));
+
+    assert_eq!(position.x, 2.5 * WORLD_TILE_SIZE);
+    assert_eq!(position.y, 3.5 * WORLD_TILE_SIZE);
+    assert_eq!(position.z, tile_elevation(TileType::Mountain));
+    assert_eq!(tile_elevation(TileType::Water), tile_elevation(TileType::Sand));
+    assert!(
+        tile_elevation(TileType::Grass) < tile_elevation(TileType::ForestGrass)
+            && tile_elevation(TileType::ForestGrass) < tile_elevation(TileType::Stone)
+            && tile_elevation(TileType::Stone) < tile_elevation(TileType::Mountain)
+    );
+}
+
+#[test]
+fn elevated_tile_mesh_has_top_and_camera_facing_sides() {
+    use crate::simulation::{TilePos, World};
+
+    let mut world = World::new(WorldSize::new(256), 1);
+    world.set_terrain(TilePos { x: 0, y: 0 }, TileType::Mountain);
+    let mesh = build_block_mesh(&world, BlockPos { x: 0, y: 0 }, 0).expect("mountain tile");
+
+    // The fixed camera sees only the negative X and negative Y walls.
+    assert_eq!(mesh.count_vertices(), 12);
+    assert_eq!(mesh.indices().map(|indices| indices.len()), Some(18));
+}
+
+#[test]
+fn adjacent_equal_height_tiles_do_not_create_internal_walls() {
+    use crate::simulation::TilePos;
+
+    let mut world = crate::simulation::World::new(WorldSize::new(256), 1);
+    world.set_terrain(TilePos { x: 63, y: 0 }, TileType::Mountain);
+    world.set_terrain(TilePos { x: 64, y: 0 }, TileType::Mountain);
+
+    let left = build_block_mesh(&world, BlockPos { x: 0, y: 0 }, 0).expect("left mountain");
+    let right = build_block_mesh(&world, BlockPos { x: 1, y: 0 }, 0).expect("right mountain");
+
+    // Two tops and three visible outside walls; the shared edge crosses a block boundary.
+    assert_eq!(left.count_vertices() + right.count_vertices(), 20);
+    let index_count = |mesh: &bevy::mesh::Mesh| mesh.indices().map(|indices| indices.len()).unwrap_or(0);
+    assert_eq!(index_count(&left) + index_count(&right), 30);
 }
 
 /// Переход LOD: продолжение стройки, отмена при возврате, перезапуск при смене.

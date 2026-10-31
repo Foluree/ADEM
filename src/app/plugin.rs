@@ -11,7 +11,7 @@ use bevy::winit::{UpdateMode, WinitSettings};
 use std::time::Duration;
 
 use crate::app::audio::AudioPlugin;
-use crate::app::camera::CameraPlugin;
+use crate::app::camera::{CameraPlugin, OverlayCamera, WorldCamera};
 use crate::app::input::InputPlugin;
 use crate::app::saves::SavesPlugin;
 use crate::app::settings::{
@@ -267,7 +267,7 @@ pub struct TickEvent {
 /// паузе. Изменённые тайлы уходят в `dirty_tiles`, по ним рендер
 /// перестраивает terrain-блоки; вокруг них перезапускаются цепочки
 /// растительности.
-fn apply_commands(
+pub(crate) fn apply_commands(
     mut queue: ResMut<CommandQueueRes>,
     mut state: ResMut<GameState>,
     mut player: ResMut<PlayerRes>,
@@ -369,7 +369,7 @@ fn apply_window_mode(settings: Res<Settings>, mut windows: Query<&mut Window>) {
     }
 }
 
-/// Применяет режим сглаживания из настроек к 2D-камере.
+/// Применяет режим сглаживания к обеим камерам сцены.
 ///
 /// Идемпотентно: пишем только при расхождении, поэтому систему можно
 /// держать включённой всегда — настройка из settings.json применится
@@ -379,7 +379,10 @@ fn apply_window_mode(settings: Res<Settings>, mut windows: Query<&mut Window>) {
 fn apply_antialias(
     settings: Res<Settings>,
     mut commands: Commands,
-    cameras: Query<(Entity, Option<&Msaa>, Has<Fxaa>, Has<Smaa>), With<Camera2d>>,
+    cameras: Query<
+        (Entity, Option<&Msaa>, Has<Fxaa>, Has<Smaa>),
+        Or<(With<WorldCamera>, With<OverlayCamera>)>,
+    >,
 ) {
     for (entity, msaa, has_fxaa, has_smaa) in &cameras {
         let (want_msaa, want_fxaa, want_smaa) = match settings.antialias {

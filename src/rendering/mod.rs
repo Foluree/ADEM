@@ -16,8 +16,9 @@ use bevy::image::ImageSampler;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::sprite_render::AlphaMode2d;
+use bevy::sprite_render::Material2dPlugin;
 
+use crate::app::camera::WorldCamera;
 use crate::app::input::{PlayerInput, cursor_world_tile};
 use crate::app::state::{GameMode, GameState, PlayerRes, SimTick, TickAccumulator, interpolate_pos, player_render_pos};
 use crate::simulation::commands::buildable_at;
@@ -26,10 +27,13 @@ use crate::simulation::{ChunkPos, EntityKind, Facing, ObjectKind, TerrainTiles, 
 use crate::ui::UiFont;
 use crate::ui::construction::ConstructionUi;
 
+pub(crate) mod isometric;
+
 mod combat;
 mod lighting;
 mod textures;
 
+use isometric::{WORLD_TILE_SIZE, tile_elevation, world_position};
 use textures::TileTextures;
 
 /// Сторона terrain-блока в тайлах. 64 делит все поддерживаемые размеры мира.
@@ -43,7 +47,7 @@ pub(crate) const TARGET_CELL_PX: f32 = 2.0;
 pub(crate) const MAX_LOD: u32 = 6;
 
 /// Размер одного тайла в исходных PNG.
-const ATLAS_TILE_PX: u32 = 16;
+const ATLAS_TILE_PX: u32 = 32;
 
 /// Ширина повтора краёв вокруг тайла в атласе (защита от bleeding).
 const ATLAS_GUTTER_PX: u32 = 2;
@@ -70,15 +74,17 @@ const BUILD_BLOCKS_BASE: usize = 4;
 const BUILD_BLOCKS_MAX: usize = 32;
 
 /// Запас вокруг видимой области, в тайлах (деревья выступают за свой тайл).
-const VIEW_MARGIN_TILES: f32 = 2.0;
+const VIEW_MARGIN_TILES: f32 = 10.0;
 
 pub struct RenderingPlugin;
 
 impl Plugin for RenderingPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, textures::load_tile_textures)
+        app.add_plugins(Material2dPlugin::<lighting::DarknessMaterial>::default())
+            .add_systems(Startup, textures::load_tile_textures)
             .init_resource::<TerrainRender>()
             .init_resource::<EntitySprites>()
+            .init_resource::<WorldSpriteAssets>()
             .init_resource::<HurtFlashes>()
             .init_resource::<lighting::CampfireLights>()
             .init_resource::<lighting::DarknessOverlay>()
@@ -91,16 +97,32 @@ impl Plugin for RenderingPlugin {
                     // новый LOD мог изменить набор этих сущностей.
                     update_item_count_labels,
                 )
-                    .chain(),
+                    .chain()
+                    .after(crate::app::camera::update_camera_transforms),
             )
             // Реестр костров сверяется с миром до render_world: тот изымает
             // dirty-тайлы, по которым отслеживаются новые и потухшие костры.
-            .add_systems(Update, lighting::update_campfire_positions.before(render_world))
-            .add_systems(Update, (update_player_sprite, update_entity_sprites).after(SimTick))
+            .add_systems(
+                Update,
+                lighting::update_campfire_positions
+                    .after(crate::app::plugin::apply_commands)
+                    .before(render_world),
+            )
+            .add_systems(
+                Update,
+                (update_player_sprite, update_entity_sprites)
+                    .after(SimTick)
+                    .after(crate::app::camera::update_camera_transforms),
+            )
             // Оверлей тьмы поверх мира ( lighting): после перестройки блоков,
             // чтобы камера и мир были актуальны.
-            .add_systems(Update, lighting::update_darkness_overlay.after(update_item_count_labels))
-            .add_systems(Update, update_build_hologram)
+            .add_systems(
+                Update,
+                lighting::update_darkness_overlay
+                    .after(update_item_count_labels)
+                    .after(crate::app::camera::update_camera_transforms),
+            )
+            .add_systems(Update, update_build_hologram.after(crate::app::camera::update_camera_transforms))
             // Боевые визуализации: след взмаха, снаряды, воткнутые копья.
             .add_plugins(combat::CombatFxPlugin);
     }
@@ -110,6 +132,8 @@ impl Plugin for RenderingPlugin {
 struct BuiltBlock {
     entity: Entity,
     mesh: Option<Handle<Mesh>>,
+    lod: u32,
+    fallback: bool,
 }
 
 /// Координаты terrain-блока в сетке блоков.
@@ -122,7 +146,7 @@ pub(crate) struct BlockPos {
 /// Состояние рендера мира: материал, активные блоки и переход LOD.
 #[derive(Resource, Default)]
 struct TerrainRender {
-    material: Option<Handle<ColorMaterial>>,
+    material: Option<Handle<StandardMaterial>>,
     /// Готовая сцена текущего LOD: видимые блоки.
     active: HashMap<BlockPos, BuiltBlock>,
     /// Строящаяся сцена нового LOD; активная остаётся на экране до её готовности.
@@ -163,6 +187,13 @@ struct EntitySprites {
     map: HashMap<u64, Entity>,
 }
 
+/// Общий quad и материалы для world-space спрайтов с depth test.
+#[derive(Resource, Default)]
+struct WorldSpriteAssets {
+    quad: Option<Handle<Mesh>>,
+    materials: HashMap<(AssetId<Image>, bool), Handle<StandardMaterial>>,
+}
+
 /// Сколько секунд после удара существо подсвечивается красным.
 const HURT_FLASH_SECS: f32 = 0.33;
 /// Подсветка урона: красный поверх текстуры с 60% альфы.
@@ -180,7 +211,11 @@ struct HurtFlashes {
 /// Размер спрайта волка в пикселях мира. Текстура 128×128, но рисунок
 /// занимает её центр (тело — около 1/3 кадра), поэтому два тайла дают
 /// зверя длиной примерно в тайл, сопоставимо с игроком.
-const WOLF_SPRITE_PX: f32 = TILE_SIZE * 2.0;
+pub(crate) const WOLF_SPRITE_PX: f32 = TILE_SIZE * 2.0;
+pub(crate) const WOLF_VISIBLE_BOTTOM: f32 = 80.0 / 128.0;
+pub(crate) const WOLF_VISIBLE_TOP: f32 = 45.0 / 128.0;
+pub(crate) const WOLF_VISIBLE_LEFT: f32 = 40.0 / 128.0;
+pub(crate) const WOLF_VISIBLE_RIGHT: f32 = 92.0 / 128.0;
 
 /// Размер спрайта игрока в пикселях мира (текстура 64×64 масштабируется
 /// до тайла; объекты масштабируются отдельно — см. `object_sprite_size`).
@@ -199,13 +234,49 @@ const ITEM_COUNT_WORLD_PX: f32 = ITEM_COUNT_FONT_SIZE * ITEM_COUNT_SCALE;
 /// пиксель, текст не показывается (и не спавнится на крупных LOD).
 const ITEM_COUNT_MIN_SCREEN_PX: f32 = 4.0;
 
+fn world_sprite_quad(
+    meshes: &mut Assets<Mesh>,
+    sprite_assets: &mut WorldSpriteAssets,
+) -> Handle<Mesh> {
+    sprite_assets
+        .quad
+        .get_or_insert_with(|| meshes.add(Rectangle::new(1.0, 1.0)))
+        .clone()
+}
+
+fn world_sprite_material(
+    texture: &Handle<Image>,
+    hurt_tint: bool,
+    sprite_assets: &mut WorldSpriteAssets,
+    materials: &mut Assets<StandardMaterial>,
+) -> Handle<StandardMaterial> {
+    sprite_assets
+        .materials
+        .entry((texture.id(), hurt_tint))
+        .or_insert_with(|| {
+            materials.add(StandardMaterial {
+                base_color: if hurt_tint { HURT_TINT } else { Color::WHITE },
+                base_color_texture: Some(texture.clone()),
+                alpha_mode: if hurt_tint {
+                    AlphaMode::Blend
+                } else {
+                    AlphaMode::Mask(0.5)
+                },
+                cull_mode: None,
+                unlit: true,
+                ..default()
+            })
+        })
+        .clone()
+}
+
 /// Собирает атлас из загруженных PNG и создаёт общий материал.
 /// Пока не все текстуры загружены, материал не создаётся.
 fn ensure_ground_material(
     mut render: ResMut<TerrainRender>,
     textures: Res<TileTextures>,
     mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     if render.material.is_some() {
         return;
@@ -215,14 +286,15 @@ fn ensure_ground_material(
     };
 
     let atlas = images.add(atlas);
-    render.material = Some(materials.add(ColorMaterial {
-        texture: Some(atlas),
-        alpha_mode: AlphaMode2d::Opaque,
+    render.material = Some(materials.add(StandardMaterial {
+        base_color_texture: Some(atlas),
+        alpha_mode: AlphaMode::Opaque,
+        unlit: true,
         ..default()
     }));
 }
 
-/// Собирает атлас 4×3 из одиннадцати тайлов с повтором краёв.
+/// Собирает атлас 4×3 из одиннадцати 32×32 тайлов с повтором краёв.
 /// Возвращает `None`, пока хотя бы одна исходная текстура не загружена.
 fn build_atlas_image(textures: &TileTextures, images: &Assets<Image>) -> Option<Image> {
     let mut data = vec![0_u8; (ATLAS_WIDTH * ATLAS_HEIGHT * 4) as usize];
@@ -260,7 +332,7 @@ fn tile_pixels(image: &Image) -> Option<&[u8]> {
     image.data.as_deref()
 }
 
-/// Записывает одну ячейку атласа: тайл 8×8 и повтор его краёв по 2 пикселя.
+/// Записывает одну ячейку атласа и повторяет её края в гуттере.
 /// Если исходных пикселей нет, ячейка заливается запасным цветом.
 fn write_atlas_cell(data: &mut [u8], index: u32, pixels: Option<&[u8]>, fallback: [u8; 4]) {
     let cell_x = (index % ATLAS_COLUMNS) * ATLAS_CELL_PX;
@@ -311,10 +383,12 @@ fn render_world(
     mut state: ResMut<GameState>,
     mut render: ResMut<TerrainRender>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut sprite_assets: ResMut<WorldSpriteAssets>,
     images: Res<Assets<Image>>,
     textures: Res<TileTextures>,
     font: Res<UiFont>,
-    camera: Query<(&Transform, &Projection), With<Camera2d>>,
+    camera: Query<(&Camera, &Transform, &Projection), With<WorldCamera>>,
 ) {
     // Мир перегенерирован: убираем обе сцены и начинаем с нуля.
     if state.pending_rerender {
@@ -339,55 +413,50 @@ fn render_world(
     let Some(material) = render.material.clone() else {
         return;
     };
-    // Точечная перестройка блоков с изменёнными тайлами (инструменты
-    // редактора, добыча игрока): блок пересобирается целиком, вместе
-    // с дочерними объектами.
-    if !dirty.is_empty() {
-        rebuild_dirty_blocks(
-            &mut commands,
-            &mut meshes,
-            &images,
-            world,
-            &material,
-            &textures,
-            &font,
-            &dirty,
-            &mut render,
-        );
-    }
-    let Ok((camera_transform, projection)) = camera.single() else {
+    let Ok((camera, camera_transform, projection)) = camera.single() else {
         return;
     };
     let Projection::Orthographic(ortho) = projection else {
         return;
     };
+    // Точечная перестройка блоков с изменёнными тайлами (инструменты редактора, добыча игрока): 
+    // блок пересобирается целиком, вместе с дочерними объектами.
+    if !dirty.is_empty() {
+        rebuild_dirty_blocks(
+            &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world,
+            &material, camera_transform.rotation, &textures, &font, &dirty, &mut render,
+        );
+    }
     if ortho.area.width() <= 0.0 || ortho.area.height() <= 0.0 {
         return;
     }
-
-    let camera_center = camera_transform.translation.truncate();
-    let margin = Vec2::splat(VIEW_MARGIN_TILES * TILE_SIZE);
-    let view_min = Vec2::new(ortho.area.min.x, ortho.area.min.y) + camera_center - margin;
-    let view_max = Vec2::new(ortho.area.max.x, ortho.area.max.y) + camera_center + margin;
-
-    let Some((bx0, by0, bx1, by1)) =
-        visible_block_range(view_min, view_max, render.blocks_per_side)
-    else {
-        clear_all_blocks(&mut commands, &mut meshes, &mut render);
+    let Some(viewport_size) = camera.logical_viewport_size() else {
         return;
     };
+    // Проверяем проекцию 3D-границ каждого блока, а не пересечения лучей
+    // только по углам viewport. Это остаётся консервативным для любого
+    // промежуточного рельефа и не теряет блоки при панорамировании.
+    let world_tiles = world.size.tiles() as i32;
+    let half_view = viewport_size * (ortho.scale * 0.5);
+    let margin = VIEW_MARGIN_TILES * WORLD_TILE_SIZE;
+    let mut visible = Vec::new();
+    collect_visible_blocks(
+        0, 0, render.blocks_per_side, render.blocks_per_side, world_tiles, 
+        camera_transform, half_view, margin, ortho.near, ortho.far, &mut visible,
+    );
+    if visible.is_empty() {
+        clear_all_blocks(&mut commands, &mut meshes, &mut render);
+        return;
+    }
 
     // Строим недостающие блоки от центра экрана наружу, с бюджетом на кадр.
-    let mut visible = Vec::with_capacity(((bx1 - bx0 + 1) * (by1 - by0 + 1)) as usize);
-    for by in by0..=by1 {
-        for bx in bx0..=bx1 {
-            visible.push(BlockPos { x: bx, y: by });
-        }
-    }
-    let view_center = (view_min + view_max) * 0.5;
+    let forward = camera_transform.rotation * -Vec3::Z;
+    let view_center = camera_transform.translation  +  forward * (-camera_transform.translation.z / forward.z);
+    let view_center = view_center.truncate();
     visible.sort_by(|a, b| {
         block_distance_sq(*a, view_center).total_cmp(&block_distance_sq(*b, view_center))
     });
+    let visible_set: HashSet<BlockPos> = visible.iter().copied().collect();
 
     let lod = lod_for_scale(ortho.scale);
 
@@ -398,25 +467,35 @@ fn render_world(
         LodTransition::Start => {
             drop_incoming(&mut commands, &mut meshes, &mut render);
             render.incoming = Some(IncomingLod {
-                lod,
-                blocks: HashMap::new(),
+                lod, blocks: HashMap::new(),
             });
+        }
+    }
+    // Новая часть viewport сразу получает дешёвый плоский placeholder,
+    // вместо чёрного фона на время построения полноразмерного блока.
+    for block in visible.iter().copied() {
+        if !render.active.contains_key(&block) {
+            let fallback = build_fallback_block(
+                &mut commands, &mut meshes, world, &material, block,
+            );
+            render.active.insert(block, fallback);
         }
     }
 
     // Убираем блоки активной сцены, которые перестали быть видимыми.
-    let stale: Vec<BlockPos> = render
-        .active
-        .keys()
-        .copied()
-        .filter(|pos| pos.x < bx0 || pos.x > bx1 || pos.y < by0 || pos.y > by1)
-        .collect();
-    for pos in stale {
-        if let Some(block) = render.active.remove(&pos) {
-            despawn_block(&mut commands, &mut meshes, block);
+    if render.incoming.is_none() {
+        let stale: Vec<BlockPos> = render
+            .active
+            .keys()
+            .copied()
+            .filter(|pos| !visible_set.contains(pos))
+            .collect();
+        for pos in stale {
+            if let Some(block) = render.active.remove(&pos) {
+                despawn_block(&mut commands, &mut meshes, block);
+            }
         }
     }
-
     let budget = (BUILD_BLOCKS_BASE << lod.min(3)).min(BUILD_BLOCKS_MAX);
     let mut built_now = 0_usize;
 
@@ -428,11 +507,19 @@ fn render_world(
             if built_now >= budget {
                 break;
             }
-            if render.active.contains_key(&block) {
+            let needs_rebuild = render
+                .active
+                .get(&block)
+                .is_some_and(|built| built.fallback || built.lod != lod);
+            if !needs_rebuild {
                 continue;
             }
+            if let Some(old) = render.active.remove(&block) {
+                despawn_block(&mut commands, &mut meshes, old);
+            }
             let built = build_block(
-                &mut commands, &mut meshes, &images, world, &material, &textures, &font, block, lod,
+                &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world,
+                &material, camera_transform.rotation, &textures, &font, block, lod,
             );
             render.active.insert(block, built);
             built_now += 1;
@@ -460,9 +547,10 @@ fn render_world(
                 continue;
             }
             let built = build_block(
-                &mut commands, &mut meshes, &images, world, &material, &textures, &font, block,
-                incoming_lod,
+                &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world, &material, 
+                camera_transform.rotation, &textures, &font, block, incoming_lod,
             );
+            commands.entity(built.entity).insert(Visibility::Hidden);
             blocks.insert(block, built);
             built_now += 1;
             missing -= 1;
@@ -472,7 +560,7 @@ fn render_world(
     }
     if swap_ready {
         promote_incoming(
-            &mut commands, &mut meshes, &mut render, bx0, by0, bx1, by1,
+            &mut commands, &mut meshes, &mut render, &visible_set,
         );
     }
 }
@@ -496,10 +584,7 @@ fn promote_incoming(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     render: &mut TerrainRender,
-    bx0: i32,
-    by0: i32,
-    bx1: i32,
-    by1: i32,
+    visible: &HashSet<BlockPos>,
 ) {
     let Some(incoming) = render.incoming.take() else {
         return;
@@ -508,9 +593,10 @@ fn promote_incoming(
         despawn_block(commands, meshes, block);
     }
     for (pos, block) in incoming.blocks {
-        if pos.x < bx0 || pos.x > bx1 || pos.y < by0 || pos.y > by1 {
+        if !visible.contains(&pos) {
             despawn_block(commands, meshes, block);
         } else {
+            commands.entity(block.entity).insert(Visibility::Visible);
             render.active.insert(pos, block);
         }
     }
@@ -529,17 +615,20 @@ fn clear_all_blocks(
     drop_incoming(commands, meshes, render);
 }
 
-/// Перестраивает terrain-блоки, содержащие изменённые тайлы, — и в активной
-/// сцене, и в строящейся нового LOD, если блок там уже построен. Блок
-/// пересобирается целиком: объекты — дети сущности блока, так что и они
-/// подхватят изменения. Вне бюджета построения: пользовательских правок
-/// за кадр немного, а видимость результата должна быть мгновенной.
+/// Перестраивает terrain-блоки, содержащие изменённые тайлы, и блоки справа
+/// или сверху, чьи видимые боковые грани зависят от изменённой высоты.
+/// Блок пересобирается целиком: объекты — дети сущности блока, так что и
+/// они подхватят изменения. Вне бюджета построения: правок за кадр немного,
+/// а видимость результата должна быть мгновенной.
 fn rebuild_dirty_blocks(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    sprite_assets: &mut WorldSpriteAssets,
     images: &Assets<Image>,
     world: &World,
-    material: &Handle<ColorMaterial>,
+    material: &Handle<StandardMaterial>,
+    camera_rotation: Quat,
     textures: &TileTextures,
     font: &Res<UiFont>,
     dirty: &[TilePos],
@@ -547,10 +636,19 @@ fn rebuild_dirty_blocks(
 ) {
     let mut blocks: HashSet<BlockPos> = HashSet::with_capacity(dirty.len());
     for tile in dirty {
-        blocks.insert(BlockPos {
+        let block = BlockPos {
             x: tile.x.div_euclid(BLOCK_TILES),
             y: tile.y.div_euclid(BLOCK_TILES),
-        });
+        };
+        blocks.insert(block);
+        let local_x = tile.x.rem_euclid(BLOCK_TILES);
+        let local_y = tile.y.rem_euclid(BLOCK_TILES);
+        if local_x == BLOCK_TILES - 1 {
+            blocks.insert(BlockPos { x: block.x + 1, y: block.y });
+        }
+        if local_y == BLOCK_TILES - 1 {
+            blocks.insert(BlockPos { x: block.x, y: block.y + 1 });
+        }
     }
 
     let stale: Vec<BlockPos> = render
@@ -562,7 +660,9 @@ fn rebuild_dirty_blocks(
     for pos in stale {
         if let Some(block) = render.active.remove(&pos) {
             despawn_block(commands, meshes, block);
-            let built = build_block(commands, meshes, images, world, material, textures, font, pos, render.lod);
+            let built = build_block(
+                commands, meshes, materials, sprite_assets, images, world, material, camera_rotation, textures, font, pos, render.lod,
+            );
             render.active.insert(pos, built);
         }
     }
@@ -579,7 +679,10 @@ fn rebuild_dirty_blocks(
             if let Some(block) = incoming.blocks.remove(&pos) {
                 despawn_block(commands, meshes, block);
                 let built =
-                    build_block(commands, meshes, images, world, material, textures, font, pos, lod);
+                    build_block(
+                        commands, meshes, materials, sprite_assets, images, world, material, camera_rotation, textures, font, pos, lod,
+                    );
+                commands.entity(built.entity).insert(Visibility::Hidden);
                 incoming.blocks.insert(pos, built);
             }
         }
@@ -598,36 +701,53 @@ fn update_player_sprite(
     acc: Res<TickAccumulator>,
     input: Res<PlayerInput>,
     textures: Res<TileTextures>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut sprite_assets: ResMut<WorldSpriteAssets>,
+    camera: Query<&Transform, (With<Camera2d>, Without<PlayerSprite>)>,
     mut last_flip: Local<bool>,
-    mut existing: Query<(Entity, &mut Transform, &mut Sprite), With<PlayerSprite>>,
+    mut existing: Query<(Entity, &mut Transform), With<PlayerSprite>>,
 ) {
-    if input.dir.0 < 0.0 {
+    let screen_horizontal = input.dir.0 - input.dir.1;
+    if screen_horizontal < 0.0 {
         *last_flip = true;
-    } else if input.dir.0 > 0.0 {
+    } else if screen_horizontal > 0.0 {
         *last_flip = false;
     }
 
-    let Some(p) = player.0.as_ref().filter(|_| state.mode == GameMode::Player) else {
-        for (entity, _, _) in &mut existing {
+    let Some(world) = state.world.as_ref() else {
+        for (entity, _) in &mut existing {
             commands.entity(entity).despawn();
         }
         return;
     };
-    let transform = player_transform(&player_render_pos(p, &acc), state.world_size.tiles());
+    let Some(p) = player.0.as_ref().filter(|_| state.mode == GameMode::Player) else {
+        for (entity, _) in &mut existing {
+            commands.entity(entity).despawn();
+        }
+        return;
+    };
+    let Ok(camera_transform) = camera.single() else {
+        return;
+    };
+    let transform = player_transform(
+        &player_render_pos(p, &acc),
+        world,
+        camera_transform.rotation,
+        *last_flip,
+    );
+    let texture = textures.player_texture();
+    let material = world_sprite_material(texture, false, &mut sprite_assets, &mut materials);
+    let quad = world_sprite_quad(&mut meshes, &mut sprite_assets);
     let mut updated = false;
-    for (_, mut tf, mut sprite) in &mut existing {
+    for (_, mut tf) in &mut existing {
         *tf = transform;
-        sprite.flip_x = *last_flip;
         updated = true;
     }
     if !updated {
         commands.spawn((
-            Sprite {
-                image: textures.player_texture().clone(),
-                custom_size: Some(Vec2::splat(PLAYER_SPRITE_PX)),
-                flip_x: *last_flip,
-                ..default()
-            },
+            Mesh3d(quad),
+            MeshMaterial3d(material),
             transform,
             PlayerSprite,
         ));
@@ -644,9 +764,12 @@ fn update_entity_sprites(
     acc: Res<TickAccumulator>,
     time: Res<Time>,
     textures: Res<TileTextures>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut sprite_assets: ResMut<WorldSpriteAssets>,
     mut sprites: ResMut<EntitySprites>,
     mut flashes: ResMut<HurtFlashes>,
-    camera: Query<(&Transform, &Projection), With<Camera2d>>,
+    camera: Query<(&Camera, &Transform, &Projection), With<Camera2d>>,
 ) {
     let Some(world) = state.world.as_ref() else {
         for (_, entity) in sprites.map.drain() {
@@ -659,15 +782,18 @@ fn update_entity_sprites(
         flashes.timers.clear();
         return;
     };
-    let Ok((camera_transform, projection)) = camera.single() else {
+    let Ok((camera, camera_transform, projection)) = camera.single() else {
         return;
     };
     let Projection::Orthographic(ortho) = projection else {
         return;
     };
-    if ortho.area.width() <= 0.0 || ortho.area.height() <= 0.0 {
+    let Some(viewport_size) = camera.logical_viewport_size() else {
         return;
-    }
+    };
+    let sprite_margin_px = WOLF_SPRITE_PX / ortho.scale;
+    let quad = world_sprite_quad(&mut meshes, &mut sprite_assets);
+    let camera_global = GlobalTransform::from(*camera_transform);
 
     // Таймеры вспышек урона гаснут по реальному времени.
     let delta = time.delta_secs();
@@ -676,18 +802,18 @@ fn update_entity_sprites(
         *timer > 0.0
     });
 
-    let camera_center = camera_transform.translation.truncate();
-    let margin = Vec2::splat(VIEW_MARGIN_TILES * TILE_SIZE);
-    let view_min = Vec2::new(ortho.area.min.x, ortho.area.min.y) + camera_center - margin;
-    let view_max = Vec2::new(ortho.area.max.x, ortho.area.max.y) + camera_center + margin;
-
-    let world_tiles = world.size.tiles();
     let mut visible = HashSet::with_capacity(world.entities.len());
     for entity in world.entities.iter() {
         let pos = interpolate_pos(entity.prev_pos, entity.pos, &acc);
-        let x = pos.x * TILE_SIZE;
-        let y = pos.y * TILE_SIZE;
-        if x < view_min.x || x > view_max.x || y < view_min.y || y > view_max.y {
+        let world_pos = world_position(world, Vec2::new(pos.x, pos.y));
+        let Ok(viewport_pos) = camera.world_to_viewport(&camera_global, world_pos) else {
+            continue;
+        };
+        if viewport_pos.x < -sprite_margin_px
+            || viewport_pos.x > viewport_size.x + sprite_margin_px
+            || viewport_pos.y < -sprite_margin_px
+            || viewport_pos.y > viewport_size.y + sprite_margin_px
+        {
             continue;
         }
         visible.insert(entity.id);
@@ -698,21 +824,25 @@ fn update_entity_sprites(
             flashes.timers.insert(entity.id, HURT_FLASH_SECS);
         }
 
-        let sprite = Sprite {
-            image: textures.entity_texture(entity).clone(),
-            custom_size: Some(entity_sprite_size(entity.kind)),
-            flip_x: entity.facing == Facing::Left,
-            ..default()
-        };
-        let transform = entity_transform(&pos, world_tiles);
+        let texture = textures.entity_texture(entity);
+        let material = world_sprite_material(texture, false, &mut sprite_assets, &mut materials);
+        let transform = entity_transform(
+            &pos,
+            world,
+            camera_transform.rotation,
+            entity_sprite_size(entity.kind),
+            entity.facing == Facing::Left,
+        );
 
         match sprites.map.get(&entity.id).copied() {
             Some(bevy_entity) => {
-                commands.entity(bevy_entity).insert((sprite, transform));
+                commands
+                    .entity(bevy_entity)
+                    .insert((MeshMaterial3d(material), transform));
             }
             None => {
                 let bevy_entity = commands
-                    .spawn((sprite, transform, EntitySprite))
+                    .spawn((Mesh3d(quad.clone()), MeshMaterial3d(material), transform, EntitySprite))
                     .id();
                 sprites.map.insert(entity.id, bevy_entity);
             }
@@ -723,28 +853,22 @@ fn update_entity_sprites(
         let hurt = flashes.timers.contains_key(&entity.id);
         match flashes.overlays.get(&entity.id).copied() {
             Some(overlay) if hurt => {
-                let overlay_sprite = Sprite {
-                    image: textures.entity_texture(entity).clone(),
-                    custom_size: Some(entity_sprite_size(entity.kind)),
-                    color: HURT_TINT,
-                    flip_x: entity.facing == Facing::Left,
-                    ..default()
-                };
-                commands.entity(overlay).insert((overlay_sprite, transform));
+                let material =
+                    world_sprite_material(texture, true, &mut sprite_assets, &mut materials);
+                commands
+                    .entity(overlay)
+                    .insert((MeshMaterial3d(material), transform));
             }
             Some(overlay) => {
                 flashes.overlays.remove(&entity.id);
                 commands.entity(overlay).despawn();
             }
             None if hurt => {
-                let overlay_sprite = Sprite {
-                    image: textures.entity_texture(entity).clone(),
-                    custom_size: Some(entity_sprite_size(entity.kind)),
-                    color: HURT_TINT,
-                    flip_x: entity.facing == Facing::Left,
-                    ..default()
-                };
-                let overlay = commands.spawn((overlay_sprite, transform)).id();
+                let material =
+                    world_sprite_material(texture, true, &mut sprite_assets, &mut materials);
+                let overlay = commands
+                    .spawn((Mesh3d(quad.clone()), MeshMaterial3d(material), transform))
+                    .id();
                 flashes.overlays.insert(entity.id, overlay);
             }
             None => {}
@@ -770,13 +894,22 @@ fn update_entity_sprites(
     }
 }
 
-/// Позиция спрайта существа: та же Z-формула, что у игрока и объектов
-/// (сортировка «за/перед» по Y, GAME_DESIGN 3.2).
-fn entity_transform(pos: &WorldPos, world_tiles: u32) -> Transform {
-    let x = pos.x * TILE_SIZE;
-    let y = pos.y * TILE_SIZE;
-    let z = 1.0 + (world_tiles as f32 * TILE_SIZE - y) * 0.001;
-    Transform::from_xyz(x, y, z)
+/// Спрайт существа развёрнут к камере и стоит на поверхности тайла.
+fn entity_transform(
+    pos: &WorldPos,
+    world: &World,
+    camera_rotation: Quat,
+    size: Vec2,
+    flip_x: bool,
+) -> Transform {
+    let location = world_position(world, Vec2::new(pos.x, pos.y));
+    let camera_up = camera_rotation * Vec3::Y;
+    //let visible_bottom = 200.0 / 256.0;
+    let mut transform =
+        Transform::from_translation(location + camera_up * (size.y * 0.5))
+            .with_rotation(camera_rotation);
+    transform.scale = Vec3::new(if flip_x { -size.x } else { size.x }, size.y, 1.0);
+    transform
 }
 
 /// Размер спрайта животного в пикселях мира.
@@ -788,11 +921,25 @@ fn entity_sprite_size(kind: EntityKind) -> Vec2 {
 
 /// Позиция спрайта игрока (в тайлах, уже интерполированная). Z повторяет
 /// формулу объектов — сортировка «за/перед» по Y (2.5D, GAME_DESIGN 3.2).
-fn player_transform(p: &WorldPos, world_tiles: u32) -> Transform {
-    let x = p.x * TILE_SIZE;
-    let y = p.y * TILE_SIZE;
-    let z = 1.0 + (world_tiles as f32 * TILE_SIZE - y) * 0.001;
-    Transform::from_xyz(x, y, z)
+fn player_transform(
+    p: &WorldPos,
+    world: &World,
+    camera_rotation: Quat,
+    flip_x: bool,
+) -> Transform {
+    let location = world_position(world, Vec2::new(p.x, p.y));
+    let camera_up = camera_rotation * Vec3::Y;
+    let visible_bottom = 234.0 / 256.0;
+    let mut transform = Transform::from_translation(
+        location + camera_up * (PLAYER_SPRITE_PX * (visible_bottom - 0.5)),
+    )
+    .with_rotation(camera_rotation);
+    transform.scale = Vec3::new(
+        if flip_x { -PLAYER_SPRITE_PX } else { PLAYER_SPRITE_PX },
+        PLAYER_SPRITE_PX,
+        1.0,
+    );
+    transform
 }
 
 /// Деспавнит сущность блока и освобождает его меш.
@@ -807,9 +954,12 @@ fn despawn_block(commands: &mut Commands, meshes: &mut Assets<Mesh>, block: Buil
 fn build_block(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    sprite_assets: &mut WorldSpriteAssets,
     images: &Assets<Image>,
     world: &World,
-    material: &Handle<ColorMaterial>,
+    material: &Handle<StandardMaterial>,
+    camera_rotation: Quat,
     textures: &TileTextures,
     font: &Res<UiFont>,
     block: BlockPos,
@@ -824,18 +974,97 @@ fn build_block(
         TerrainBlock,
     ));
     if let Some(handle) = mesh.clone() {
-        entity.insert((Mesh2d(handle), MeshMaterial2d(material.clone())));
+        entity.insert((Mesh3d(handle), MeshMaterial3d(material.clone())));
     }
     // Объекты рисуются только на ближних LOD: дальше они мельче ячейки сетки.
     if lod <= 1 {
-        spawn_objects(&mut entity, images, world, block, origin, world.size.tiles(), textures);
-        spawn_items(&mut entity, world, block, origin, world.size.tiles(), textures, &font.0);
+        spawn_objects(
+            &mut entity, meshes, materials, sprite_assets, images, world, block, origin, camera_rotation, textures,
+        );
+        spawn_items(
+            &mut entity, meshes, materials, sprite_assets, world, block, origin, camera_rotation, textures, &font.0,
+        );
     }
-
     BuiltBlock {
         entity: entity.id(),
         mesh,
+        lod,
+        fallback: false,
     }
+}
+
+fn build_fallback_block(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    world: &World,
+    material: &Handle<StandardMaterial>,
+    block: BlockPos,
+) -> BuiltBlock {
+    let mesh = build_fallback_block_mesh(world, block).map(|mesh| meshes.add(mesh));
+    let mut entity = commands.spawn((
+        Transform::from_translation(block_origin(block)),
+        Visibility::default(),
+        TerrainBlock,
+    ));
+    if let Some(handle) = mesh.clone() {
+        entity.insert((Mesh3d(handle), MeshMaterial3d(material.clone())));
+    }
+    BuiltBlock {
+        entity: entity.id(),
+        mesh,
+        lod: MAX_LOD,
+        fallback: true,
+    }
+}
+
+fn build_fallback_block_mesh(world: &World, block: BlockPos) -> Option<Mesh> {
+    const SAMPLE_STEP: i32 = 8;
+    let base_x = block.x * BLOCK_TILES;
+    let base_y = block.y * BLOCK_TILES;
+    let world_tiles = world.size.tiles() as i32;
+    let mut counts = [0_u32; TILE_KIND_COUNT];
+
+    for y in (0..BLOCK_TILES).step_by(SAMPLE_STEP as usize) {
+        for x in (0..BLOCK_TILES).step_by(SAMPLE_STEP as usize) {
+            let tile = TilePos {
+                x: base_x + x,
+                y: base_y + y,
+            };
+            if tile.x >= world_tiles || tile.y >= world_tiles {
+                continue;
+            }
+            if let Some(index) = tile_atlas_index(world.terrain_kind(tile)) {
+                counts[index as usize] += 1;
+            }
+        }
+    }
+    let kind = kind_for_atlas_index(dominant_atlas_index(&counts)?)?;
+    let index = tile_atlas_index(kind)?;
+    let elevation = tile_elevation(kind);
+    let width_tiles = (world_tiles - base_x).clamp(0, BLOCK_TILES) as f32;
+    let height_tiles = (world_tiles - base_y).clamp(0, BLOCK_TILES) as f32;
+    let points = [
+        [0.0, 0.0, elevation],
+        [width_tiles * WORLD_TILE_SIZE, 0.0, elevation],
+        [
+            width_tiles * WORLD_TILE_SIZE,
+            height_tiles * WORLD_TILE_SIZE,
+            elevation,
+        ],
+        [0.0, height_tiles * WORLD_TILE_SIZE, elevation],
+    ];
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, points.to_vec());
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_UV_0,
+        atlas_uv_coordinates(index).to_vec(),
+    );
+    mesh.insert_indices(Indices::U32([0, 1, 2, 0, 2, 3].into()));
+    mesh.compute_normals();
+    Some(mesh)
 }
 
 /// Сколько блоков по стороне нужно для мира из `tiles` тайлов.
@@ -843,47 +1072,117 @@ fn blocks_per_side(tiles: i32) -> i32 {
     (tiles + BLOCK_TILES - 1) / BLOCK_TILES
 }
 
-/// Пересечение видимой области с сеткой блоков.
-/// Возвращает `(bx0, by0, bx1, by1)` или `None`, если мир вне экрана.
-fn visible_block_range(
-    min: Vec2,
-    max: Vec2,
-    blocks_per_side: i32,
-) -> Option<(i32, i32, i32, i32)> {
-    if blocks_per_side <= 0 {
-        return None;
+fn collect_visible_blocks(
+    bx0: i32,
+    by0: i32,
+    bx1: i32,
+    by1: i32,
+    world_tiles: i32,
+    camera: &Transform,
+    half_view: Vec2,
+    margin: f32,
+    near: f32,
+    far: f32,
+    visible: &mut Vec<BlockPos>,
+) {
+    if bx0 >= bx1 || by0 >= by1 || !block_region_intersects_view( bx0, by0, bx1, by1, world_tiles, camera, half_view, margin, near, far ) {
+        return;
+    }
+    if bx1 - bx0 == 1 && by1 - by0 == 1 {
+        visible.push(BlockPos { x: bx0, y: by0 });
+        return;
     }
 
-    let block_world = BLOCK_TILES as f32 * TILE_SIZE;
-    let bx0 = (min.x / block_world).floor() as i32;
-    let by0 = (min.y / block_world).floor() as i32;
-    let bx1 = (max.x / block_world).ceil() as i32 - 1;
-    let by1 = (max.y / block_world).ceil() as i32 - 1;
-
-    let bx0 = bx0.max(0);
-    let by0 = by0.max(0);
-    let bx1 = bx1.min(blocks_per_side - 1);
-    let by1 = by1.min(blocks_per_side - 1);
-
-    if bx0 > bx1 || by0 > by1 {
-        None
+    let mid_x = bx0 + (bx1 - bx0 + 1) / 2;
+    let mid_y = by0 + (by1 - by0 + 1) / 2;
+    let x_ranges = if bx1 - bx0 > 1 {
+        [(bx0, mid_x), (mid_x, bx1)]
     } else {
-        Some((bx0, by0, bx1, by1))
+        [(bx0, bx1), (bx1, bx1)]
+    };
+    let y_ranges = if by1 - by0 > 1 {
+        [(by0, mid_y), (mid_y, by1)]
+    } else {
+        [(by0, by1), (by1, by1)]
+    };
+
+    for (x0, x1) in x_ranges {
+        for (y0, y1) in y_ranges {
+            collect_visible_blocks(
+                x0, y0, x1, y1, world_tiles, camera, half_view, margin, near, far, visible,
+            );
+        }
     }
 }
 
-/// Левый нижний угол блока в мировых координатах.
+#[allow(clippy::too_many_arguments)]
+fn block_region_intersects_view(
+    bx0: i32,
+    by0: i32,
+    bx1: i32,
+    by1: i32,
+    world_tiles: i32,
+    camera: &Transform,
+    half_view: Vec2,
+    margin: f32,
+    near: f32,
+    far: f32,
+) -> bool {
+    let min = Vec3::new(
+        (bx0 * BLOCK_TILES) as f32 * WORLD_TILE_SIZE,
+        (by0 * BLOCK_TILES) as f32 * WORLD_TILE_SIZE,
+        0.0,
+    );
+    let max = Vec3::new(
+        (bx1 * BLOCK_TILES).min(world_tiles) as f32 * WORLD_TILE_SIZE,
+        (by1 * BLOCK_TILES).min(world_tiles) as f32 * WORLD_TILE_SIZE,
+        tile_elevation(TileType::Mountain),
+    );
+    let camera_position = camera.translation;
+    let rotation = camera.rotation;
+    let right = rotation * Vec3::X;
+    let up = rotation * Vec3::Y;
+    let forward = rotation * -Vec3::Z;
+
+    let projected_range = |axis: Vec3| {
+        let low = axis.x * if axis.x >= 0.0 { min.x } else { max.x }
+            + axis.y * if axis.y >= 0.0 { min.y } else { max.y }
+            + axis.z * if axis.z >= 0.0 { min.z } else { max.z }
+            - axis.dot(camera_position);
+        let high = axis.x * if axis.x >= 0.0 { max.x } else { min.x }
+            + axis.y * if axis.y >= 0.0 { max.y } else { min.y }
+            + axis.z * if axis.z >= 0.0 { max.z } else { min.z }
+            - axis.dot(camera_position);
+        (low, high)
+    };
+    let (screen_left, screen_right) = projected_range(right);
+    let (screen_bottom, screen_top) = projected_range(up);
+    let (depth_near, depth_far) = projected_range(forward);
+
+    screen_right >= -half_view.x - margin
+        && screen_left <= half_view.x + margin
+        && screen_top >= -half_view.y - margin
+        && screen_bottom <= half_view.y + margin
+        && depth_far >= near
+        && depth_near <= far
+}
+
+/// Начало блока в координатах 3D-сетки.
 fn block_origin(block: BlockPos) -> Vec3 {
     Vec3::new(
-        (block.x * BLOCK_TILES) as f32 * TILE_SIZE,
-        (block.y * BLOCK_TILES) as f32 * TILE_SIZE,
+        (block.x * BLOCK_TILES) as f32,
+        (block.y * BLOCK_TILES) as f32,
         0.0,
-    )
+    ) * WORLD_TILE_SIZE
 }
 
 /// Квадрат расстояния от центра блока до точки (для порядка построения).
 fn block_distance_sq(block: BlockPos, point: Vec2) -> f32 {
-    let center = block_origin(block).truncate() + Vec2::splat(BLOCK_TILES as f32 * TILE_SIZE * 0.5);
+    let base = Vec2::new(
+        (block.x * BLOCK_TILES) as f32,
+        (block.y * BLOCK_TILES) as f32,
+    );
+    let center = (base + Vec2::splat(BLOCK_TILES as f32 * 0.5)) * WORLD_TILE_SIZE;
     center.distance_squared(point)
 }
 
@@ -952,62 +1251,93 @@ pub(crate) fn lod_transition_for(
     }
 }
 
-/// Строит меш блока: по кваду на ячейку LOD с доминирующим типом тайла.
+/// Строит верх ячейки и грани перепада высоты, обращённые к фиксированной камере.
 pub(crate) fn build_block_mesh(world: &World, block: BlockPos, lod: u32) -> Option<Mesh> {
     let cells = (BLOCK_TILES >> lod) as usize;
     let cell_tiles = 1_i32 << lod;
     let world_tiles = world.size.tiles() as i32;
     let base_x = block.x * BLOCK_TILES;
     let base_y = block.y * BLOCK_TILES;
-
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(cells * cells * 4);
-    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(cells * cells * 4);
-    let mut indices: Vec<u32> = Vec::with_capacity(cells * cells * 6);
-
-    // Добавляет квад ячейки (cx, cy) с текстурой `index`.
-    let mut push_quad = |cx: usize, cy: usize, index: u8| {
-        let x0 = cx as f32 * cell_tiles as f32 * TILE_SIZE;
-        let y0 = cy as f32 * cell_tiles as f32 * TILE_SIZE;
-        let x1 = x0 + cell_tiles as f32 * TILE_SIZE;
-        let y1 = y0 + cell_tiles as f32 * TILE_SIZE;
-        let [u0, v0, u1, v1] = atlas_uv(index);
-        let base = positions.len() as u32;
-
-        positions.extend([
-            [x0, y0, 0.0],
-            [x1, y0, 0.0],
-            [x1, y1, 0.0],
-            [x0, y1, 0.0],
-        ]);
-        uvs.extend([[u0, v1], [u1, v1], [u1, v0], [u0, v0]]);
-        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
-    };
+    let mut kinds = vec![None; cells * cells];
 
     for cy in 0..cells {
         for cx in 0..cells {
             let x0 = base_x + cx as i32 * cell_tiles;
             let y0 = base_y + cy as i32 * cell_tiles;
-
-            // Быстрый путь: ячейка целиком внутри мира и одного чанка с
-            // однородным рельефом — доминанта известна без обхода тайлов.
-            if let Some(index) = uniform_cell_index(world, x0, y0, cell_tiles, world_tiles) {
-                push_quad(cx, cy, index);
+            kinds[cy * cells + cx] = cell_kind(world, x0, y0, cell_tiles, world_tiles);
+        }
+    }
+    let mut positions = Vec::with_capacity(cells * cells * 20);
+    let mut uvs = Vec::with_capacity(cells * cells * 20);
+    let mut indices = Vec::with_capacity(cells * cells * 30);
+    let mut push_quad = |points: [[f32; 3]; 4], texture_uvs: [[f32; 2]; 4]| {
+        let base = positions.len() as u32;
+        positions.extend(points);
+        uvs.extend(texture_uvs);
+        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    let point = |x: f32, y: f32, elevation: f32| {
+        [x * WORLD_TILE_SIZE, y * WORLD_TILE_SIZE, elevation]
+    };
+    for cy in 0..cells {
+        for cx in 0..cells {
+            let Some(kind) = kinds[cy * cells + cx] else {
                 continue;
-            }
-            let mut counts = [0_u32; TILE_KIND_COUNT];
-            for y in y0..y0 + cell_tiles {
-                for x in x0..x0 + cell_tiles {
-                    if x >= world_tiles || y >= world_tiles {
-                        continue;
-                    }
-                    if let Some(index) = tile_atlas_index(world.terrain_kind(TilePos { x, y })) {
-                        counts[index as usize] += 1;
-                    }
-                }
-            }
+            };
+            let Some(index) = tile_atlas_index(kind) else {
+                continue;
+            };
+            let x0 = (base_x + cx as i32 * cell_tiles) as f32;
+            let y0 = (base_y + cy as i32 * cell_tiles) as f32;
+            let lx0 = cx as f32 * cell_tiles as f32;
+            let ly0 = cy as f32 * cell_tiles as f32;
+            let lx1 = lx0 + cell_tiles as f32;
+            let ly1 = ly0 + cell_tiles as f32;
+            let elevation = tile_elevation(kind);
 
-            if let Some(index) = dominant_atlas_index(&counts) {
-                push_quad(cx, cy, index);
+            push_quad(
+                [
+                    point(lx0, ly0, elevation),
+                    point(lx1, ly0, elevation),
+                    point(lx1, ly1, elevation),
+                    point(lx0, ly1, elevation),
+                ],
+                atlas_uv_coordinates(index),
+            );
+
+            let edges = [
+                (cx as i32 - 1, cy as i32, x0 as i32 - cell_tiles, y0 as i32, 0_u8),
+                (cx as i32, cy as i32 - 1, x0 as i32, y0 as i32 - cell_tiles, 2),
+            ];
+            for (nx, ny, neighbor_x, neighbor_y, edge) in edges {
+                let neighbor_kind = if nx >= 0
+                    && ny >= 0
+                    && nx < cells as i32
+                    && ny < cells as i32
+                {
+                    kinds[ny as usize * cells + nx as usize]
+                } else {
+                    cell_kind(world, neighbor_x, neighbor_y, cell_tiles, world_tiles)
+                };
+                let neighbor_elevation = neighbor_kind.map(tile_elevation).unwrap_or(0.0);
+                if neighbor_elevation >= elevation {
+                    continue;
+                }
+                let wall = match edge {
+                    0 => [
+                        point(lx0, ly1, neighbor_elevation),
+                        point(lx0, ly0, neighbor_elevation),
+                        point(lx0, ly0, elevation),
+                        point(lx0, ly1, elevation),
+                    ],
+                    _ => [
+                        point(lx0, ly0, neighbor_elevation),
+                        point(lx1, ly0, neighbor_elevation),
+                        point(lx1, ly0, elevation),
+                        point(lx0, ly0, elevation),
+                    ],
+                };
+                push_quad(wall, atlas_uv_coordinates(index));
             }
         }
     }
@@ -1023,14 +1353,38 @@ pub(crate) fn build_block_mesh(world: &World, block: BlockPos, lod: u32) -> Opti
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(indices));
+    mesh.compute_normals();
     Some(mesh)
+}
+
+fn atlas_uv_coordinates(index: u8) -> [[f32; 2]; 4] {
+    let [u0, v0, u1, v1] = atlas_uv(index);
+    [[u0, v1], [u1, v1], [u1, v0], [u0, v0]]
+}
+
+fn cell_kind(world: &World, x0: i32, y0: i32, cell: i32, world_tiles: i32) -> Option<TileType> {
+    if let Some(index) = uniform_cell_index(world, x0, y0, cell, world_tiles) {
+        return kind_for_atlas_index(index);
+    }
+    let mut counts = [0_u32; TILE_KIND_COUNT];
+    for y in y0..y0 + cell {
+        for x in x0..x0 + cell {
+            if x < 0 || y < 0 || x >= world_tiles || y >= world_tiles {
+                continue;
+            }
+            if let Some(index) = tile_atlas_index(world.terrain_kind(TilePos { x, y })) {
+                counts[index as usize] += 1;
+            }
+        }
+    }
+    dominant_atlas_index(&counts).and_then(kind_for_atlas_index)
 }
 
 /// Если ячейка `[x0, x0+cell) × [y0, y0+cell)` целиком лежит внутри мира
 /// и внутри одного чанка с однородным рельефом, возвращает индекс атласа.
 /// Иначе None — ячейку считает общий путь с подсчётом тайлов.
 fn uniform_cell_index(world: &World, x0: i32, y0: i32, cell: i32, world_tiles: i32) -> Option<u8> {
-    if x0 + cell > world_tiles || y0 + cell > world_tiles {
+    if x0 < 0 || y0 < 0 || x0 + cell > world_tiles || y0 + cell > world_tiles {
         return None;
     }
     let chunk_side = CHUNK_SIZE as i32;
@@ -1094,25 +1448,28 @@ fn kind_for_atlas_index(index: u8) -> Option<TileType> {
     })
 }
 
-/// Спавнит объекты блока как дочерние спрайты, сохраняя Z-сортировку по Y.
+/// Спавнит объекты блока как дочерние camera-facing спрайты.
 /// Идёт по разреженному слою объектов четырёх чанков блока — стоимость
 /// пропорциональна числу объектов, а не тайлам блока.
 fn spawn_objects(
     parent: &mut EntityCommands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    sprite_assets: &mut WorldSpriteAssets,
     images: &Assets<Image>,
     world: &World,
     block: BlockPos,
     origin: Vec3,
-    world_tiles: u32,
+    camera_rotation: Quat,
     textures: &TileTextures,
 ) {
-    let max_y = world_tiles as f32 * TILE_SIZE;
     let bx0 = block.x * BLOCK_TILES;
     let by0 = block.y * BLOCK_TILES;
     // Блок 64×64 покрывает ровно 4×4 чанков (сетка блоков кратна чанку);
     // у края мира часть чанков за границей — они пропускаются.
     let chunks_per_block = BLOCK_TILES / CHUNK_SIZE as i32;
     let cps = world.chunks_per_side as i32;
+    let quad = world_sprite_quad(meshes, sprite_assets);
 
     parent.with_children(|parent| {
         for cy in 0..chunks_per_block {
@@ -1133,17 +1490,24 @@ fn spawn_objects(
                         .get(handle)
                         .map(|image| object_sprite_size(obj.kind, image))
                         .unwrap_or(Vec2::splat(TILE_SIZE));
-                    // Спрайт центром по X над тайлом; низ прижат к нижней
-                    // границе родного тайла (не ниже и не в воздухе).
-                    let wx = tile.x as f32 * TILE_SIZE + TILE_SIZE * 0.5;
-                    let wy = tile.y as f32 * TILE_SIZE + size.y * 0.5;
+                    // Спрайт центром по X над тайлом; низ прижат к нижней границе родного тайла (не ниже и не в воздухе).
+                    let tile_world = world_position(
+                        world,
+                        Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),
+                    );
+                    let anchor = tile_world - origin;
+                    let height = size.y * 0.5;
+                    let camera_up = camera_rotation * Vec3::Y;
+                    let material =
+                        world_sprite_material(handle, false, sprite_assets, materials);
+                    let mut transform =
+                        Transform::from_translation(anchor + camera_up * height)
+                            .with_rotation(camera_rotation);
+                    transform.scale = Vec3::new(size.x, size.y, 1.0);
                     parent.spawn((
-                        Sprite {
-                            image: handle.clone(),
-                            custom_size: Some(size),
-                            ..default()
-                        },
-                        Transform::from_xyz(wx - origin.x, wy - origin.y, 1.0 + (max_y - wy) * 0.001),
+                        Mesh3d(quad.clone()),
+                        MeshMaterial3d(material),
+                        transform,
                     ));
                 }
             }
@@ -1168,18 +1532,21 @@ fn object_sprite_size(kind: ObjectKind, image: &Image) -> Vec2 {
 /// Спавнит предметы на тайлах блока (дроп) как дочерние спрайты.
 fn spawn_items(
     parent: &mut EntityCommands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    sprite_assets: &mut WorldSpriteAssets,
     world: &World,
     block: BlockPos,
     origin: Vec3,
-    world_tiles: u32,
+    camera_rotation: Quat,
     textures: &TileTextures,
     font: &Handle<Font>,
 ) {
-    let max_y = world_tiles as f32 * TILE_SIZE;
     let bx0 = block.x * BLOCK_TILES;
     let by0 = block.y * BLOCK_TILES;
     let chunks_per_block = BLOCK_TILES / CHUNK_SIZE as i32;
     let cps = world.chunks_per_side as i32;
+    let quad = world_sprite_quad(meshes, sprite_assets);
 
     parent.with_children(|parent| {
         for cy in 0..chunks_per_block {
@@ -1195,14 +1562,25 @@ fn spawn_items(
                         x: cpx * CHUNK_SIZE as i32 + (idx % CHUNK_SIZE as u8) as i32,
                         y: cpy * CHUNK_SIZE as i32 + (idx / CHUNK_SIZE as u8) as i32,
                     };
-                    let (wx, wy) = tile_center(tile);
+                    let tile_world = world_position(
+                        world,
+                        Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),
+                    );
+                    let local = tile_world - origin;
+                    let item_anchor = local + Vec3::Z;
+                    let item_height = TILE_SIZE * 0.3;
+                    let texture = textures.item_texture(stack.kind);
+                    let material = world_sprite_material(texture, false, sprite_assets, materials);
+                    let item_size = Vec2::splat(TILE_SIZE * 0.6);
+                    let mut transform = Transform::from_translation(
+                        item_anchor + camera_rotation * Vec3::Y * item_height,
+                    )
+                    .with_rotation(camera_rotation);
+                    transform.scale = Vec3::new(item_size.x, item_size.y, 1.0);
                     parent.spawn((
-                        Sprite {
-                            image: textures.item_texture(stack.kind).clone(),
-                            custom_size: Some(Vec2::splat(TILE_SIZE * 0.6)),
-                            ..default()
-                        },
-                        Transform::from_xyz(wx - origin.x, wy - origin.y, 1.0 + (max_y - wy) * 0.001),
+                        Mesh3d(quad.clone()),
+                        MeshMaterial3d(material),
+                        transform,
                     ));
                     if stack.count > 1 {
                         // Счётчик растрируется крупным шрифтом и уменьшается
@@ -1210,6 +1588,7 @@ fn spawn_items(
                         // нескольких пикселей и на экране выглядят мылом
                         // при любом зуме. 40 px с масштабом 0.1 дают тот же
                         // размер на экране, но с чёткой растеризацией.
+                        let label_anchor = local + Vec3::new(TILE_SIZE * 0.25, -TILE_SIZE * 0.25, 2.0);
                         parent.spawn((
                             Text2d::new(stack.count.to_string()),
                             Visibility::Visible,
@@ -1220,11 +1599,8 @@ fn spawn_items(
                                 ..default()
                             },
                             TextColor(Color::WHITE),
-                            Transform::from_xyz(
-                                wx - origin.x + TILE_SIZE * 0.25,
-                                wy - origin.y - TILE_SIZE * 0.25,
-                                2.0 + (max_y - wy) * 0.001,
-                            )
+                            Transform::from_translation(label_anchor)
+                            .with_rotation(camera_rotation)
                             .with_scale(Vec3::splat(ITEM_COUNT_SCALE)),
                         ));
                     }
@@ -1232,13 +1608,6 @@ fn spawn_items(
             }
         }
     });
-}
-
-/// Центр тайла в мировых координатах.
-fn tile_center(tile: TilePos) -> (f32, f32) {
-    let x = tile.x as f32 * TILE_SIZE + TILE_SIZE * 0.5;
-    let y = tile.y as f32 * TILE_SIZE + TILE_SIZE * 0.5;
-    (x, y)
 }
 
 /// Маркер голограммы выбранной постройки.
@@ -1257,7 +1626,7 @@ fn update_build_hologram(
     textures: Res<TileTextures>,
     images: Res<Assets<Image>>,
     windows: Query<&Window>,
-    cameras: Query<(&Transform, &Projection), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     existing: Query<Entity, With<BuildHologram>>,
 ) {
     let selected = if construction.open && state.mode == GameMode::Player {
@@ -1295,12 +1664,16 @@ fn update_build_hologram(
         .get(&handle)
         .map(|image| object_sprite_size(kind, image))
         .unwrap_or(Vec2::splat(TILE_SIZE));
-    // Спрайт стоит так же, как объекты: центр по X над тайлом, низ прижат
-    // к нижней границе тайла; Z — по формуле 2.5D-сортировки.
-    let wx = tile.x as f32 * TILE_SIZE + TILE_SIZE * 0.5;
-    let wy = tile.y as f32 * TILE_SIZE + size.y * 0.5;
-    let max_y = world.size.tiles() as f32 * TILE_SIZE;
-    let z = 1.0 + (max_y - wy) * 0.001;
+    let Ok((_, camera_transform)) = cameras.single() else {
+        return;
+    };
+    let tile_world = world_position(
+        world,
+        Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),
+    );
+    let camera_up = camera_transform.rotation * Vec3::Y;
+    let transform = Transform::from_translation(tile_world + camera_up * (size.y * 0.5))
+        .with_rotation(camera_transform.rotation);
     let color = if valid {
         Color::srgba(0.45, 1.0, 0.45, 0.55)
     } else {
@@ -1315,12 +1688,11 @@ fn update_build_hologram(
 
     match existing.iter().next() {
         Some(entity) => {
-            commands
-                .entity(entity)
-                .insert((sprite, Transform::from_xyz(wx, wy, z)));
+            commands.entity(entity).insert((sprite, transform));
         }
         None => {
-            commands.spawn((sprite, Transform::from_xyz(wx, wy, z), BuildHologram));
+            commands.spawn((sprite, transform, BuildHologram));
         }
     }
+
 }
