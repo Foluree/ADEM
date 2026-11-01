@@ -7,6 +7,7 @@ pub mod climate;
 pub mod combat;
 pub mod commands;
 pub mod crafts;
+pub mod dirty;
 pub mod entities;
 pub mod generation;
 pub mod hunger;
@@ -35,6 +36,8 @@ pub use climate::ambient_temperature_c;
 pub use combat::{Projectile, ProjectileKind, StuckSpear};
 #[allow(unused_imports)]
 pub use commands::{Command, CommandQueue};
+#[allow(unused_imports)]
+pub use dirty::DirtyTiles;
 #[allow(unused_imports)]
 pub use crafts::{CraftBook, CraftRecipe, ShapedPattern, GRID_SLOTS, MANUAL_CATEGORY};
 #[allow(unused_imports)]

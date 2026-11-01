@@ -84,6 +84,9 @@ impl Material2d for DarknessMaterial {
 #[derive(Resource, Default)]
 pub(crate) struct CampfireLights {
     positions: HashSet<TilePos>,
+    /// Счётчик изменений реестра: оверлей тьмы по нему понимает, что набор
+    /// огней изменился, не сравнивая множества каждый кадр.
+    version: u64,
 }
 
 /// Оверлей тьмы: одна Bevy-сущность с мешем и материалом, пересобираемая
@@ -94,34 +97,60 @@ pub(crate) struct DarknessOverlay {
     mesh: Option<Handle<Mesh>>,
     material: Option<Handle<DarknessMaterial>>,
     fire_positions: Option<Handle<ShaderBuffer>>,
+    /// Кадр, на который собран оверлей. Пока ключ не изменился, меш, буфер
+    /// огней и материал не трогаются — иначе каждый ночной кадр получал бы
+    /// AssetEvent::Modified и лишнюю подготовку материала.
+    last_frame: Option<OverlayFrame>,
+}
+
+/// Состояние кадра, от которого зависит содержимое оверлея тьмы. Поворота
+/// камеры нет (ARCHITECTURE 5), поэтому достаточно переноса камеры.
+#[derive(Clone, PartialEq)]
+struct OverlayFrame {
+    darkness: f32,
+    view_min: Vec2,
+    view_max: Vec2,
+    camera_translation: Vec3,
+    fires_version: u64,
 }
 
 /// Держит реестр костров в соответствии с миром. Полный пересбор — после
 /// перегенерации мира или загрузки сохранения (`pending_rerender`), иначе
-/// точечная сверка по изменённым тайлам. Запускается до `render_world`,
-/// который изымает dirty-тайлы.
+/// точечная сверка по изменённым тайлам обоих каналов (рельеф и декор:
+/// костёр — объект, но заодно проверяется и рельеф под ним). Запускается
+/// до `render_world`, который изымает dirty-тайлы.
 pub(crate) fn update_campfire_positions(
     state: Res<GameState>,
     mut lights: ResMut<CampfireLights>,
 ) {
     let Some(world) = state.world.as_ref() else {
-        lights.positions.clear();
+        if !lights.positions.is_empty() {
+            lights.positions.clear();
+            lights.version += 1;
+        }
         return;
     };
     if state.pending_rerender {
         lights.positions = scan_campfires(world);
+        lights.version += 1;
         return;
     }
-    for tile in &state.dirty_tiles {
+    let mut changed = false;
+    for tile in state
+        .dirty_tiles
+        .terrain
+        .iter()
+        .chain(state.dirty_tiles.decor.iter())
+    {
         let has_fire = matches!(
             world.object_at(*tile),
             Some(obj) if matches!(obj.kind, ObjectKind::Campfire)
         );
-        if has_fire {
-            lights.positions.insert(*tile);
-        } else {
-            lights.positions.remove(tile);
-        }
+        changed |= has_fire && lights.positions.insert(*tile)
+            || !has_fire && lights.positions.remove(tile);
+    }
+    if changed {
+        lights.version += 1;
     }
 }
 
@@ -168,6 +197,8 @@ pub(crate) fn update_darkness_overlay(
         if let Some(entity) = overlay.entity {
             commands.entity(entity).insert(Visibility::Hidden);
         }
+        // После скрытия оверлей собирается заново, даже если кадр совпадёт.
+        overlay.last_frame = None;
         return;
     }
 
@@ -185,11 +216,26 @@ pub(crate) fn update_darkness_overlay(
     let margin = Vec2::splat((LIGHT_RADIUS_TILES + 2.0) * WORLD_TILE_SIZE);
     let view_min = -half_size - margin;
     let view_max = half_size + margin;
+
+    // Кадр не изменился (стоячая камера, стабильная тьма, костры те же):
+    // собранный оверлей уже корректен и видим — ничего не трогаем.
+    let frame = OverlayFrame {
+        darkness,
+        view_min,
+        view_max,
+        camera_translation: camera_transform.translation,
+        fires_version: lights.version,
+    };
+    if overlay.last_frame.as_ref() == Some(&frame) {
+        return;
+    }
     let world_to_camera = camera_transform.to_matrix().inverse();
 
     // Центры костров в мировых пикселях; костры вне области с запасом
     // света всё равно не дают вклада — отсекаем их до построения сетки.
-    let fires: Vec<Vec2> = lights
+    // Сортировка по X: фрагментный шейдер ищёт окно огней бинарным
+    // поиском, а не перебирает все огни на каждый пиксель экрана.
+    let mut fires: Vec<Vec2> = lights
         .positions
         .iter()
         .map(|tile| {
@@ -205,6 +251,7 @@ pub(crate) fn update_darkness_overlay(
                 && fire.y <= view_max.y + LIGHT_RADIUS_PX
         })
         .collect();
+    fires.sort_by(|a, b| a.x.total_cmp(&b.x));
 
     let mesh = overlay
         .mesh
@@ -270,6 +317,7 @@ pub(crate) fn update_darkness_overlay(
             overlay.entity = Some(entity);
         }
     }
+    overlay.last_frame = Some(frame);
 }
 
 /// Деспавнит оверлей (мир отсутствует).
@@ -277,6 +325,7 @@ fn despawn_overlay(commands: &mut Commands, overlay: &mut DarknessOverlay) {
     if let Some(entity) = overlay.entity.take() {
         commands.entity(entity).despawn();
     }
+    overlay.last_frame = None;
 }
 
 /// Четыре вершины и два треугольника покрывают видимую область с запасом.

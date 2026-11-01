@@ -1,6 +1,7 @@
 //! Тесты игрока и его окружения: движение, инвентарь, добыча и сбор,
 //! очередь команд симуляции.
 
+use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::objects::{ObjectKind, WorldObject};
 use crate::simulation::tile::TileType;
 use crate::simulation::world::{TilePos, World, WorldSize};
@@ -522,7 +523,7 @@ fn command_player_eat_consumes_apple() {
     // Две команды на одном тике: вторая отбита кулдауном.
     queue.push(Command::PlayerEat);
     queue.push(Command::PlayerEat);
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     queue.apply_all(&mut world, Some(&mut p), &mut dirty, &mut sched, 0);
 
     assert_eq!(p.inventory.count_of(ItemKind::Apple), 2, "второй укус отброшен кулдауном");
@@ -722,12 +723,14 @@ fn commands_apply_fifo_and_report_dirty() {
     // Вне мира — пропускается, но считается применённой.
     queue.push(Command::SetTerrain { pos: TilePos { x: -1, y: 0 }, kind: TileType::Sand });
 
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     let applied = queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
     assert_eq!(applied, 3);
     assert_eq!(world.terrain_kind(a), TileType::Sand);
     assert!(world.object_at(b).is_some());
-    assert_eq!(dirty, vec![a, b]);
+    // Канал причины: рельеф и объект попадают в разные списки рендера.
+    assert_eq!(dirty.terrain, vec![a]);
+    assert_eq!(dirty.decor, vec![b]);
     assert!(queue.is_empty());
 }
 
@@ -757,7 +760,7 @@ fn command_drop_stack_finds_free_tile() {
         stack: ItemStack { kind: ItemKind::Rock, count: 3 },
     });
 
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
 
     // Палки долились в центральную стопку.
@@ -768,9 +771,9 @@ fn command_drop_stack_finds_free_tile() {
         world.item_at(TilePos { x: 9, y: 9 }).map(|s| (s.kind, s.count)),
         Some((ItemKind::Rock, 3))
     );
-    // Оба изменённых тайла ушли в dirty-список рендера.
-    assert!(dirty.contains(&center));
-    assert!(dirty.contains(&TilePos { x: 9, y: 9 }));
+    // Оба изменённых тайла ушли в decor-канал рендера (предметы на земле).
+    assert!(dirty.decor.contains(&center));
+    assert!(dirty.decor.contains(&TilePos { x: 9, y: 9 }));
 }
 
 /// Сброс стека не теряет предметы, когда всё вокруг занято чужими видами:
@@ -797,7 +800,7 @@ fn command_drop_stack_searches_until_free_tile() {
         pos: center,
         stack: ItemStack { kind: ItemKind::Stick, count: 2 },
     });
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
 
     // Первый свободный тайл — на кольце радиуса 3, обход начинается

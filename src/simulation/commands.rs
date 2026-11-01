@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 
 use super::combat;
+use super::dirty::DirtyTiles;
 use super::entities::EntityKind;
 use super::items::{ItemKind, ItemStack, MAX_STACK, MISC_SLOTS};
 use super::objects::{ObjectKind, WorldObject, build_cost};
@@ -79,8 +80,9 @@ impl CommandQueue {
 
     /// Применяет все команды по порядку поступления и возвращает их число.
     ///
-    /// `dirty` наполняется позициями изменённых тайлов — рендер по ним
-    /// перестраивает terrain-блоки. После каждого изменения запускаются
+    /// `dirty` наполняется позициями изменённых тайлов с разделением по
+    /// каналу (рельеф / декор) — рендер по ним пересобирает меш блока или
+    /// только дочерние спрайты. После каждого изменения запускаются
     /// цепочки растительности, которых коснулось изменение (новая земля
     /// рядом с травой, новый берег у воды и т.п.). Команды с тайлами вне
     /// мира пропускаются: контроллер мог посчитать по устаревшим данным.
@@ -88,7 +90,7 @@ impl CommandQueue {
         &mut self,
         world: &mut World,
         mut player: Option<&mut Player>,
-        dirty: &mut Vec<TilePos>,
+        dirty: &mut DirtyTiles,
         sched: &mut Scheduler,
         tick: u64,
     ) -> usize {
@@ -98,14 +100,14 @@ impl CommandQueue {
                 Command::SetTerrain { pos, kind } => {
                     if in_bounds(world, pos) {
                         world.set_terrain(pos, kind);
-                        dirty.push(pos);
+                        dirty.terrain(pos);
                         vegetation::after_tile_changed(world, sched, tick, pos);
                     }
                 }
                 Command::SetObject { pos, object } => {
                     if in_bounds(world, pos) {
                         world.set_object(pos, object);
-                        dirty.push(pos);
+                        dirty.decor(pos);
                         vegetation::after_tile_changed(world, sched, tick, pos);
                     }
                 }
@@ -135,20 +137,26 @@ impl CommandQueue {
                         // добыча: оружие не мешает собирать траву и камни.
                         // Исключение — лук: им нельзя ничего ломать.
                         let can_harvest = player.selected_item() != Some(ItemKind::Bow);
+                        // Добыча меняет либо объект (куст, валун), либо рельеф
+                        // (сбор травы превращает тайл в землю) — но не оба
+                        // сразу. Канал dirty определяется по тому, был ли на
+                        // тайле объект до действия.
+                        let had_object = world.object_at(pos).is_some();
                         if !combat::try_melee_attack(world, player, pos, tick)
-                            && can_harvest
-                            && player.interact(pos, world)
+                            && can_harvest && player.interact(pos, world)
                         {
-                            dirty.push(pos);
+                            if had_object {
+                                dirty.decor(pos);
+                            } else {
+                                dirty.terrain(pos);
+                            }
                             vegetation::after_tile_changed(world, sched, tick, pos);
                         }
                     }
                 }
                 Command::PlayerHarvestApple { pos } => {
-                    if let Some(player) = player.as_deref_mut()
-                        && player.harvest_apple(pos, world)
-                    {
-                        dirty.push(pos);
+                    if let Some(player) = player.as_deref_mut() && player.harvest_apple(pos, world) {
+                        dirty.decor(pos);
                         vegetation::after_tile_changed(world, sched, tick, pos);
                     }
                 }
@@ -167,7 +175,7 @@ impl CommandQueue {
                             // Снимаем весь стек из слота.
                             player.inventory.items[slot_index] = None;
                             if try_place_item(world, pos, stack) {
-                                dirty.push(pos);
+                                dirty.decor(pos);
                                 vegetation::after_tile_changed(world, sched, tick, pos);
                             } else {
                                 // Не поместилось: возвращаем стек в инвентарь.
@@ -182,7 +190,7 @@ impl CommandQueue {
                     } else if let Some(target) = find_drop_tile(world, pos, stack) {
                         // Свободный тайл нашёлся: предмет не исчезает «в никуда».
                         try_place_item(world, target, stack);
-                        dirty.push(target);
+                        dirty.decor(target);
                         vegetation::after_tile_changed(world, sched, tick, target);
                     }
                 }
@@ -199,7 +207,7 @@ impl CommandQueue {
                     {
                         player.inventory.add(stack.kind, stack.count);
                         world.set_item(pos, None);
-                        dirty.push(pos);
+                        dirty.decor(pos);
                         vegetation::after_tile_changed(world, sched, tick, pos);
                     }
                 }
@@ -224,7 +232,7 @@ impl CommandQueue {
                         continue;
                     };
                     world.set_object(pos, Some(object));
-                    dirty.push(pos);
+                    dirty.decor(pos);
                     vegetation::after_tile_changed(world, sched, tick, pos);
                 }
                 Command::PlayerThrowSpear { target } => {

@@ -1,6 +1,6 @@
 //! Мир: размер, чанки со слоями, доступ к тайлам и объектам.
 
-use super::chunk::{Chunk, ResourceDeposit, CHUNK_SIZE};
+use super::chunk::{Chunk, ResourceDeposit, TerrainTiles, CHUNK_SIZE};
 use super::combat::{Projectile, StuckSpear};
 use super::entities::EntityStore;
 use super::items::ItemStack;
@@ -87,6 +87,36 @@ impl World {
     /// Сколько чанков по стороне для данного размера мира.
     pub fn chunks_per_side(size: WorldSize) -> u32 {
         size.tiles() / CHUNK_SIZE as u32
+    }
+
+    /// Оценка расхода ОЗУ миром в байтах (для F3-панели): чанки с рельефом
+    /// и разреженными слоями, существа, снаряды, планировщик. Приближение
+    /// без учёта аллокатора: ёмкости × размер записи, hashbrown с запасом
+    /// на байт управления и загрузку 7/8. Итог делить на байты/тайл —
+    /// основной показатель бюджета памяти (ARCHITECTURE 3.1).
+    pub fn memory_bytes(&self) -> u64 {
+        const fn size_of<T>() -> u64 {
+            std::mem::size_of::<T>() as u64
+        }
+        // Оценка разреженного слоя: (ключ, значение) + байт управления, ×8/7.
+        const fn map_bytes<K, V>(len: usize) -> u64 {
+            (len as u64) * (size_of::<(K, V)>() + 2) * 8 / 7
+        }
+
+        let mut bytes = (self.chunks.capacity() as u64) * size_of::<Chunk>();
+        for chunk in &self.chunks {
+            if matches!(chunk.terrain, TerrainTiles::Full(_)) {
+                // Отдельная аллокация Box<[TileType; 256]>.
+                bytes += 256 * size_of::<TileType>();
+            }
+            bytes += map_bytes::<u8, ResourceDeposit>(chunk.resources.len());
+            bytes += map_bytes::<u8, WorldObject>(chunk.objects.len());
+            bytes += map_bytes::<u8, ItemStack>(chunk.items.len());
+        }
+        bytes += (self.entities.len() as u64) * size_of::<super::entities::SimEntity>();
+        bytes += (self.projectiles.capacity() as u64) * size_of::<Projectile>();
+        bytes += (self.stuck_spears.capacity() as u64) * size_of::<StuckSpear>();
+        bytes
     }
 
     /// Создать пустой мир заданного размера.

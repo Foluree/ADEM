@@ -79,6 +79,22 @@ impl Default for Scheduler {
 }
 
 impl Scheduler {
+    /// Оценка расхода ОЗУ планировщиком в байтах (для F3-панели): бакеты
+    /// ближнего окна с их ёмкостью, дальняя куча, набор отменённых.
+    /// Приближение без учёта аллокатора: ёмкости × размер записи.
+    pub fn memory_bytes(&self) -> u64 {
+        let near: u64 = self
+            .near
+            .iter()
+            .map(|bucket| (bucket.capacity() as u64) * std::mem::size_of::<Task>() as u64)
+            .sum();
+        let far = (self.far.len() as u64) * std::mem::size_of::<(u64, TaskId, Task)>() as u64;
+        // HashSet: бакет = ключ + байт управления, загрузка ≤ 7/8.
+        let cancelled = (self.cancelled.len() as u64)
+            * (std::mem::size_of::<TaskId>() as u64 + 2) * 8 / 7;
+        near + far + cancelled
+    }
+
     /// Удаляет все задачи, привязанные к содержимому мира. Календарные
     /// события и прочие независимые задачи сохраняются при перегенерации.
     pub fn clear_world_tasks(&mut self) {

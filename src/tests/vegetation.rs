@@ -1,17 +1,18 @@
 //! Тесты растительности: самозапланированные цепочки — расползание травы,
 //! рост кустов, эрозия берегов, перезапуск от инструментов редактора.
 
+use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::world::{TilePos, World};
 
 /// Прогоняет планировщик до `until` тика, применяя события растительности
-/// и собирая позиции изменённых тайлов (dirty-флаги для рендера).
+/// и собирая позиции изменённых тайлов по каналам (dirty-флаги для рендера).
 /// Возвращает число исполненных событий. Вспомогательная для тестов
 /// самозапланированных цепочек.
 fn run_vegetation(
     sched: &mut crate::simulation::Scheduler,
     world: &mut World,
     until: u64,
-    dirty: &mut Vec<TilePos>,
+    dirty: &mut DirtyTiles,
 ) -> usize {
     let mut applied = 0;
     for tick in 1..=until {
@@ -41,11 +42,14 @@ fn vegetation_changes_report_dirty_tiles() {
     }
     vegetation::seed_all(&world, &mut sched, 0);
 
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     run_vegetation(&mut sched, &mut world, 20_000, &mut dirty);
 
     assert!(!dirty.is_empty(), "растительные события должны отмечать dirty-тайлы");
-    for pos in &dirty {
+    // Расползание травы меняет рельеф — канал terrain; каналу decor здесь
+    // взяться неоткуда (кубы растут только на лесной траве).
+    assert!(dirty.decor.is_empty(), "расползание травы не меняет декор");
+    for pos in &dirty.terrain {
         assert_eq!(
             world.terrain_kind(*pos),
             TileType::Grass,
@@ -74,7 +78,7 @@ fn grass_spreads_via_scheduler() {
 
     // Четыре тайла травы по 0.1%/такт: первое расползание в среднем за ~250
     // тиков; 20 000 тиков хватает с огромным запасом.
-    run_vegetation(&mut sched, &mut world, 20_000, &mut Vec::new());
+    run_vegetation(&mut sched, &mut world, 20_000, &mut DirtyTiles::default());
 
     for y in 4..8 {
         assert_eq!(
@@ -105,7 +109,7 @@ fn bushes_grow_up_to_chunk_cap() {
 
     // 0.05%/такт на тайл × 256 тайлов: куст каждые ~8 тиков, предел
     // достигается за сотни тиков.
-    run_vegetation(&mut sched, &mut world, 100_000, &mut Vec::new());
+    run_vegetation(&mut sched, &mut world, 100_000, &mut DirtyTiles::default());
 
     let chunk = world.chunk(crate::simulation::ChunkPos { x: 0, y: 0 });
     let bushes = chunk
@@ -132,7 +136,7 @@ fn water_erodes_shores_via_scheduler() {
 
     // 0.02%/такт: событие в среднем за 5000 тиков, нужно три превращения —
     // 300 000 тиков дают запас.
-    run_vegetation(&mut sched, &mut world, 300_000, &mut Vec::new());
+    run_vegetation(&mut sched, &mut world, 300_000, &mut DirtyTiles::default());
 
     assert_eq!(
         world.terrain_kind(TilePos { x: 11, y: 5 }),
@@ -160,7 +164,7 @@ fn editor_placed_dirt_gets_overgrown() {
     world.set_terrain(TilePos { x: 10, y: 5 }, TileType::Grass);
     queue.push(Command::SetTerrain { pos: TilePos { x: 11, y: 5 }, kind: TileType::Dirt });
 
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
 
     run_vegetation(&mut sched, &mut world, 20_000, &mut dirty);

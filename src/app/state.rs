@@ -3,13 +3,14 @@
 use bevy::prelude::*;
 
 use crate::simulation::commands::CommandQueue;
+use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::entities::EntityKind;
 use crate::simulation::objects::ObjectKind;
 use crate::simulation::player::{Player, WorldPos};
 use crate::simulation::scheduler::Scheduler;
 use crate::simulation::tile::TileType;
 use crate::simulation::time::{GameClock, TICKS_PER_SEC};
-use crate::simulation::{TilePos, World, WorldSize};
+use crate::simulation::{World, WorldSize};
 
 /// Скорость симуляции.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -166,9 +167,11 @@ pub struct GameState {
     pub mode: GameMode,
     /// Выбранный инструмент (None — клик по карте ничего не ставит).
     pub selected_tool: Option<Tool>,
-    /// Тайлы, изменённые с прошлого кадра: рендер перестраивает их
-    /// terrain-блоки. Наполняется применением команд, очищается рендером.
-    pub dirty_tiles: Vec<TilePos>,
+    /// Тайлы, изменённые с прошлого кадра, по каналам причины (рельеф /
+    /// декор): рендер пересобирает terrain-меш блока или только дочерние
+    /// спрайты. Наполняется применением команд и задачами растительности,
+    /// изымается рендером.
+    pub dirty_tiles: DirtyTiles,
 }
 
 impl Default for GameState {
@@ -183,7 +186,7 @@ impl Default for GameState {
             pending_rerender: false,
             mode: GameMode::Observer,
             selected_tool: None,
-            dirty_tiles: Vec::new(),
+            dirty_tiles: DirtyTiles::default(),
         }
     }
 }

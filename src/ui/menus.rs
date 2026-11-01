@@ -105,8 +105,10 @@ const GAP_Y: f32 = 44.0;
 const LINE_PX: f32 = 3.0;
 const LINE_MIN_PX: f32 = 1.0;
 const LINE_MAX_PX: f32 = 8.0;
-/// Сколько сегментов на одно Безье-ребро (гладкость на максимальном зуме).
-const CURVE_SEGMENTS: usize = 21;
+/// Сколько сегментов на одно Безье-ребро (10 хватает для гладкости на
+/// максимальном зуме; каждый сегмент — отдельная UI-сущность, которых
+/// в дереве тысячи).
+const CURVE_SEGMENTS: usize = 10;
 /// Пределы зума.
 const MIN_ZOOM: f32 = 0.2;
 const MAX_ZOOM: f32 = 2.5;
@@ -878,6 +880,7 @@ fn pan_zoom_tree(
     mut wheel: MessageReader<MouseWheel>,
     mut prev_cursor: Local<Option<Vec2>>,
     mut last_zoom: Local<f32>,
+    mut last_offset: Local<Vec2>,
     mut cards: Query<(&CanvasNode, &mut Node), Without<CurveSegment>>,
     mut segments: Query<(&CurveSegment, &mut Node, &mut UiTransform)>,
     mut titles: Query<(&CardTitle, &mut TextFont, &mut Visibility), (Without<CardEra>, Without<CardDesc>)>,
@@ -919,39 +922,46 @@ fn pan_zoom_tree(
 
     let z = view.zoom;
     let o = view.offset;
-    for (canvas, mut node) in &mut cards {
-        node.left = Val::Px(o.x + canvas.base.x * z);
-        node.top = Val::Px(o.y + canvas.base.y * z);
-        node.width = Val::Px(canvas.size.x * z);
-        node.height = Val::Px(canvas.size.y * z);
-        // Радиус и паддинги — в px холста: масштабируются зумом, иначе
-        // на отдалении карточка «круглится», а отступы съедают текст.
-        node.border_radius = BorderRadius::all(Val::Px(8.0 * z));
-        node.padding = UiRect::all(Val::Px(10.0 * z));
-        node.row_gap = Val::Px(4.0 * z);
-    }
+    // Раскладка карточек и линий переписывается только при сдвиге вида
+    // (или на входе в меню): мутации Node каждый кадр впустую грязнят
+    // тысячи узлов и заставляют UI пересчитывать раскладку без нужды.
+    let force = view.is_added();
+    let view_changed = force || *last_offset != o || (z - *last_zoom).abs() > f32::EPSILON;
+    if view_changed {
+        *last_offset = o;
+        for (canvas, mut node) in &mut cards {
+            node.left = Val::Px(o.x + canvas.base.x * z);
+            node.top = Val::Px(o.y + canvas.base.y * z);
+            node.width = Val::Px(canvas.size.x * z);
+            node.height = Val::Px(canvas.size.y * z);
+            // Радиус и паддинги — в px холста: масштабируются зумом, иначе
+            // на отдалении карточка «круглится», а отступы съедают текст.
+            node.border_radius = BorderRadius::all(Val::Px(8.0 * z));
+            node.padding = UiRect::all(Val::Px(10.0 * z));
+            node.row_gap = Val::Px(4.0 * z);
+        }
 
-    // Линии: длина — честно зумом, толщина — кламп экранных пикселей.
-    // Сегмент кладётся серединой на середину хорды и доворачивается
-    // через `UiTransform` (поворот вокруг центра ноды).
-    let line_px = (LINE_PX * z).clamp(LINE_MIN_PX, LINE_MAX_PX);
-    for (seg, mut node, mut tr) in &mut segments {
-        let a = o + seg.a * z;
-        let b = o + seg.b * z;
-        let d = b - a;
-        let len = d.length().max(0.01);
-        let mid = (a + b) * 0.5;
-        node.left = Val::Px(mid.x - len * 0.5);
-        node.top = Val::Px(mid.y - line_px * 0.5);
-        node.width = Val::Px(len);
-        node.height = Val::Px(line_px);
-        tr.rotation = Rot2::radians(d.y.atan2(d.x));
+        // Линии: длина — честно зумом, толщина — кламп экранных пикселей.
+        // Сегмент кладётся серединой на середину хорды и доворачивается
+        // через `UiTransform` (поворот вокруг центра ноды).
+        let line_px = (LINE_PX * z).clamp(LINE_MIN_PX, LINE_MAX_PX);
+        for (seg, mut node, mut tr) in &mut segments {
+            let a = o + seg.a * z;
+            let b = o + seg.b * z;
+            let d = b - a;
+            let len = d.length().max(0.01);
+            let mid = (a + b) * 0.5;
+            node.left = Val::Px(mid.x - len * 0.5);
+            node.top = Val::Px(mid.y - line_px * 0.5);
+            node.width = Val::Px(len);
+            node.height = Val::Px(line_px);
+            tr.rotation = Rot2::radians(d.y.atan2(d.x));
+        }
     }
 
     // Шрифты и пороги видимости — только при смене зума. `force` — вход
     // в меню: карточки заспавнены в базовом размере, а `last_zoom` мог
     // уцелеть с прошлого открытия с тем же значением.
-    let force = view.is_added();
     if force || (z - *last_zoom).abs() > f32::EPSILON {
         *last_zoom = z;
         let show_title = z >= TITLE_MIN_ZOOM;

@@ -19,6 +19,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 use super::chunk::CHUNK_TILES;
+use super::dirty::DirtyTiles;
 use super::objects::{ObjectKind, WorldObject};
 use super::scheduler::{Scheduler, TaskKind};
 use super::tile::TileType;
@@ -155,14 +156,14 @@ pub fn after_tile_changed(world: &World, sched: &mut Scheduler, tick: u64, pos: 
 }
 /// Обрабатывает исполненное событие растительности: применяет правило,
 /// планирует продолжение цепочки и дописывает изменившиеся тайлы в
-/// `dirty` (рендер по ним перестраивает terrain-блоки). Вызывается
-/// тиковой системой app-слоя.
+/// `dirty` с каналом причины (трава/эрозия меняют рельеф, кусты — декор).
+/// Вызывается тиковой системой app-слоя.
 pub fn apply_task(
     kind: &TaskKind,
     world: &mut World,
     sched: &mut Scheduler,
     tick: u64,
-    dirty: &mut Vec<TilePos>,
+    dirty: &mut DirtyTiles,
 ) {
     match *kind {
         TaskKind::GrassSpread { chunk, local_index } => {
@@ -184,7 +185,7 @@ fn grass_spread(
     tick: u64,
     chunk: ChunkPos,
     local: u8,
-    dirty: &mut Vec<TilePos>,
+    dirty: &mut DirtyTiles,
 ) {
     let seed = world.seed;
     let pos = tile_pos(chunk, local);
@@ -201,7 +202,7 @@ fn grass_spread(
     let mut rng = event_rng(seed, tick, TAG_GRASS, chunk, local);
     let target = dirt[rng.random_range(0..dirt.len())];
     world.set_terrain(target, TileType::Grass);
-    dirty.push(target);
+    dirty.terrain(target);
     // Новый тайл травы начинает собственную цепочку, источник продолжается,
     // пока рядом остаётся земля (проверки внутри планировщиков).
     schedule_grass_spread(world, sched, seed, tick, target);
@@ -214,7 +215,7 @@ fn bush_growth(
     sched: &mut Scheduler,
     tick: u64,
     chunk: ChunkPos,
-    dirty: &mut Vec<TilePos>,
+    dirty: &mut DirtyTiles,
 ) {
     let seed = world.seed;
     // Один обход слоя чанка: считаем кусты и собираем кандидатов — тайлы
@@ -245,7 +246,7 @@ fn bush_growth(
     let idx = candidates[rng.random_range(0..candidates.len())];
     let pos = tile_pos(chunk, idx);
     world.set_object(pos, Some(WorldObject::bush()));
-    dirty.push(pos);
+    dirty.decor(pos);
     // Продолжаем, пока есть кандидаты и предел не достигнут (проверка
     // внутри с учётом только что выросшего куста).
     schedule_bush_growth(world, sched, seed, tick, chunk);
@@ -258,7 +259,7 @@ fn water_erosion(
     tick: u64,
     chunk: ChunkPos,
     local: u8,
-    dirty: &mut Vec<TilePos>,
+    dirty: &mut DirtyTiles,
 ) {
     let seed = world.seed;
     let pos = tile_pos(chunk, local);
@@ -276,7 +277,7 @@ fn water_erosion(
     let target = targets[rng.random_range(0..targets.len())];
     let kind = world.terrain_kind(target);
     world.set_terrain(target, eroded(kind));
-    dirty.push(target);
+    dirty.terrain(target);
     // Вода продолжает подтачивать, пока есть что эродировать.
     schedule_water_erosion(world, sched, seed, tick, pos);
 }

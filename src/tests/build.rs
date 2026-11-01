@@ -2,6 +2,7 @@
 //! применение команды `PlayerBuild` (плата, проверка тайла).
 
 use crate::simulation::commands::{Command, CommandQueue, buildable_at};
+use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::items::{ItemKind, ItemStack};
 use crate::simulation::objects::{ObjectKind, WorldObject};
 use crate::simulation::player::{Player, WorldPos};
@@ -20,7 +21,7 @@ fn setup() -> (World, Player, TilePos) {
 
 /// Применяет очередь команд к миру с игроком.
 fn apply(queue: &mut CommandQueue, world: &mut World, player: &mut Player) {
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     queue.apply_all(world, Some(player), &mut dirty, &mut Scheduler::default(), 0);
 }
 

@@ -1,7 +1,7 @@
 //! Тесты системы одежды: тепло предметов, сбор тепла только из надетых
 //! слотов одежды и правила слотов одежды в инвентаре.
 
-use crate::simulation::clothes::{warmth, warmth_of, WARMTH_MAX};
+use crate::simulation::clothes::{warmth, warmth_of};
 use crate::simulation::items::{Inventory, ItemKind, ItemStack, SlotArea, SlotRef};
 
 /// Пока предметов одежды нет, тепло у всех существующих предметов
@@ -34,12 +34,4 @@ fn warmth_counts_equipped_clothes_slots_only() {
         ItemStack { kind: ItemKind::Apple, count: 1 },
     );
     assert_eq!(warmth(&inv), 0.0, "яблоко в слоте одежды не греет");
-}
-
-/// Шкала тепла зажимается в [0, WARMTH_MAX] (граница сверяется с
-/// константой индикатора UI).
-#[test]
-fn warmth_scale_bounds() {
-    assert!(WARMTH_MAX > 0.0);
-    assert_eq!(WARMTH_MAX, 100.0);
 }

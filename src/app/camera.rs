@@ -3,6 +3,7 @@
 use bevy::camera::{Camera2d, Camera3d, OrthographicProjection, Projection};
 use bevy::input::mouse::{MouseButton, MouseMotion, MouseWheel};
 use bevy::input_focus::InputFocus;
+use bevy::light::cluster::ClusterConfig;
 use bevy::prelude::*;
 use bevy::ui_widgets::TextInput;
 
@@ -101,6 +102,12 @@ fn spawn_camera(
             order: 0,
             ..default()
         },
+        // Реальных 3D-светов нет: все материалы unlit, свет костра —
+        // собственный шейдер оверлея. Один кластер на весь фрустум вместо
+        // полной кластеризации света Bevy (~2% кадра). Вариант None здесь
+        // нельзя: bevy 0.20.1 для активной камеры с None всё равно строит
+        // dummy-текстуру нулевого размера и падает на validation error.
+        ClusterConfig::Single,
         Projection::Orthographic(projection.clone()),
         transform,
         WorldCamera,
@@ -279,7 +286,7 @@ pub(crate) fn update_camera_transforms(
     state: Res<GameState>,
     camera_target: Res<CameraTarget>,
     mut world_camera: Query<
-        (&mut Transform, &Projection),
+        (&mut Transform, &mut Projection),
         (With<WorldCamera>, Without<OverlayCamera>),
     >,
     mut overlay_camera: Query<
@@ -289,13 +296,22 @@ pub(crate) fn update_camera_transforms(
 ) {
     let distance = state.world_size.tiles() as f32 * WORLD_TILE_SIZE * 2.0;
     let transform = camera_target.camera_transform(distance);
-    let Ok((mut world_transform, world_projection)) = world_camera.single_mut() else {
+    let Ok((mut world_transform, mut world_projection)) = world_camera.single_mut() else {
         return;
     };
     *world_transform = transform;
-    let Projection::Orthographic(_) = world_projection else {
+    let Projection::Orthographic(world_ortho) = &mut *world_projection else {
         return;
     };
+    // Дальняя плоскость должна следовать за размером мира: far, назначенный
+    // при старте для мира 256², резал дальний угол карт ~от 600 тайлов
+    // (глубина дальнего угла ≈ 2.6·W больше far = 6·W₂₅₆). Точность
+    // depth-буфера не страдает: для ортопроекции она равномерна и даже на
+    // мире 16384² составляет ~0.1 юнита.
+    let want_far = distance * 3.0;
+    if (world_ortho.far - want_far).abs() > f32::EPSILON {
+        world_ortho.far = want_far;
+    }
     let Ok((mut overlay_transform, mut overlay_projection)) = overlay_camera.single_mut() else {
         return;
     };

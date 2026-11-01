@@ -83,6 +83,7 @@ impl Plugin for RenderingPlugin {
         app.add_plugins(Material2dPlugin::<lighting::DarknessMaterial>::default())
             .add_systems(Startup, textures::load_tile_textures)
             .init_resource::<TerrainRender>()
+            .init_resource::<RenderMetrics>()
             .init_resource::<EntitySprites>()
             .init_resource::<WorldSpriteAssets>()
             .init_resource::<HurtFlashes>()
@@ -161,6 +162,28 @@ struct IncomingLod {
     blocks: HashMap<BlockPos, BuiltBlock>,
 }
 
+/// Счётчики рендера для FPS-панели (GAME_DESIGN 9, ARCHITECTURE 9):
+/// события dirty по каналам, перестройки блоков, время сборки мешей,
+/// число видимых блоков и спрайтов. События и время накапливаются с
+/// прошлого опроса панели; панель сбрасывает их, читая. Только для
+/// отладки, на симуляцию не влияет.
+#[derive(Resource, Default)]
+pub(crate) struct RenderMetrics {
+    /// Terrain-события dirty с прошлого опроса панели.
+    pub(crate) terrain_events: u32,
+    /// Decor-события dirty (объекты/предметы) с прошлого опроса панели.
+    pub(crate) decor_events: u32,
+    /// Полных перестроек terrain-блоков с прошлого опроса панели.
+    pub(crate) rebuilds: u32,
+    /// Суммарное время `build_block_mesh` с прошлого опроса панели, мс.
+    pub(crate) mesh_build_ms: f32,
+    /// Видимых terrain-блоков на текущий кадр.
+    pub(crate) visible_blocks: u32,
+    /// Спрайтов-детей terrain-блоков на текущий кадр (объекты, предметы,
+    /// счётчики).
+    pub(crate) block_sprites: u32,
+}
+
 /// Метка сущности terrain-блока.
 #[derive(Component)]
 struct TerrainBlock;
@@ -181,17 +204,24 @@ struct ItemCountLabel;
 
 /// Соответствие «id существа симуляции → Bevy-сущность спрайта».
 /// Спрайты создаются только для видимых существ и удаляются, когда
-/// существо уходит с экрана.
+/// существо уходит с экрана. `textures` хранит текстуру текущего
+/// материала: она меняется только со сменой состояния/кадра анимации,
+/// поэтому `MeshMaterial3d` пере-инсертится лишь тогда.
 #[derive(Resource, Default)]
 struct EntitySprites {
     map: HashMap<u64, Entity>,
+    textures: HashMap<u64, bevy::asset::AssetId<Image>>,
 }
 
 /// Общий quad и материалы для world-space спрайтов с depth test.
+/// `object_sizes` кэширует размеры спрайтов по текстуре: чтение размеров
+/// из `Assets<Image>` на каждый спавн заменяется lookup'ом. Кэшируется
+/// только загруженное изображение — до загрузки размер считается заново.
 #[derive(Resource, Default)]
 struct WorldSpriteAssets {
     quad: Option<Handle<Mesh>>,
     materials: HashMap<(AssetId<Image>, bool), Handle<StandardMaterial>>,
+    object_sizes: HashMap<AssetId<Image>, Vec2>,
 }
 
 /// Сколько секунд после удара существо подсвечивается красным.
@@ -382,6 +412,7 @@ fn render_world(
     mut commands: Commands,
     mut state: ResMut<GameState>,
     mut render: ResMut<TerrainRender>,
+    mut metrics: ResMut<RenderMetrics>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut sprite_assets: ResMut<WorldSpriteAssets>,
@@ -389,6 +420,7 @@ fn render_world(
     textures: Res<TileTextures>,
     font: Res<UiFont>,
     camera: Query<(&Camera, &Transform, &Projection), With<WorldCamera>>,
+    terrain_blocks: Query<&Children, With<TerrainBlock>>,
 ) {
     // Мир перегенерирован: убираем обе сцены и начинаем с нуля.
     if state.pending_rerender {
@@ -406,6 +438,8 @@ fn render_world(
     // Изменённые тайлы изымаются до заимствования мира: список
     // обнуляется на месте, «расходуется» рендером.
     let dirty = std::mem::take(&mut state.dirty_tiles);
+    metrics.terrain_events += dirty.terrain.len() as u32;
+    metrics.decor_events += dirty.decor.len() as u32;
 
     let Some(world) = state.world.as_ref() else {
         return;
@@ -419,12 +453,22 @@ fn render_world(
     let Projection::Orthographic(ortho) = projection else {
         return;
     };
-    // Точечная перестройка блоков с изменёнными тайлами (инструменты редактора, добыча игрока): 
-    // блок пересобирается целиком, вместе с дочерними объектами.
-    if !dirty.is_empty() {
+    // Точечная перестройка terrain-блоков (инструменты редактора, добыча
+    // травы, растительность): блок пересобирается целиком, вместе с
+    // дочерними объектами.
+    if !dirty.terrain.is_empty() {
         rebuild_dirty_blocks(
             &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world,
-            &material, camera_transform.rotation, &textures, &font, &dirty, &mut render,
+            &material, camera_transform.rotation, &textures, &font, &dirty.terrain, &mut render,
+            &mut metrics,
+        );
+    }
+    // Объекты и предметы (декор) не меняют геометрию меша: достаточно
+    // пересобрать дочерние спрайты затронутых блоков.
+    if !dirty.decor.is_empty() {
+        refresh_decor(
+            &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world,
+            camera_transform.rotation, &textures, &font, &dirty.decor, &render,
         );
     }
     if ortho.area.width() <= 0.0 || ortho.area.height() <= 0.0 {
@@ -474,12 +518,12 @@ fn render_world(
     // Новая часть viewport сразу получает дешёвый плоский placeholder,
     // вместо чёрного фона на время построения полноразмерного блока.
     for block in visible.iter().copied() {
-        if !render.active.contains_key(&block) {
-            let fallback = build_fallback_block(
+        render
+            .active
+            .entry(block)
+            .or_insert_with(|| build_fallback_block(
                 &mut commands, &mut meshes, world, &material, block,
-            );
-            render.active.insert(block, fallback);
-        }
+            ));
     }
 
     // Убираем блоки активной сцены, которые перестали быть видимыми.
@@ -519,7 +563,7 @@ fn render_world(
             }
             let built = build_block(
                 &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world,
-                &material, camera_transform.rotation, &textures, &font, block, lod,
+                &material, camera_transform.rotation, &textures, &font, &mut metrics, block, lod,
             );
             render.active.insert(block, built);
             built_now += 1;
@@ -547,8 +591,8 @@ fn render_world(
                 continue;
             }
             let built = build_block(
-                &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world, &material, 
-                camera_transform.rotation, &textures, &font, block, incoming_lod,
+                &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world, &material,
+                camera_transform.rotation, &textures, &font, &mut metrics, block, incoming_lod,
             );
             commands.entity(built.entity).insert(Visibility::Hidden);
             blocks.insert(block, built);
@@ -563,6 +607,15 @@ fn render_world(
             &mut commands, &mut meshes, &mut render, &visible_set,
         );
     }
+
+    // Абсолютные счётчики текущего кадра (панель показывает их без пересчёта).
+    metrics.visible_blocks = render.active.len() as u32;
+    metrics.block_sprites = render
+        .active
+        .values()
+        .filter_map(|block| terrain_blocks.get(block.entity).ok())
+        .map(|children| children.len() as u32)
+        .sum();
 }
 
 /// Удаляет строящуюся сцену нового LOD (отмена перехода или перезапуск).
@@ -633,6 +686,7 @@ fn rebuild_dirty_blocks(
     font: &Res<UiFont>,
     dirty: &[TilePos],
     render: &mut TerrainRender,
+    metrics: &mut RenderMetrics,
 ) {
     let mut blocks: HashSet<BlockPos> = HashSet::with_capacity(dirty.len());
     for tile in dirty {
@@ -661,9 +715,10 @@ fn rebuild_dirty_blocks(
         if let Some(block) = render.active.remove(&pos) {
             despawn_block(commands, meshes, block);
             let built = build_block(
-                commands, meshes, materials, sprite_assets, images, world, material, camera_rotation, textures, font, pos, render.lod,
+                commands, meshes, materials, sprite_assets, images, world, material, camera_rotation, textures, font, metrics, pos, render.lod,
             );
             render.active.insert(pos, built);
+            metrics.rebuilds += 1;
         }
     }
 
@@ -680,13 +735,85 @@ fn rebuild_dirty_blocks(
                 despawn_block(commands, meshes, block);
                 let built =
                     build_block(
-                        commands, meshes, materials, sprite_assets, images, world, material, camera_rotation, textures, font, pos, lod,
+                        commands, meshes, materials, sprite_assets, images, world, material, camera_rotation, textures, font, metrics, pos, lod,
                     );
                 commands.entity(built.entity).insert(Visibility::Hidden);
                 incoming.blocks.insert(pos, built);
+                metrics.rebuilds += 1;
             }
         }
     }
+}
+
+/// Обновляет декор (объекты и предметы) блоков с изменёнными тайлами, не
+/// трогая terrain-меш: изменение объекта/предмета не меняет геометрию.
+/// Дети блока снимаются целиком и спавнятся заново — тот же путь, что при
+/// постройке блока. Декор рисуется только на LOD ≤ 1: на дальних блоках и
+/// в fallback-блоках обновлять нечего.
+fn refresh_decor(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    sprite_assets: &mut WorldSpriteAssets,
+    images: &Assets<Image>,
+    world: &World,
+    camera_rotation: Quat,
+    textures: &TileTextures,
+    font: &Res<UiFont>,
+    decor: &[TilePos],
+    render: &TerrainRender,
+) {
+    let mut blocks: HashSet<BlockPos> = HashSet::with_capacity(decor.len());
+    for tile in decor {
+        blocks.insert(BlockPos {
+            x: tile.x.div_euclid(BLOCK_TILES),
+            y: tile.y.div_euclid(BLOCK_TILES),
+        });
+    }
+    for block in blocks {
+        if let Some(built) = render.active.get(&block) {
+            refresh_block_decor(
+                built, commands, meshes, materials, sprite_assets, images, world,
+                camera_rotation, textures, font, block,
+            );
+        }
+        if let Some(incoming) = render.incoming.as_ref() && let Some(built) = incoming.blocks.get(&block) {
+            refresh_block_decor(
+                built, commands, meshes, materials, sprite_assets, images, world,
+                camera_rotation, textures, font, block,
+            );
+        }
+    }
+}
+
+/// Пересобирает детей одного блока (объекты и предметы на земле).
+fn refresh_block_decor(
+    built: &BuiltBlock,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    sprite_assets: &mut WorldSpriteAssets,
+    images: &Assets<Image>,
+    world: &World,
+    camera_rotation: Quat,
+    textures: &TileTextures,
+    font: &Res<UiFont>,
+    block: BlockPos,
+) {
+    if built.fallback || built.lod > 1 {
+        return;
+    }
+    let Ok(mut entity) = commands.get_entity(built.entity) else {
+        return;
+    };
+    entity.despawn_related::<Children>();
+    let origin = block_origin(block);
+    spawn_objects(
+        &mut entity, meshes, materials, sprite_assets, images, world, block, origin, camera_rotation, textures,
+    );
+    spawn_items(
+        &mut entity, meshes, materials, sprite_assets, world, block, origin, camera_rotation, textures, &font.0,
+    );
 }
 
 /// Обновляет спрайт игрока: существует и следует за сущностью в режиме
@@ -775,6 +902,7 @@ fn update_entity_sprites(
         for (_, entity) in sprites.map.drain() {
             commands.entity(entity).despawn();
         }
+        sprites.textures.clear();
         for (_, overlay) in flashes.overlays.drain() {
             commands.entity(overlay).despawn();
         }
@@ -825,7 +953,6 @@ fn update_entity_sprites(
         }
 
         let texture = textures.entity_texture(entity);
-        let material = world_sprite_material(texture, false, &mut sprite_assets, &mut materials);
         let transform = entity_transform(
             &pos,
             world,
@@ -836,15 +963,26 @@ fn update_entity_sprites(
 
         match sprites.map.get(&entity.id).copied() {
             Some(bevy_entity) => {
-                commands
-                    .entity(bevy_entity)
-                    .insert((MeshMaterial3d(material), transform));
+                // Материал меняется только со сменой текстуры (состояние/кадр
+                // анимации): без смены — двигаем спрайт, не трогая компонент.
+                if sprites.textures.get(&entity.id) != Some(&texture.id()) {
+                    let material =
+                        world_sprite_material(texture, false, &mut sprite_assets, &mut materials);
+                    commands
+                        .entity(bevy_entity)
+                        .insert((MeshMaterial3d(material), transform));
+                    sprites.textures.insert(entity.id, texture.id());
+                } else {
+                    commands.entity(bevy_entity).insert(transform);
+                }
             }
             None => {
+                let material = world_sprite_material(texture, false, &mut sprite_assets, &mut materials);
                 let bevy_entity = commands
                     .spawn((Mesh3d(quad.clone()), MeshMaterial3d(material), transform, EntitySprite))
                     .id();
                 sprites.map.insert(entity.id, bevy_entity);
+                sprites.textures.insert(entity.id, texture.id());
             }
         }
 
@@ -885,6 +1023,7 @@ fn update_entity_sprites(
         if let Some(entity) = sprites.map.remove(&id) {
             commands.entity(entity).despawn();
         }
+        sprites.textures.remove(&id);
         // Существо покинуло экран или умерло: вспышка и overlay не нужны.
         flashes.prev_hp.remove(&id);
         flashes.timers.remove(&id);
@@ -962,10 +1101,13 @@ fn build_block(
     camera_rotation: Quat,
     textures: &TileTextures,
     font: &Res<UiFont>,
+    metrics: &mut RenderMetrics,
     block: BlockPos,
     lod: u32,
 ) -> BuiltBlock {
+    let started = std::time::Instant::now();
     let mesh = build_block_mesh(world, block, lod).map(|mesh| meshes.add(mesh));
+    metrics.mesh_build_ms += started.elapsed().as_secs_f32() * 1000.0;
     let origin = block_origin(block);
 
     let mut entity = commands.spawn((
@@ -1063,7 +1205,8 @@ fn build_fallback_block_mesh(world: &World, block: BlockPos) -> Option<Mesh> {
         atlas_uv_coordinates(index).to_vec(),
     );
     mesh.insert_indices(Indices::U32([0, 1, 2, 0, 2, 3].into()));
-    mesh.compute_normals();
+    // Нормали не считаем: материал terrain unlit (см. ensure_ground_material),
+    // шейдер без атрибута нормали компилируется без VERTEX_NORMALS.
     Some(mesh)
 }
 
@@ -1115,7 +1258,6 @@ fn collect_visible_blocks(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn block_region_intersects_view(
     bx0: i32,
     by0: i32,
@@ -1353,7 +1495,9 @@ pub(crate) fn build_block_mesh(world: &World, block: BlockPos, lod: u32) -> Opti
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(indices));
-    mesh.compute_normals();
+    // Нормали не считаем: материал terrain unlit, освещение по нормалям
+    // не считается, а без атрибута Bevy не включает VERTEX_NORMALS в шейдере.
+    // Это ~2/3 стоимости сборки меша (профиль: compute_normals был 1.38%).
     Some(mesh)
 }
 
@@ -1486,10 +1630,7 @@ fn spawn_objects(
                         y: cpy * CHUNK_SIZE as i32 + (idx / CHUNK_SIZE as u8) as i32,
                     };
                     let handle = textures.object_texture(obj);
-                    let size = images
-                        .get(handle)
-                        .map(|image| object_sprite_size(obj.kind, image))
-                        .unwrap_or(Vec2::splat(TILE_SIZE));
+                    let size = object_sprite_size_cached(obj.kind, handle, images, sprite_assets);
                     // Спрайт центром по X над тайлом; низ прижат к нижней границе родного тайла (не ниже и не в воздухе).
                     let tile_world = world_position(
                         world,
@@ -1519,7 +1660,6 @@ fn spawn_objects(
 /// отображаются в 1.2 тайла (объекты чуть перекрывают свой тайл), поэтому
 /// текстура 64×64 даёт 1.2×1.2 тайла, а высокая 64×128 (деревья) —
 /// 1.2×2.4 тайла. Постройки (текстуры 16×16) занимают ровно свой тайл.
-/// Текстура ещё не загружена — тайл-плейсхолдер.
 fn object_sprite_size(kind: ObjectKind, image: &Image) -> Vec2 {
     if kind.is_building() {
         return Vec2::splat(TILE_SIZE);
@@ -1527,6 +1667,31 @@ fn object_sprite_size(kind: ObjectKind, image: &Image) -> Vec2 {
     const TILES_PER_64PX: f32 = 1.2;
     let scale = TILES_PER_64PX * TILE_SIZE / 64.0;
     Vec2::new(image.width() as f32 * scale, image.height() as f32 * scale)
+}
+
+/// Размер спрайта объекта с кэшем по текстуре: пересчёт из `Assets<Image>`
+/// только при первом спавне объекта с этой текстурой (и после загрузки —
+/// незагруженная текстура в кэш не попадает, до загрузки тайл-плейсхолдер).
+fn object_sprite_size_cached(
+    kind: ObjectKind,
+    handle: &Handle<Image>,
+    images: &Assets<Image>,
+    sprite_assets: &mut WorldSpriteAssets,
+) -> Vec2 {
+    if kind.is_building() {
+        return Vec2::splat(TILE_SIZE);
+    }
+    match sprite_assets.object_sizes.get(&handle.id()) {
+        Some(size) => *size,
+        None => match images.get(handle) {
+            Some(image) => {
+                let size = object_sprite_size(kind, image);
+                sprite_assets.object_sizes.insert(handle.id(), size);
+                size
+            }
+            None => Vec2::splat(TILE_SIZE),
+        },
+    }
 }
 
 /// Спавнит предметы на тайлах блока (дроп) как дочерние спрайты.
@@ -1618,6 +1783,12 @@ struct BuildHologram;
 /// выбранного вида на тайле под курсором (привязка к сетке тайлов).
 /// Зелёная — поставить можно (тайл свободен, не вода, в радиусе
 /// взаимодействия и хватает предметов), красная — нельзя.
+///
+/// Пересчёт только при изменении ввода (курсор, камера): выбор тайла —
+/// луч по рельефу, а он одинаков, пока ничего не двигалось. Финальную
+/// корректность всё равно проверяет симуляция при применении команды,
+/// поэтому устаревший цвет после подбора предмета с неподвижным курсором
+/// поправится при первом же движении мыши.
 fn update_build_hologram(
     mut commands: Commands,
     state: Res<GameState>,
@@ -1625,9 +1796,13 @@ fn update_build_hologram(
     player: Res<PlayerRes>,
     textures: Res<TileTextures>,
     images: Res<Assets<Image>>,
+    mut sprite_assets: ResMut<WorldSpriteAssets>,
     windows: Query<&Window>,
-    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
+    cameras: Query<(&Camera, &Transform, &Projection), With<Camera2d>>,
+    // Отдельный запрос 2-компонентный под сигнатуру cursor_world_tile.
+    pick_cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     existing: Query<Entity, With<BuildHologram>>,
+    mut last_input: Local<Option<(Option<Vec2>, Vec3, f32)>>,
 ) {
     let selected = if construction.open && state.mode == GameMode::Player {
         construction.selected
@@ -1645,8 +1820,21 @@ fn update_build_hologram(
     let Ok(window) = windows.single() else {
         return;
     };
+    let Ok((_, camera_transform, projection)) = cameras.single() else {
+        return;
+    };
+    let Projection::Orthographic(ortho) = projection else {
+        return;
+    };
+    // Рай-пик и вся логика — только когда двигался курсор или камера.
+    let frame_input = (window.cursor_position(), camera_transform.translation, ortho.scale);
+    if *last_input == Some(frame_input) && existing.iter().next().is_some() {
+        return;
+    }
+    *last_input = Some(frame_input);
+
     // Курсор вне окна или за границами мира: голограмму рисовать не на чем.
-    let Some(tile) = cursor_world_tile(window, &cameras, Some(world)) else {
+    let Some(tile) = cursor_world_tile(window, &pick_cameras, Some(world)) else {
         for entity in &existing {
             commands.entity(entity).despawn();
         }
@@ -1660,13 +1848,7 @@ fn update_build_hologram(
     let valid = affordable && buildable_at(world, tile) && p.reachable(tile, world);
 
     let handle = textures.kind_texture(kind).clone();
-    let size = images
-        .get(&handle)
-        .map(|image| object_sprite_size(kind, image))
-        .unwrap_or(Vec2::splat(TILE_SIZE));
-    let Ok((_, camera_transform)) = cameras.single() else {
-        return;
-    };
+    let size = object_sprite_size_cached(kind, &handle, &images, &mut sprite_assets);
     let tile_world = world_position(
         world,
         Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),

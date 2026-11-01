@@ -145,6 +145,7 @@ fn tick_world(
     mut clock: ResMut<ClockRes>,
     mut sched: ResMut<SchedulerRes>,
     mut timing: ResMut<TickTiming>,
+    mut fired: Local<Vec<(u64, Task)>>,
     mut events: MessageWriter<TickEvent>,
 ) {
     // На паузе тики не генерируются и аккумулятор не растёт (GAME_DESIGN 3.3):
@@ -187,10 +188,13 @@ fn tick_world(
     }
 
     // Dirty-флаги изымаются до мутации мира: события растительности
-    // дописывают позиции изменённых тайлов, рендер «расходует» их за кадр.
+    // дописывают позиции изменённых тайлов (с каналом причины), рендер
+    // «расходует» их за кадр.
     let mut dirty = std::mem::take(&mut state.dirty_tiles);
     let started = std::time::Instant::now();
-    let mut fired: Vec<(u64, Task)> = Vec::new();
+    // Список исполненных задач переиспользуется между кадрами: ёмкость
+    // переживает кадр, аллокаций на ровном месте нет.
+    fired.clear();
     for _ in 0..ticks {
         clock.0.tick_once();
         let tick = clock.0.tick;
@@ -239,7 +243,8 @@ fn tick_world(
     state.dirty_tiles = dirty;
 
     // Шина событий: исполненные задачи уходят слушателям (появятся позже).
-    for (tick, task) in fired {
+    // drain оставляет ёмкость вектора на следующий кадр.
+    for (tick, task) in fired.drain(..) {
         events.write(TickEvent { tick, task });
     }
 
@@ -264,9 +269,9 @@ pub struct TickEvent {
 /// Применяет команды контроллеров (UI, «бог», игрок) к миру.
 ///
 /// Команды применяются каждый кадр в порядке FIFO — редактор работает и на
-/// паузе. Изменённые тайлы уходят в `dirty_tiles`, по ним рендер
-/// перестраивает terrain-блоки; вокруг них перезапускаются цепочки
-/// растительности.
+/// паузе. Изменённые тайлы уходят в `dirty_tiles` с каналом причины, по ним
+/// рендер пересобирает меш блока или только его декор; вокруг них
+/// перезапускаются цепочки растительности.
 pub(crate) fn apply_commands(
     mut queue: ResMut<CommandQueueRes>,
     mut state: ResMut<GameState>,

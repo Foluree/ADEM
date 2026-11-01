@@ -1,6 +1,7 @@
 //! Тесты существ: спавн и HP волков, автомат состояний, анимация ходьбы,
 //! поведение в воде, команды Spawn/RemoveEntity.
 
+use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::tile::TileType;
 use crate::simulation::world::{TilePos, World, WorldSize};
 
@@ -163,7 +164,7 @@ fn spawn_entity_command_places_wolf_at_tile_center() {
     let pos = TilePos { x: 7, y: 9 };
     queue.push(crate::simulation::Command::SpawnEntity { kind: EntityKind::Wolf, pos });
 
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     let mut sched = crate::simulation::Scheduler::default();
     queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
 
@@ -190,7 +191,7 @@ fn remove_entity_command_deletes_by_id() {
     let second = world.entities.spawn(EntityKind::Wolf, WorldPos { x: 8.5, y: 9.5 });
 
     queue.push(Command::RemoveEntity { id: first });
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
 
     let ids: Vec<u64> = world.entities.iter().map(|entity| entity.id).collect();
@@ -215,7 +216,7 @@ fn move_entity_command_places_and_stands() {
 
     let target = WorldPos { x: 12.25, y: 9.75 };
     queue.push(Command::MoveEntity { id, pos: target });
-    let mut dirty = Vec::new();
+    let mut dirty = DirtyTiles::default();
     queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
 
     let wolf = &world.entities.entities[0];
