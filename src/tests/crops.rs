@@ -1,43 +1,61 @@
 //! Культуры: посев, рост по стадиям (с зимней паузой), уборка урожая.
+//! Посев и уборка исполняются человеком мира через действия симуляции.
 
+use crate::simulation::actions;
 use crate::simulation::crops::{self, Crop, CropKind};
 use crate::simulation::dirty::DirtyTiles;
+use crate::simulation::entities::EntityKind;
 use crate::simulation::items::{ItemKind, MISC_SLOTS};
-use crate::simulation::player::{Player, WorldPos};
 use crate::simulation::scheduler::Scheduler;
 use crate::simulation::tile::TileType;
 use crate::simulation::time::TICKS_PER_MONTH;
-use crate::simulation::world::{TilePos, World, WorldSize};
+use crate::simulation::world::{TilePos, World, WorldPos, WorldSize};
 
-/// Плоский мир с пашней в углу и игроком рядом.
-fn farm_world() -> (World, Player) {
+/// Плоский мир с пашней в углу и человеком рядом (возвращает id существа).
+fn farm_world() -> (World, u64) {
     let mut world = World::new(WorldSize::new(256), 7);
     let pos = TilePos { x: 10, y: 10 };
     world.set_terrain(pos, TileType::Farmland);
-    let player = Player::new(WorldPos::of_tile_center(TilePos { x: 11, y: 10 }));
-    (world, player)
+    let actor = world
+        .entities
+        .spawn(EntityKind::Human, WorldPos::of_tile_center(TilePos { x: 11, y: 10 }));
+    (world, actor)
+}
+
+/// Ум существа (мутабельно): инвентарь, голод, выбранный слот.
+fn mind_mut(world: &mut World, actor: u64) -> &mut crate::simulation::HumanMind {
+    world
+        .entities
+        .get_mut(actor)
+        .unwrap()
+        .mind
+        .as_mut()
+        .unwrap()
 }
 
 #[test]
 fn sow_requires_farmland_and_plantable_item() {
-    let (mut world, mut player) = farm_world();
+    let (mut world, actor) = farm_world();
     // Нет сажаемого предмета — посев невозможен.
-    assert!(!player.sow(TilePos { x: 10, y: 10 }, &mut world));
+    assert!(!actions::sow(&mut world, actor, TilePos { x: 10, y: 10 }));
 
     // Не пашня — посев невозможен даже с семенами.
-    player.inventory.add(ItemKind::WheatSeeds, 2);
+    mind_mut(&mut world, actor).inventory.add(ItemKind::WheatSeeds, 2);
     world.set_terrain(TilePos { x: 10, y: 10 }, TileType::Grass);
-    assert!(!player.sow(TilePos { x: 10, y: 10 }, &mut world));
+    assert!(!actions::sow(&mut world, actor, TilePos { x: 10, y: 10 }));
 
     world.set_terrain(TilePos { x: 10, y: 10 }, TileType::Farmland);
-    assert!(player.sow(TilePos { x: 10, y: 10 }, &mut world));
+    assert!(actions::sow(&mut world, actor, TilePos { x: 10, y: 10 }));
     // Семя списано, всходы на тайле, вторая посадка на занятый тайл — нет.
-    assert_eq!(player.inventory.count_of(ItemKind::WheatSeeds), 1);
+    assert_eq!(
+        mind_mut(&mut world, actor).inventory.count_of(ItemKind::WheatSeeds),
+        1
+    );
     assert_eq!(
         world.crop_at(TilePos { x: 10, y: 10 }).map(|c| (c.kind, c.stage)),
         Some((CropKind::Wheat, 0))
     );
-    assert!(!player.sow(TilePos { x: 10, y: 10 }, &mut world));
+    assert!(!actions::sow(&mut world, actor, TilePos { x: 10, y: 10 }));
 }
 
 #[test]
@@ -97,7 +115,7 @@ fn growth_pauses_in_winter_and_resumes_in_spring() {
 
 #[test]
 fn harvest_mature_crop_gives_yield_and_frees_tile() {
-    let (mut world, mut player) = farm_world();
+    let (mut world, actor) = farm_world();
     let pos = TilePos { x: 10, y: 10 };
     let stages = CropKind::Wheat.stage_count() as u8;
     world.set_crop(
@@ -106,11 +124,14 @@ fn harvest_mature_crop_gives_yield_and_frees_tile() {
     );
 
     // Место под весь урожай есть — уборка проходит.
-    assert!(player.interact(pos, &mut world));
+    assert!(actions::interact(&mut world, actor, pos));
     let yield_wheat = CropKind::Wheat.harvest_yield();
     for (kind, count) in yield_wheat {
         if count > 0 {
-            assert_eq!(player.inventory.count_of(kind), count);
+            assert_eq!(
+                mind_mut(&mut world, actor).inventory.count_of(kind),
+                count
+            );
         }
     }
     // Культура снята, пашня осталась.
@@ -120,7 +141,7 @@ fn harvest_mature_crop_gives_yield_and_frees_tile() {
 
 #[test]
 fn harvest_immune_to_full_inventory() {
-    let (mut world, mut player) = farm_world();
+    let (mut world, actor) = farm_world();
     let pos = TilePos { x: 10, y: 10 };
     let stages = CropKind::Potato.stage_count() as u8;
     world.set_crop(
@@ -129,10 +150,10 @@ fn harvest_immune_to_full_inventory() {
     );
     // Забитый инвентарь чужими предметами: урожаю деться некуда.
     for slot in 0..MISC_SLOTS {
-        player.inventory.items[slot] =
+        mind_mut(&mut world, actor).inventory.items[slot] =
             Some(crate::simulation::items::ItemStack { kind: ItemKind::Rock, count: 64 });
     }
-    assert!(!player.interact(pos, &mut world));
+    assert!(!actions::interact(&mut world, actor, pos));
     // Культура не потеряна.
     assert!(world.crop_at(pos).is_some());
 }

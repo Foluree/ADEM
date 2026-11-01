@@ -15,7 +15,7 @@ use bevy::sprite_render::{AlphaMode2d, ColorMaterial};
 
 use crate::app::input::{WeaponFx, WeaponFxKind};
 use crate::app::camera::update_camera_transforms;
-use crate::app::state::{GameMode, GameState, PlayerRes, SimTick, TickAccumulator, player_render_pos};
+use crate::app::state::{GameMode, GameState, SimTick, TickAccumulator, controlled_render_pos};
 use crate::rendering::isometric::{WORLD_TILE_SIZE, world_position};
 use crate::simulation::time::TICKS_PER_SEC;
 use crate::simulation::{ItemKind, ProjectileKind, StuckSpear, TILE_SIZE};
@@ -218,7 +218,6 @@ fn spawn_weapon_fx(
 fn update_weapon_fx(
     time: Res<Time>,
     state: Res<GameState>,
-    player: Res<PlayerRes>,
     acc: Res<TickAccumulator>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     cameras: Query<&Transform, With<Camera2d>>,
@@ -232,13 +231,13 @@ fn update_weapon_fx(
     for (entity, mut effect, material) in &mut effects {
         effect.age += time.delta_secs();
         let progress = (effect.age / effect.duration).clamp(0.0, 1.0);
-        // Интерполированная позиция игрока для эффектов, привязанных к нему
-        // (лук). Нет игрока в режиме игрока — эффекту не к чему привязываться.
-        let player_pos = player
-            .0
-            .as_ref()
+        // Интерполированная позиция захваченного существа для эффектов,
+        // привязанных к нему (лук). Нет захвата — эффекту не к чему
+        // привязываться.
+        let player_pos = state
+            .controlled_entity()
             .filter(|_| state.mode == GameMode::Player)
-            .map(|p| player_render_pos(p, &acc));
+            .map(|e| controlled_render_pos(e, &acc));
         match effect.kind {
             WeaponFxKind::Blade => {
                 let angle = effect.start_angle + BLADE_SWEEP * progress;

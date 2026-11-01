@@ -4,13 +4,12 @@ use bevy::prelude::*;
 
 use crate::simulation::commands::CommandQueue;
 use crate::simulation::dirty::DirtyTiles;
-use crate::simulation::entities::EntityKind;
+use crate::simulation::entities::{EntityKind, HumanMind, SimEntity};
 use crate::simulation::objects::{BuildingKind, ObjectKind};
-use crate::simulation::player::{Player, WorldPos};
 use crate::simulation::scheduler::Scheduler;
 use crate::simulation::tile::TileType;
 use crate::simulation::time::{GameClock, TICKS_PER_SEC};
-use crate::simulation::{World, WorldSize};
+use crate::simulation::{World, WorldPos, WorldSize};
 
 /// Скорость симуляции.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -26,6 +25,17 @@ pub enum SimSpeed {
     X12_5,
     X15,
     X20,
+    X25,
+    X30,
+    X35,
+    X40,
+    X45,
+    X50,
+    X60,
+    X70,
+    X80,
+    X90,
+    X100,
 }
 
 impl SimSpeed {
@@ -43,6 +53,17 @@ impl SimSpeed {
             SimSpeed::X12_5 => 12.5,
             SimSpeed::X15 => 15.0,
             SimSpeed::X20 => 20.0,
+            SimSpeed::X25 => 25.0,
+            SimSpeed::X30 => 30.0,
+            SimSpeed::X35 => 35.0,
+            SimSpeed::X40 => 40.0,
+            SimSpeed::X45 => 45.0,
+            SimSpeed::X50 => 50.0,
+            SimSpeed::X60 => 60.0,
+            SimSpeed::X70 => 70.0,
+            SimSpeed::X80 => 80.0,
+            SimSpeed::X90 => 90.0,
+            SimSpeed::X100 => 100.0,
         }
     }
 
@@ -60,6 +81,17 @@ impl SimSpeed {
             SimSpeed::X12_5 => "x12.5",
             SimSpeed::X15 => "x15",
             SimSpeed::X20 => "x20",
+            SimSpeed::X25 => "x25",
+            SimSpeed::X30 => "x30",
+            SimSpeed::X35 => "x35",
+            SimSpeed::X40 => "x40",
+            SimSpeed::X45 => "x45",
+            SimSpeed::X50 => "x50",
+            SimSpeed::X60 => "x60",
+            SimSpeed::X70 => "x70",
+            SimSpeed::X80 => "x80",
+            SimSpeed::X90 => "x90",
+            SimSpeed::X100 => "x100",
         }
     }
 
@@ -77,6 +109,17 @@ impl SimSpeed {
             SimSpeed::X12_5,
             SimSpeed::X15,
             SimSpeed::X20,
+            SimSpeed::X25,
+            SimSpeed::X30,
+            SimSpeed::X35,
+            SimSpeed::X40,
+            SimSpeed::X45,
+            SimSpeed::X50,
+            SimSpeed::X60,
+            SimSpeed::X70,
+            SimSpeed::X80,
+            SimSpeed::X90,
+            SimSpeed::X100,
         ]
     }
 }
@@ -154,6 +197,24 @@ pub enum MenuKind {
     Pause,
 }
 
+/// Вид линзы карты (редактор): что подсвечивается на чанках.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LensKind {
+    /// Чанки с разумными существами (люди).
+    Sentients,
+    /// Чанки с рукотворными постройками.
+    Buildings,
+}
+
+/// Включённые линзы карты (обновление раз в секунду — в rendering/lenses).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MapLenses {
+    /// Чанки с разумными существами.
+    pub sentients: bool,
+    /// Чанки с постройками.
+    pub buildings: bool,
+}
+
 /// Главное состояние игры.
 #[derive(Resource)]
 pub struct GameState {
@@ -167,8 +228,19 @@ pub struct GameState {
     pub pending_rerender: bool,
     /// Роль игрока: наблюдатель (редактор) или существо в мире.
     pub mode: GameMode,
+    /// Захваченное существо (игра за существо, GAME_DESIGN 4.1): id в
+    /// `world.entities`. `None` — наблюдатель. Инвариант: `mode == Player`
+    /// ⇔ `controlled.is_some()`, менять только через `set_controlled`.
+    pub controlled: Option<u64>,
+    /// Автономность захваченного существа (кнопка «ИИ» в HUD): `true` —
+    /// существо живёт само (FSM брожения у животных, ИИ выживания у людей),
+    /// `false` (по умолчанию) — полностью под контроллером: ни FSM, ни ИИ
+    /// его не ведут. Сбрасывается при каждом захвате.
+    pub controlled_ai: bool,
     /// Выбранный инструмент (None — клик по карте ничего не ставит).
     pub selected_tool: Option<Tool>,
+    /// Включённые линзы карты (категория «Линзы» в панели редактора).
+    pub lenses: MapLenses,
     /// Тайлы, изменённые с прошлого кадра, по каналам причины (рельеф /
     /// декор): рендер пересобирает terrain-меш блока или только дочерние
     /// спрайты. Наполняется применением команд и задачами растительности,
@@ -187,9 +259,53 @@ impl Default for GameState {
             active_menu: None,
             pending_rerender: false,
             mode: GameMode::Observer,
+            controlled: None,
+            controlled_ai: false,
             selected_tool: None,
+            lenses: MapLenses::default(),
             dirty_tiles: DirtyTiles::default(),
         }
+    }
+}
+
+impl GameState {
+    /// Захватывает существо (режим игрока) или отпускает его
+    /// (`None` — наблюдатель). Единственная точка смены режима.
+    /// Захват всегда начинается под полным контролем: ИИ выключен.
+    pub fn set_controlled(&mut self, id: Option<u64>) {
+        self.controlled = id;
+        self.controlled_ai = false;
+        self.mode = if id.is_some() {
+            GameMode::Player
+        } else {
+            GameMode::Observer
+        };
+    }
+
+    /// Захваченное существо (если существует в мире).
+    pub fn controlled_entity(&self) -> Option<&SimEntity> {
+        self.world
+            .as_ref()
+            .and_then(|world| world.entities.get(self.controlled?))
+    }
+
+    /// Захваченное существо (мутабельно): UI меняет инвентарь напрямую,
+    /// как раньше менял `PlayerRes`.
+    pub fn controlled_entity_mut(&mut self) -> Option<&mut SimEntity> {
+        self.world
+            .as_mut()
+            .and_then(|world| world.entities.get_mut(self.controlled?))
+    }
+
+    /// Ум захваченного существа: инвентарь/голод. `None` — захвата нет или
+    /// существо неразумное (волк): хотбар/инвентарь ему недоступны.
+    pub fn controlled_mind(&self) -> Option<&HumanMind> {
+        self.controlled_entity()?.mind.as_ref()
+    }
+
+    /// Ум захваченного существа (мутабельно).
+    pub fn controlled_mind_mut(&mut self) -> Option<&mut HumanMind> {
+        self.controlled_entity_mut()?.mind.as_mut()
     }
 }
 
@@ -201,15 +317,20 @@ pub struct ClockRes(pub GameClock);
 #[derive(Resource, Default)]
 pub struct SchedulerRes(pub Scheduler);
 
-/// Данные игрока: Some — существо существует. В режиме наблюдателя игрок
-/// «припаркован» (данные и инвентарь сохраняются), в режиме игрока он
-/// управляется вводом. Позиция переносится между входами в режим.
-#[derive(Resource, Default)]
-pub struct PlayerRes(pub Option<Player>);
-
 /// Bevy-обёртка над очередью команд симуляции.
 #[derive(Resource, Default)]
 pub struct CommandQueueRes(pub CommandQueue);
+
+/// Выделение существа в редакторе (задача «инспектор»): подсветка под
+/// курсором и существо с открытым окном-инспектором. Заполняется вводом
+/// (app/input.rs), читается рендером (white outline) и окном инспектора.
+#[derive(Resource, Default)]
+pub struct EditorSelection {
+    /// Существо под курсором (наблюдатель, радиус выбора — в input.rs).
+    pub hovered: Option<u64>,
+    /// Существо с открытым окном-инспектором (СКМ-клик).
+    pub selected: Option<u64>,
+}
 
 /// Аккумулятор реального времени для фикс-степ тика.
 #[derive(Resource, Default)]
@@ -235,12 +356,12 @@ pub fn interpolate_pos(prev: WorldPos, pos: WorldPos, acc: &TickAccumulator) -> 
     }
 }
 
-/// Позиция игрока для рендера в этом кадре: интерполяция между позициями
-/// прошлого и текущего тиков по заполнению аккумулятора фикс-степа.
-/// Позиция меняется дискретно по тикам (20 раз в секунду), без
-/// интерполяции спрайт и камера двигались бы рывками.
-pub fn player_render_pos(player: &Player, acc: &TickAccumulator) -> WorldPos {
-    interpolate_pos(player.prev_pos, player.pos, acc)
+/// Позиция захваченного существа для рендера в этом кадре: интерполяция
+/// между позициями прошлого и текущего тиков по заполнению аккумулятора
+/// фикс-степа. Позиция меняется дискретно по тикам (20 раз в секунду),
+/// без интерполяции спрайт и камера двигались бы рывками.
+pub fn controlled_render_pos(entity: &SimEntity, acc: &TickAccumulator) -> WorldPos {
+    interpolate_pos(entity.prev_pos, entity.pos, acc)
 }
 
 /// Сглаженное время исполнения одного тика (мс) — для FPS-панели

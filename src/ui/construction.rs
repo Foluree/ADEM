@@ -14,7 +14,7 @@ use bevy::ui_widgets::{Activate, Button, TextInput};
 
 use crate::app::input::cursor_world_tile;
 use crate::app::settings::{ControlAction, Settings};
-use crate::app::state::{CommandQueueRes, GameMode, GameState, PlayerRes};
+use crate::app::state::{CommandQueueRes, GameMode, GameState};
 use crate::simulation::commands::Command;
 use crate::simulation::objects::{BuildingKind, ObjectKind, build_cost};
 use crate::ui::UiFont;
@@ -88,7 +88,6 @@ fn toggle_construction(
     settings: Res<Settings>,
     mut construction: ResMut<ConstructionUi>,
     state: Res<GameState>,
-    player: Res<PlayerRes>,
     capture: Res<BindingCapture>,
     focus: Res<InputFocus>,
     text_inputs: Query<(), With<TextInput>>,
@@ -105,7 +104,7 @@ fn toggle_construction(
         return;
     }
     // Меню строительства — инструмент игрока: в наблюдателе не открывается.
-    if state.mode != GameMode::Player || player.0.is_none() {
+    if state.mode != GameMode::Player || state.controlled_mind().is_none() {
         return;
     }
 
@@ -131,14 +130,13 @@ fn toggle_construction(
 fn close_on_mode_change(
     mut commands: Commands,
     state: Res<GameState>,
-    player: Res<PlayerRes>,
     mut construction: ResMut<ConstructionUi>,
     roots: Query<Entity, With<ConstructionRoot>>,
 ) {
     if !construction.open {
         return;
     }
-    if state.mode == GameMode::Player && player.0.is_some() {
+    if state.mode == GameMode::Player && state.controlled_mind().is_some() {
         return;
     }
     construction.open = false;
@@ -298,7 +296,8 @@ fn spawn_entry(
 }
 
 /// Название постройки для меню (предметные названия — в info/items.json).
-fn building_name(kind: BuildingKind) -> &'static str {
+/// Публично: тултипы нижней панели редактора показывают те же названия.
+pub(crate) fn building_name(kind: BuildingKind) -> &'static str {
     match kind {
         BuildingKind::Campfire => "Костёр",
         BuildingKind::CraftingTable => "Верстак",

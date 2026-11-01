@@ -134,6 +134,8 @@ pub enum MenuAction {
     CycleWindowMode,
     /// Цикл «Сглаживание» (Выкл / FXAA / MSAA / SMAA).
     CycleAntialias,
+    /// Тумблер «Освещение» (ночная тьма и свет костров).
+    ToggleLighting,
 }
 
 /// Кнопка меню. `Hovered` обязателен: пикинг обновляет его только у
@@ -265,7 +267,8 @@ fn handle_escape(
     mut state: ResMut<GameState>,
     mut view: ResMut<PauseMenuView>,
     mut inventory: ResMut<InventoryUi>,
-    mut station: ResMut<crate::ui::station::StationUi>,
+    mut station: ResMut<crate::ui::stations::StationUi>,
+    mut selection: ResMut<crate::app::state::EditorSelection>,
     mut construction: ResMut<ConstructionUi>,
     capture: Res<BindingCapture>,
     focus: Res<InputFocus>,
@@ -278,7 +281,7 @@ fn handle_escape(
         Query<Entity, With<PauseMenuRoot>>,
         Query<Entity, With<crate::ui::menus::MenuRoot>>,
         Query<Entity, With<InventoryRoot>>,
-        Query<Entity, With<crate::ui::station::StationRoot>>,
+        Query<Entity, With<crate::ui::stations::StationRoot>>,
         Query<Entity, With<ConstructionRoot>>,
     ),
 ) {
@@ -298,6 +301,12 @@ fn handle_escape(
             commands.entity(e).despawn();
         }
         state.active_menu = None;
+        return;
+    }
+
+    // Окно инспектора — тот же второй слой: ESC закрывает его.
+    if selection.selected.is_some() {
+        selection.selected = None;
         return;
     }
 
@@ -487,6 +496,10 @@ fn on_menu_button_activate(
             settings.antialias = settings.antialias.next();
             update_first_button_text(children, &mut texts, antialias_label(&settings));
         }
+        MenuAction::ToggleLighting => {
+            settings.lighting = !settings.lighting;
+            update_first_button_text(children, &mut texts, lighting_label(&settings));
+        }
     }
 }
 
@@ -534,6 +547,11 @@ fn window_mode_label(settings: &Settings) -> String {
 /// Подпись кнопки «Сглаживание».
 fn antialias_label(settings: &Settings) -> String {
     format!("Сглаживание: {}", settings.antialias.name())
+}
+
+/// Подпись тумблера «Освещение».
+fn lighting_label(settings: &Settings) -> String {
+    format!("Освещение: {}", if settings.lighting { "Вкл" } else { "Выкл" })
 }
 
 // ---------- Подсветка и звуки ----------
@@ -1028,6 +1046,13 @@ fn build_category(
                 fonts,
                 &antialias_label(settings),
                 MenuAction::CycleAntialias,
+                style::text(),
+            );
+            action_button(
+                parent,
+                fonts,
+                &lighting_label(settings),
+                MenuAction::ToggleLighting,
                 style::text(),
             );
         }

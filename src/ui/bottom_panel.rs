@@ -18,12 +18,11 @@ use bevy::ui_widgets::{Activate, ActivateOnPress, Button, TextInput};
 
 use crate::app::settings::{ControlAction, Settings};
 use crate::app::state::{
-    ClockRes, GameMode, GameState, PlayerRes, SchedulerRes, SimSpeed, Tool, ToolCategory,
+    ClockRes, GameMode, GameState, LensKind, SchedulerRes, SimSpeed, Tool, ToolCategory,
 };
 use crate::simulation::entities::EntityKind;
 use crate::simulation::generation::generate_world;
 use crate::simulation::objects::{BuildingKind, ObjectKind};
-use crate::simulation::player::WorldPos;
 use crate::simulation::scheduler::Scheduler;
 use crate::simulation::tile::TileType;
 use crate::simulation::vegetation;
@@ -119,6 +118,75 @@ fn category_icon(category: ToolCategory, icons: &UiIcons) -> Handle<Image> {
     .clone()
 }
 
+// --- Названия для тултипов ---
+
+/// Русское название тайла (тултипы панели редактора).
+pub(crate) fn tile_name(kind: TileType) -> &'static str {
+    match kind {
+        TileType::Empty => "Пустота",
+        TileType::Water => "Вода",
+        TileType::Sand => "Песок",
+        TileType::Dirt => "Земля",
+        TileType::Grass => "Трава",
+        TileType::ForestGrass => "Лесная трава",
+        TileType::Stone => "Камень",
+        TileType::Clay => "Глина",
+        TileType::Farmland => "Пашня",
+        TileType::DeepWater => "Глубокая вода",
+        TileType::Ocean => "Океан",
+        TileType::Mountain => "Гора",
+        TileType::Moss => "Мох",
+        TileType::Mud => "Грязь",
+        TileType::Podzol => "Подзол",
+    }
+}
+
+/// Русское название природного объекта или постройки.
+pub(crate) fn object_kind_name(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Tree => "Дерево",
+        ObjectKind::Bush => "Куст",
+        ObjectKind::Rock => "Валун",
+        ObjectKind::AppleTree => "Яблоня",
+        ObjectKind::Building(kind) => crate::ui::construction::building_name(kind),
+    }
+}
+
+/// Русское название вида существ.
+pub(crate) fn entity_kind_name(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Wolf => "Волк",
+        EntityKind::Human => "Человек",
+    }
+}
+
+/// Название кнопки панели для тултипа. `None` — тултип не нужен: плитки
+/// времени (пауза, скорость) подписаны сами.
+pub(crate) fn panel_action_tooltip(action: &PanelAction) -> Option<&'static str> {
+    match action {
+        PanelAction::TogglePause | PanelAction::SetSpeed(_) => None,
+        PanelAction::OpenMenu(PanelMenu::Speed) => None,
+        PanelAction::OpenMenu(PanelMenu::Tools(category)) => Some(match category {
+            ToolCategory::Tiles => "Тайлы",
+            ToolCategory::Objects => "Объекты",
+            ToolCategory::Buildings => "Постройки",
+            ToolCategory::Entities => "Существа",
+        }),
+        PanelAction::OpenMenu(PanelMenu::Lenses) => Some("Линзы карты"),
+        PanelAction::Back => Some("Назад"),
+        PanelAction::SelectTool(tool) => Some(match tool {
+            Tool::Tile(kind) => tile_name(*kind),
+            Tool::Object(kind) => object_kind_name(*kind),
+            Tool::Building(kind) => crate::ui::construction::building_name(*kind),
+            Tool::Entity(kind) => entity_kind_name(*kind),
+        }),
+        PanelAction::ToggleLens(kind) => Some(match kind {
+            LensKind::Sentients => "Разумные существа",
+            LensKind::Buildings => "Постройки",
+        }),
+    }
+}
+
 // --- Состояние вида панели ---
 
 /// Открытое подменю панели.
@@ -128,6 +196,8 @@ pub enum PanelMenu {
     Speed,
     /// Инструменты категории.
     Tools(ToolCategory),
+    /// Линзы карты: подсветка чанков (обновление раз в секунду).
+    Lenses,
 }
 
 /// Текущий вид панели: `None` — базовые кнопки, иначе открытое подменю.
@@ -151,6 +221,8 @@ pub enum PanelAction {
     SetSpeed(SimSpeed),
     /// Выбрать инструмент; повторный клик снимает выбор.
     SelectTool(Tool),
+    /// Включить/выключить линзу карты.
+    ToggleLens(LensKind),
 }
 
 // --- Компоненты ---
@@ -239,6 +311,12 @@ fn base_items(state: &GameState, icons: &UiIcons) -> Vec<PanelItem> {
             content: ButtonContent::Icon(category_icon(category, icons)),
         });
     }
+    // Линзы карты: отдельное подменю переключателей (не инструменты —
+    // клик по карте ничего не ставит).
+    items.push(PanelItem {
+        action: PanelAction::OpenMenu(PanelMenu::Lenses),
+        content: ButtonContent::Icon(icons.entity(EntityKind::Human).clone()),
+    });
     items
 }
 
@@ -265,6 +343,19 @@ fn menu_items(menu: PanelMenu, icons: &UiIcons) -> Vec<PanelItem> {
                 .clone()),
             })
             .collect(),
+        PanelMenu::Lenses => [
+            (LensKind::Sentients, icons.entity(EntityKind::Human).clone()),
+            (
+                LensKind::Buildings,
+                icons.object(ObjectKind::Building(BuildingKind::Campfire)).clone(),
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, icon)| PanelItem {
+            action: PanelAction::ToggleLens(kind),
+            content: ButtonContent::Icon(icon),
+        })
+        .collect(),
     }
 }
 
@@ -613,6 +704,11 @@ fn on_panel_button_activated(
                     if state.selected_tool == Some(*tool) { None } else { Some(*tool) };
             }
         }
+        // Линзы — независимые переключатели, клик по карте не мешают.
+        PanelAction::ToggleLens(kind) => match kind {
+            LensKind::Sentients => state.lenses.sentients = !state.lenses.sentients,
+            LensKind::Buildings => state.lenses.buildings = !state.lenses.buildings,
+        },
     }
 }
 
@@ -636,6 +732,10 @@ fn update_button_styles(
         let selected = match action {
             PanelAction::SetSpeed(speed) => state.speed == *speed,
             PanelAction::SelectTool(tool) => state.selected_tool == Some(*tool),
+            PanelAction::ToggleLens(kind) => match kind {
+                LensKind::Sentients => state.lenses.sentients,
+                LensKind::Buildings => state.lenses.buildings,
+            },
             _ => false,
         };
         let want = if selected {
@@ -692,7 +792,6 @@ fn fit_icons(
 fn handle_world_size_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<GameState>,
-    mut player: ResMut<PlayerRes>,
     clock: Res<ClockRes>,
     mut sched: ResMut<SchedulerRes>,
     focus: Res<InputFocus>,
@@ -721,7 +820,7 @@ fn handle_world_size_input(
         |side| {
             let size = WorldSize::new(side);
             if size != state.world_size {
-                regenerate_world(size, state.seed, &mut state, &mut player, &clock, &mut sched.0);
+                regenerate_world(size, state.seed, &mut state, &clock, &mut sched.0);
                 state.world_size = size;
             }
             state.world_size.tiles().to_string()
@@ -733,7 +832,6 @@ fn handle_world_size_input(
 fn handle_world_seed_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<GameState>,
-    mut player: ResMut<PlayerRes>,
     clock: Res<ClockRes>,
     mut sched: ResMut<SchedulerRes>,
     focus: Res<InputFocus>,
@@ -763,7 +861,6 @@ fn handle_world_seed_input(
                     state.world_size,
                     seed,
                     &mut state,
-                    &mut player,
                     &clock,
                     &mut sched.0,
                 );
@@ -813,13 +910,13 @@ fn handle_world_field<T>(
 }
 
 /// Перегенерирует мир с новыми размером/сидом: генерация, посев цепочек
-/// растительности, запрос перерисовки и зажим игрока в границы нового
-/// мира (сброс сегмента интерполяции — телепорт). Общая часть обоих полей.
+/// растительности, запрос перерисовки. Захваченное существо теряется:
+/// мир заменён целиком, управлять не кем (можно захватить другое по F1).
+/// Общая часть обоих полей ввода.
 fn regenerate_world(
     size: WorldSize,
     seed: u64,
     state: &mut GameState,
-    player: &mut PlayerRes,
     clock: &ClockRes,
     sched: &mut Scheduler,
 ) {
@@ -827,13 +924,7 @@ fn regenerate_world(
     vegetation::seed_all(&world, sched, clock.0.tick);
     state.world = Some(world);
     state.pending_rerender = true;
-    if let Some(p) = player.0.as_mut() {
-        let max = size.tiles() as f32;
-        p.teleport_to(WorldPos {
-            x: p.pos.x.clamp(0.0, max),
-            y: p.pos.y.clamp(0.0, max),
-        });
-    }
+    state.set_controlled(None);
 }
 
 /// Скрывает нижнюю панель редактора в режиме игрока.

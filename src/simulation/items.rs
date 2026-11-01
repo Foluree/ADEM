@@ -788,6 +788,21 @@ impl ItemKind {
             _ => 0.0,
         }
     }
+
+    /// Еда ли это для волка: хищник ест мясо (сырое и приготовленное).
+    /// Остальная еда и несъедобное — нет; новый вид должен решить это
+    /// явно (match без wildcard, как у `food_value`).
+    pub fn is_wolf_food(self) -> bool {
+        matches!(
+            self,
+            ItemKind::MeatBirdRaw
+                | ItemKind::MeatBirdCooked
+                | ItemKind::MeatHerbivoreRaw
+                | ItemKind::MeatHerbivoreCooked
+                | ItemKind::MeatPredatorRaw
+                | ItemKind::MeatPredatorCooked
+        )
+    }
 }
 
 /// Класс инструмента/оружия — обобщённое поведение вместо проверки десятков

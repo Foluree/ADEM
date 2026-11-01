@@ -20,7 +20,7 @@ use bevy::ui_widgets::{Activate, Button, TextInput};
 use crate::app::input::cursor_world_tile;
 use crate::app::settings::{ControlAction, Settings};
 use crate::app::state::{
-    CommandQueueRes, GameMode, GameState, MenuKind, PlayerRes, WindowFocusState,
+    CommandQueueRes, GameMode, GameState, MenuKind, WindowFocusState,
 };
 use crate::simulation::commands::Command;
 use crate::simulation::crafts::{CraftBook, GRID_SLOTS};
@@ -203,20 +203,21 @@ fn toggle_inventory(
     keys: Res<ButtonInput<KeyCode>>,
     mut inv: ResMut<InventoryUi>,
     state: Res<GameState>,
-    player: Res<PlayerRes>,
     settings: Res<Settings>,
     capture: Res<BindingCapture>,
     focus: Res<InputFocus>,
     text_inputs: Query<(), With<TextInput>>,
     font: Res<UiFont>,
     roots: Query<Entity, With<InventoryRoot>>,
-    mut station: ResMut<crate::ui::station::StationUi>,
-    station_roots: Query<Entity, With<crate::ui::station::StationRoot>>,
+    mut station: ResMut<crate::ui::stations::StationUi>,
+    station_roots: Query<Entity, With<crate::ui::stations::StationRoot>>,
 ) {
     if text_input_focused(&focus, &text_inputs) || capture.0.is_some() || state.active_menu.is_some() {
         return;
     }
-    if !keys.just_pressed(settings.controls.key(ControlAction::Inventory)) || player.0.is_none() {
+    if !keys.just_pressed(settings.controls.key(ControlAction::Inventory))
+        || state.controlled_mind().is_none()
+    {
         return;
     }
 
@@ -503,7 +504,7 @@ fn on_slot_activated(
     activate: On<Activate>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut inv: ResMut<InventoryUi>,
-    player: Res<PlayerRes>,
+    state: Res<GameState>,
     slots: Query<&InvSlot>,
 ) {
     // Активация приходит на клик любой кнопкой мыши; слоты инвентаря
@@ -520,7 +521,7 @@ fn on_slot_activated(
         return;
     };
     let target = SlotRef { area: clicked.area, index: clicked.index };
-    let Some(p) = player.0.as_ref() else {
+    let Some(p) = state.controlled_mind() else {
         return;
     };
     // Под зажатой ЛКМ стек уже снят из слота в «руку» (`inventory_drag`),
@@ -557,13 +558,13 @@ fn take_from_craft_cell(craft: &mut CraftingUi, index: usize, count: u32) {
 fn place_one_into_craft_cell(
     inv: &mut InventoryUi,
     craft: &mut CraftingUi,
-    player: &mut PlayerRes,
+    state: &mut GameState,
     target: usize,
 ) -> bool {
     let Some(src) = inv.selected else {
         return false;
     };
-    let Some(p) = player.0.as_mut() else {
+    let Some(p) = state.controlled_mind_mut() else {
         return false;
     };
     let Some(stack) = p.inventory.get(src) else {
@@ -602,11 +603,11 @@ fn place_one_into_craft_cell(
 
 /// Забирает один предмет из клетки сетки обратно в инвентарь.
 /// `false` — клетка пуста или в инвентаре нет места.
-fn take_one_from_craft_cell(craft: &mut CraftingUi, player: &mut PlayerRes, target: usize) -> bool {
+fn take_one_from_craft_cell(craft: &mut CraftingUi, state: &mut GameState, target: usize) -> bool {
     let Some(stack) = craft.slots[target] else {
         return false;
     };
-    let Some(p) = player.0.as_mut() else {
+    let Some(p) = state.controlled_mind_mut() else {
         return false;
     };
     if !p.inventory.can_fit(stack.kind, 1) {
@@ -629,7 +630,7 @@ fn on_craft_slot_activated(
     mut inv: ResMut<InventoryUi>,
     mut craft: ResMut<CraftingUi>,
     hold: Res<CraftHoldFill>,
-    mut player: ResMut<PlayerRes>,
+    mut state: ResMut<GameState>,
     slots: Query<&CraftSlot>,
 ) {
     let Ok(clicked) = slots.get(activate.entity) else {
@@ -649,14 +650,14 @@ fn on_craft_slot_activated(
     if mouse.just_released(MouseButton::Right) && hold.filled_rmb == Some(target) {
         return;
     }
-    let Some(p) = player.0.as_mut() else {
+    let Some(p) = state.controlled_mind_mut() else {
         return;
     };
 
     // ПКМ по клетке: забрать один предмет в инвентарь. Места нет — клетка
     // не тратится (предмет не должен исчезать «в никуда»).
     if mouse.just_released(MouseButton::Right) {
-        take_one_from_craft_cell(&mut craft, &mut player, target);
+        take_one_from_craft_cell(&mut craft, &mut state, target);
         return;
     }
 
@@ -677,7 +678,7 @@ fn on_craft_slot_activated(
     // Источник остаётся выбранным, пока стек не опустеет: так удобно
     // докладывать несколько единиц подряд.
     if inv.selected.is_some() {
-        place_one_into_craft_cell(&mut inv, &mut craft, &mut player, target);
+        place_one_into_craft_cell(&mut inv, &mut craft, &mut state, target);
         return;
     }
 
@@ -742,7 +743,7 @@ fn craft_grid_hold_fill(
     mut inv: ResMut<InventoryUi>,
     mut craft: ResMut<CraftingUi>,
     mut hold: ResMut<CraftHoldFill>,
-    mut player: ResMut<PlayerRes>,
+    mut state: ResMut<GameState>,
     slots: Query<(&CraftSlot, &ComputedNode, &UiGlobalTransform)>,
 ) {
     // Кнопка отпущена: следующее нажатие начинается с чистого листа.
@@ -777,7 +778,7 @@ fn craft_grid_hold_fill(
         hold.last_lmb = hovered;
         if let Some(target) = hovered {
             hold.filled_lmb = Some(target);
-            place_one_into_craft_cell(&mut inv, &mut craft, &mut player, target);
+            place_one_into_craft_cell(&mut inv, &mut craft, &mut state, target);
         }
     }
     if mouse.just_pressed(MouseButton::Right) {
@@ -787,7 +788,7 @@ fn craft_grid_hold_fill(
         hold.last_rmb = hovered;
         if let Some(target) = hovered {
             hold.filled_rmb = Some(target);
-            take_one_from_craft_cell(&mut craft, &mut player, target);
+            take_one_from_craft_cell(&mut craft, &mut state, target);
         }
     }
 }
@@ -818,7 +819,7 @@ fn on_result_activated(
     inv: Res<InventoryUi>,
     mut craft: ResMut<CraftingUi>,
     book: Res<CraftBookRes>,
-    mut player: ResMut<PlayerRes>,
+    mut state: ResMut<GameState>,
 ) {
     // `Activate` — глобальное событие UI: его шлёт любая кнопка (слоты
     // инвентаря и сетки, кнопки нижней панели). Крафт должен срабатывать
@@ -832,7 +833,7 @@ fn on_result_activated(
     if !left_click && !right_click {
         return;
     }
-    let Some(p) = player.0.as_mut() else {
+    let Some(p) = state.controlled_mind_mut() else {
         return;
     };
     let Some(recipe) = book.0.matching_recipe(&craft.slots).cloned() else {
@@ -874,9 +875,8 @@ fn on_result_activated(
 fn reset_crafting_on_close(
     mut inv: ResMut<InventoryUi>,
     mut craft: ResMut<CraftingUi>,
-    mut player: ResMut<PlayerRes>,
     mut queue: ResMut<CommandQueueRes>,
-    state: Res<GameState>,
+    mut state: ResMut<GameState>,
 ) {
     if inv.open {
         // Окно открыто: сетка живёт, перетаскивание активно.
@@ -890,21 +890,30 @@ fn reset_crafting_on_close(
         return;
     }
 
-    let Some(p) = player.0.as_mut() else {
-        // Игрока нет — сетку очищаем: заполнить её без игрока невозможно.
+    // Центр сброса остатков — тайл существа; зажимаем в границы мира.
+    let Some(actor) = state.controlled else {
+        // Захвата нет — сетку очищаем: вернуть содержимое некуда.
         craft.slots = Default::default();
         return;
     };
-    let Some(world) = state.world.as_ref() else {
+    let center = state.world.as_ref().map(|world| {
+        let size = world.size.tiles() as i32;
+        let pos = world
+            .entities
+            .get(actor)
+            .map(|e| e.pos)
+            .unwrap_or_default();
+        TilePos {
+            x: (pos.x.floor() as i32).clamp(0, size - 1),
+            y: (pos.y.floor() as i32).clamp(0, size - 1),
+        }
+    });
+    let Some(center) = center else {
         return;
     };
-
-    // Тайл игрока — центр сброса остатков; зажимаем в границы мира,
-    // позиция существа могла остановиться ровно на краю.
-    let size = world.size.tiles() as i32;
-    let center = TilePos {
-        x: (p.pos.x.floor() as i32).clamp(0, size - 1),
-        y: (p.pos.y.floor() as i32).clamp(0, size - 1),
+    let Some(p) = state.controlled_mind_mut() else {
+        craft.slots = Default::default();
+        return;
     };
 
     for cell in craft.slots.iter_mut() {
@@ -932,9 +941,8 @@ fn inventory_drag(
     mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
     focus: Res<WindowFocusState>,
-    state: Res<GameState>,
+    mut state: ResMut<GameState>,
     mut inv: ResMut<InventoryUi>,
-    mut player: ResMut<PlayerRes>,
     mut queue: ResMut<CommandQueueRes>,
     icons: Res<UiIcons>,
     windows: Query<&Window>,
@@ -951,7 +959,7 @@ fn inventory_drag(
     // игры, поэтому стек возвращается на место, а не висит «в руке».
     if !focus.focused {
         if inv.drag.is_some() {
-            cancel_drag(&mut commands, &mut inv, &mut player);
+            cancel_drag(&mut commands, &mut inv, &mut state);
         }
         return;
     }
@@ -965,7 +973,7 @@ fn inventory_drag(
         // Режим сменился/открылось меню посреди перетаскивания — стек
         // возвращается в исходный слот, а не остаётся «в руке» навсегда.
         if inv.drag.is_some() {
-            cancel_drag(&mut commands, &mut inv, &mut player);
+            cancel_drag(&mut commands, &mut inv, &mut state);
         }
         return;
     }
@@ -974,9 +982,9 @@ fn inventory_drag(
         // нужно обработать, иначе стек останется «в руке».
         if inv.drag.is_some() {
             if mouse.just_released(MouseButton::Right) {
-                cancel_drag(&mut commands, &mut inv, &mut player);
+                cancel_drag(&mut commands, &mut inv, &mut state);
             } else if mouse.just_released(MouseButton::Left) {
-                finish_drag(&mut commands, &mut inv, &mut player, None);
+                finish_drag(&mut commands, &mut inv, &mut state, None);
             }
         }
         return;
@@ -991,7 +999,7 @@ fn inventory_drag(
             return;
         };
         let target = SlotRef { area: hover.area, index: hover.index };
-        let Some(p) = player.0.as_mut() else {
+        let Some(p) = state.controlled_mind_mut() else {
             return;
         };
         let Some(stack) = p.inventory.get(target) else {
@@ -1027,7 +1035,7 @@ fn inventory_drag(
     }
     // ПКМ во время перетаскивания: отмена, стек возвращается на место.
     if mouse.just_released(MouseButton::Right) {
-        cancel_drag(&mut commands, &mut inv, &mut player);
+        cancel_drag(&mut commands, &mut inv, &mut state);
         return;
     }
     // Призрак следует за курсором.
@@ -1048,16 +1056,16 @@ fn inventory_drag(
             .iter()
             .any(|(computed, transform)| cursor_over_node(window, computed, transform, cursor));
         if let Some(t) = target {
-            finish_drag(&mut commands, &mut inv, &mut player, Some(t));
+            finish_drag(&mut commands, &mut inv, &mut state, Some(t));
         } else if creative_open && over_creative {
             delete_drag(&mut commands, &mut inv);
         } else if inv.open
             && !over_panel
             && let Some(tile) = cursor_world_tile(window, &cameras, state.world.as_ref())
         {
-            throw_drag(&mut commands, &mut inv, &mut player, &mut queue, tile);
+            throw_drag(&mut commands, &mut inv, &mut state, &mut queue, tile);
         } else {
-            finish_drag(&mut commands, &mut inv, &mut player, None);
+            finish_drag(&mut commands, &mut inv, &mut state, None);
         }
     }
 }
@@ -1078,7 +1086,7 @@ fn delete_drag(commands: &mut Commands, inv: &mut InventoryUi) {
 fn throw_drag(
     commands: &mut Commands,
     inv: &mut InventoryUi,
-    player: &mut PlayerRes,
+    state: &mut GameState,
     queue: &mut CommandQueueRes,
     target: TilePos,
 ) {
@@ -1087,7 +1095,7 @@ fn throw_drag(
     };
     commands.entity(drag.ghost).despawn();
     let throw_slot = (drag.from.area == SlotArea::Misc).then_some(drag.from.index);
-    if let Some(p) = player.0.as_mut() {
+    if let Some(p) = state.controlled_mind_mut() {
         p.inventory.put(drag.from, drag.stack);
     }
     if let Some(slot) = throw_slot {
@@ -1118,14 +1126,14 @@ fn hovered_slot<'a>(
 fn finish_drag(
     commands: &mut Commands,
     inv: &mut InventoryUi,
-    player: &mut PlayerRes,
+    state: &mut GameState,
     target: Option<SlotRef>,
 ) {
     let Some(drag) = inv.drag.take() else {
         return;
     };
     commands.entity(drag.ghost).despawn();
-    let Some(p) = player.0.as_mut() else {
+    let Some(p) = state.controlled_mind_mut() else {
         return;
     };
     // Сначала возвращаем стек «в руку» в исходный слот: transfer берёт его оттуда. 
@@ -1144,13 +1152,13 @@ fn finish_drag(
 fn cancel_drag(
     commands: &mut Commands,
     inv: &mut InventoryUi,
-    player: &mut PlayerRes,
+    state: &mut GameState,
 ) {
     let Some(drag) = inv.drag.take() else {
         return;
     };
     commands.entity(drag.ghost).despawn();
-    if let Some(p) = player.0.as_mut() {
+    if let Some(p) = state.controlled_mind_mut() {
         p.inventory.put(drag.from, drag.stack);
     }
 }
@@ -1160,7 +1168,7 @@ fn cancel_drag(
 fn refresh_slots(
     mut commands: Commands,
     inv: Res<InventoryUi>,
-    player: Res<PlayerRes>,
+    state: Res<GameState>,
     icons: Res<UiIcons>,
     mut slots: Query<(Entity, &InvSlot, &mut BorderColor, &Children), With<InventoryWindowSlot>>,
     mut images: Query<&mut ImageNode>,
@@ -1169,7 +1177,7 @@ fn refresh_slots(
     if !inv.open {
         return;
     }
-    let Some(p) = player.0.as_ref() else {
+    let Some(p) = state.controlled_mind() else {
         return;
     };
 

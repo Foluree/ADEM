@@ -17,6 +17,7 @@ use bevy::render::{render_resource::AsBindGroup, storage::ShaderBuffer};
 use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d};
 
+use crate::app::settings::Settings;
 use crate::app::state::{ClockRes, GameState};
 use crate::rendering::isometric::{WORLD_TILE_SIZE, world_position};
 use crate::simulation::{BuildingKind, ChunkPos, ObjectKind, TilePos, World, CHUNK_SIZE};
@@ -25,7 +26,7 @@ use crate::simulation::{BuildingKind, ChunkPos, ObjectKind, TilePos, World, CHUN
 pub(crate) const NIGHT_DAYLIGHT: f32 = 0.08;
 
 /// Радиус света костра в тайлах.
-pub(crate) const LIGHT_RADIUS_TILES: f32 = 6.0;
+pub(crate) const LIGHT_RADIUS_TILES: f32 = 5.0;
 
 /// Радиус света в мировых пикселях.
 const LIGHT_RADIUS_PX: f32 = LIGHT_RADIUS_TILES * WORLD_TILE_SIZE;
@@ -175,10 +176,13 @@ fn scan_campfires(world: &World) -> HashSet<TilePos> {
 
 /// Пересобирает оверлей тьмы под видимую область и время суток. Запускается
 /// после `render_world` (камера и мир уже актуальны). Днём оверлей скрыт.
+/// Отключённое в настройках освещение (`Settings::lighting`) работает как
+/// вечный день: оверлей скрыт, меш и буфер огней не пересобираются вовсе.
 pub(crate) fn update_darkness_overlay(
     mut commands: Commands,
     state: Res<GameState>,
     clock: Res<ClockRes>,
+    settings: Res<Settings>,
     lights: Res<CampfireLights>,
     cameras: Query<(&Camera, &Transform, &Projection), With<Camera2d>>,
     mut overlay: ResMut<DarknessOverlay>,
@@ -186,6 +190,15 @@ pub(crate) fn update_darkness_overlay(
     mut materials: ResMut<Assets<DarknessMaterial>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
+    if !settings.lighting {
+        if let Some(entity) = overlay.entity {
+            commands.entity(entity).insert(Visibility::Hidden);
+        }
+        // После включения оверлей собирается заново, даже если кадр совпадёт.
+        overlay.last_frame = None;
+        return;
+    }
+
     let daylight = daylight_factor(clock.0.time_of_day_fraction());
     let darkness = (1.0 - daylight).clamp(0.0, 1.0);
 

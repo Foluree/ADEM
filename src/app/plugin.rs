@@ -18,8 +18,8 @@ use crate::app::settings::{
     AntiAlias, ControlAction, Settings, WindowModeSetting, settings_path,
 };
 use crate::app::state::{
-    ClockRes, CommandQueueRes, FocusPause, GameMode, GameState, MenuKind, PlayerRes, SchedulerRes,
-    SimTick, TickAccumulator, TickTiming, WindowFocusState,
+    ClockRes, CommandQueueRes, EditorSelection, FocusPause, GameMode, GameState, MenuKind,
+    SchedulerRes, SimSpeed, SimTick, TickAccumulator, TickTiming, WindowFocusState,
 };
 use crate::app::window_icon::set_window_icon;
 use crate::rendering::RenderingPlugin;
@@ -46,8 +46,8 @@ impl Plugin for AdemPlugin {
             .init_resource::<TickTiming>()
             .init_resource::<WindowFocusState>()
             .init_resource::<FocusPause>()
-            .init_resource::<PlayerRes>()
             .init_resource::<CommandQueueRes>()
+            .init_resource::<EditorSelection>()
             .add_message::<TickEvent>()
             .add_plugins(CameraPlugin)
             .add_plugins(RenderingPlugin)
@@ -105,14 +105,24 @@ fn seed_calendar(mut clock: ResMut<ClockRes>, mut sched: ResMut<SchedulerRes>) {
     sched.0.schedule_at(next_season_tick(clock.0.tick), TaskKind::SeasonChanged);
 }
 
-/// Максимум тиков за один кадр. При 20 tps мир «не отстаёт» уже с 5 FPS
-/// на x1 (ARCHITECTURE 3.1). Восемь тиков нужны высоким скоростям: на
-/// x20 при 60 FPS требуется ~6.7 тика на кадр, иначе x12.5/x15/x20
-/// упирались бы в один и тот же потолок.
-const MAX_TICKS_PER_FRAME: u32 = 8;
+/// Нижняя граница FPS, на которую рассчитан догоняющий лимит тиков.
+/// При падении FPS ниже неё симуляция всё же замедляется (иначе аккумулятор
+/// рос бы бесконечно), но любое окно от 5 FPS идёт в реальном темпе —
+/// в том числе неактивное (10 FPS в фоне, см. `apply_window_update_mode`).
+const MIN_SIM_FPS: f32 = 5.0;
+
+/// Максимум тиков за один кадр для данной скорости: столько тиков нужно,
+/// чтобы выдержать множитель даже на `MIN_SIM_FPS` кадрах в секунду
+/// (x1 → 4, x100 → 400). Решение автора: симуляция не замедляется вместе
+/// с FPS (прежний фиксированный лимит 8 тиков тормозил мир на низком FPS).
+pub(crate) fn max_ticks_for_frame(speed: SimSpeed) -> u32 {
+    (speed.multiplier() * TICKS_PER_SEC as f32 / MIN_SIM_FPS)
+        .ceil()
+        .max(1.0) as u32
+}
 
 /// Чистая логика фикс-степа: сколько тиков исполнить и остаток аккумулятора.
-/// При исчерпании бюджета остаток отбрасывается — мир замедляется, а не зависает.
+/// При исчерпании бюджета (только ниже `MIN_SIM_FPS`) остаток отбрасывается.
 pub(crate) fn step_ticks(
     acc_seconds: f32,
     speed: f32,
@@ -143,7 +153,6 @@ fn tick_world(
     time: Res<Time>,
     mut state: ResMut<GameState>,
     input: Res<crate::app::input::PlayerInput>,
-    mut player: ResMut<PlayerRes>,
     mut acc: ResMut<TickAccumulator>,
     mut clock: ResMut<ClockRes>,
     mut sched: ResMut<SchedulerRes>,
@@ -153,7 +162,7 @@ fn tick_world(
     mut events: MessageWriter<TickEvent>,
 ) {
     // На паузе тики не генерируются и аккумулятор не растёт (GAME_DESIGN 3.3):
-    // стоит и игрок — он часть мира.
+    // стоит и захваченное существо — оно часть мира.
     if state.paused || state.world.is_none() {
         return;
     }
@@ -161,34 +170,54 @@ fn tick_world(
         acc.seconds,
         state.speed.multiplier(),
         time.delta_secs(),
-        MAX_TICKS_PER_FRAME,
+        max_ticks_for_frame(state.speed),
     );
     acc.seconds = rest;
     if ticks == 0 {
         return;
     }
 
-    // Игрок движется по тикам симуляции: скорость задана в тайлах за тик,
-    // на ускорении мира он движется быстрее в реальном времени. Тут же
-    // подбирает воткнутые рядом копья (автоподбор по близости) и тратит
-    // сытость. Здоровье, упавшее в ноль (голод, бой), — смерть: существо
-    // исчезает, управление возвращается наблюдателю. Полноценная смерть
-    // с возрождением — отдельная задача (ROADMAP).
-    let mut died = false;
-    if state.mode == GameMode::Player
-        && let Some(p) = player.0.as_mut()
-        && let Some(world) = state.world.as_ref()
-    {
-        for _ in 0..ticks {
-            p.step(input.dir, world);
-            p.tick_hunger(input.dir != (0.0, 0.0), world);
-        }
-        combat::pickup_stuck_spears(state.world.as_mut().unwrap(), p);
-        died = p.hp <= 0.0;
+    // Захваченное существо могло погибнуть в мире (бой) или быть убрано
+    // редактором — контроль теряется сразу.
+    if state.controlled.is_some() && state.controlled_entity().is_none() {
+        state.set_controlled(None);
     }
-    if died {
-        player.0 = None;
-        state.mode = GameMode::Observer;
+
+    // Захваченное существо движется по тикам симуляции: скорость задана
+    // видом, на ускорении мира оно движется быстрее в реальном времени.
+    // Тут же подбирает воткнутые рядом копья (автоподбор по близости) и
+    // тратит сытость. Здоровье, упавшее в ноль (голод, бой), — смерть:
+    // лут инвентаря выпадает, управление возвращается наблюдателю.
+    // Полноценная смерть с телом — отдельная задача (ROADMAP).
+    //
+    // При включённом ИИ (кнопка «ИИ» в HUD) движение и голод ведёт
+    // симуляция: `step_direction`/`tick_hunger` не вызываются — иначе
+    // голод тикал бы дважды, а ввод рвал бы ИИ-цели.
+    if state.mode == GameMode::Player
+        && let Some(actor) = state.controlled
+    {
+        let ai_driven = state.controlled_ai;
+        let mut died = false;
+        if let Some(world) = state.world.as_mut() {
+            if !ai_driven {
+                for _ in 0..ticks {
+                    crate::simulation::actions::step_direction(world, actor, input.dir);
+                    if !crate::simulation::actions::tick_hunger(world, actor, input.dir != (0.0, 0.0))
+                    {
+                        died = true;
+                        break;
+                    }
+                }
+            }
+            combat::pickup_stuck_spears(world, actor);
+        }
+        if died {
+            // Дроп инвентаря и удаление сущности из мира.
+            if let Some(world) = state.world.as_mut() {
+                combat::kill_entity(world, actor, clock.0.tick);
+            }
+            state.set_controlled(None);
+        }
     }
 
     // Dirty-флаги изымаются до мутации мира: события растительности
@@ -203,14 +232,17 @@ fn tick_world(
         clock.0.tick_once();
         let tick = clock.0.tick;
         sched.0.run_tick(tick, |task| fired.push((tick, task)));
-        // Животные двигаются и принимают решения на каждом тике — так же,
-        // как игрок: их поведение часть мира, а не рендера. Снаряды летят
-        // и бьют в том же тике.
+        // Существа двигаются и принимают решения на каждом тике — так же,
+        // как захваченное существо: их поведение часть мира, а не рендера.
+        // Снаряды летят и бьют в том же тике. Захваченному ИИ и FSM не
+        // ведут — кроме случая, когда игрок включил ему автономность
+        // (кнопка «ИИ»): тогда существо живёт как обычное.
+        let player_controlled = if state.controlled_ai { None } else { state.controlled };
         if let Some(world) = state.world.as_mut() {
-            world.tick_entities(tick);
+            world.tick_entities(tick, player_controlled);
             world.tick_projectiles(tick);
-            // Дроп-сущности: автоподбор игроком и исчезновение по возрасту.
-            world.item_entities.tick(tick, player.0.as_mut());
+            // Дроп-сущности: автоподбор людьми и исчезновение по возрасту.
+            world.tick_item_entities(tick);
         }
     }
 
@@ -314,7 +346,6 @@ pub struct TickEvent {
 pub(crate) fn apply_commands(
     mut queue: ResMut<CommandQueueRes>,
     mut state: ResMut<GameState>,
-    mut player: ResMut<PlayerRes>,
     clock: Res<ClockRes>,
     mut sched: ResMut<SchedulerRes>,
     book: Res<CraftBookRes>,
@@ -323,10 +354,13 @@ pub(crate) fn apply_commands(
         return;
     }
     let mut dirty = std::mem::take(&mut state.dirty_tiles);
+    let actor = state.controlled;
     if let Some(world) = state.world.as_mut() {
+        // Действия игрока (Player*) исполняет захваченное существо;
+        // в наблюдателе actor = None и они пропускаются.
         queue.0.apply_all(
             world,
-            player.0.as_mut(),
+            actor,
             &mut dirty,
             &mut sched.0,
             clock.0.tick,

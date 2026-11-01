@@ -7,7 +7,7 @@ use bevy::picking::Pickable;
 use bevy::ui_widgets::TextInput;
 
 use crate::app::settings::{ControlAction, Settings};
-use crate::app::state::{GameMode, GameState, PlayerRes};
+use crate::app::state::{GameMode, GameState};
 use bevy::ui_widgets::Button;
 use crate::simulation::items::{MISC_SLOTS, SlotArea};
 use crate::ui::inventory::{InventoryUi, InvSlot};
@@ -131,8 +131,12 @@ fn toggle_hotbar_visibility(
     state: Res<GameState>,
     mut roots: Query<(&mut Node, &mut Pickable), With<HotbarRoot>>,
 ) {
+    // Хотбар — окно инвентаря разумного существа: захваченный волк без
+    // «ума» слотов не имеет и строки не получает (раньше она рисовалась
+    // пустой).
+    let visible = state.mode == GameMode::Player && state.controlled_mind().is_some();
     for (mut node, mut pickable) in &mut roots {
-        if state.mode == GameMode::Player {
+        if visible {
             node.display = Display::Flex;
             *pickable = Pickable::default();
         } else {
@@ -146,10 +150,9 @@ fn toggle_hotbar_visibility(
 fn handle_hotbar_selection(
     keys: Res<ButtonInput<KeyCode>>,
     settings: Res<Settings>,
-    state: Res<GameState>,
+    mut state: ResMut<GameState>,
     inv: Res<InventoryUi>,
-    station: Res<crate::ui::station::StationUi>,
-    mut player: ResMut<PlayerRes>,
+    station: Res<crate::ui::stations::StationUi>,
     focus: Res<InputFocus>,
     text_inputs: Query<(), With<TextInput>>,
     capture: Res<crate::ui::pause_menu::BindingCapture>,
@@ -167,7 +170,9 @@ fn handle_hotbar_selection(
         || station.open
         || state.active_menu == Some(crate::app::state::MenuKind::Creative);
     let inventory_key = settings.controls.key(ControlAction::Inventory);
-    let Some(p) = player.0.as_mut() else {
+    // Хотбар есть только у разумного существа (с «умом»); волк не выбирает
+    // слоты — инвентаря у него нет.
+    let Some(p) = state.controlled_mind_mut() else {
         return;
     };
     // Цифры 1..8.
@@ -208,7 +213,6 @@ fn handle_hotbar_selection(
 
 fn refresh_hotbar(
     state: Res<GameState>,
-    player: Res<PlayerRes>,
     icons: Res<UiIcons>,
     mut slots: Query<(&HotbarSlot, &mut BorderColor, &mut BackgroundColor, &Children)>,
     mut images: Query<&mut ImageNode>,
@@ -217,7 +221,7 @@ fn refresh_hotbar(
     if state.mode != GameMode::Player {
         return;
     }
-    let Some(p) = player.0.as_ref() else {
+    let Some(p) = state.controlled_mind() else {
         return;
     };
     for (slot, mut border, mut bg, children) in &mut slots {

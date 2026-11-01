@@ -1,5 +1,7 @@
 //! Мир: размер, чанки со слоями, доступ к тайлам и объектам.
 
+use std::collections::HashMap;
+
 use super::chunk::{Chunk, ResourceDeposit, TerrainTiles, CHUNK_SIZE};
 use super::combat::{Projectile, StuckSpear};
 use super::containers::Container;
@@ -56,10 +58,35 @@ pub struct TilePos {
 }
 
 /// Позиция чанка (в чанках).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ChunkPos {
     pub x: u32,
     pub y: u32,
+}
+
+/// Позиция в непрерывных координатах тайлов. Сущности не привязаны к сетке
+/// (GAME_DESIGN 4.2); свой тип вместо Bevy `Vec2` — в симуляции нет Bevy.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct WorldPos {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl WorldPos {
+    /// Позиция в центре тайла.
+    pub fn of_tile_center(pos: TilePos) -> Self {
+        Self {
+            x: pos.x as f32 + 0.5,
+            y: pos.y as f32 + 0.5,
+        }
+    }
+
+    /// Расстояние до другой позиции, тайлов.
+    pub fn dist(self, other: Self) -> f32 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        (dx * dx + dy * dy).sqrt()
+    }
 }
 
 /// Мир целиком.
@@ -86,6 +113,18 @@ pub struct World {
     pub next_projectile_id: u64,
     /// Дроп-сущности предметов (MC-стиль): разброс, автоподбор, despawn.
     pub item_entities: ItemEntities,
+    /// Прогресс ломания построек (транзиент, в сейв не пишется): тики
+    /// непрерывного зажатия ЛКМ по постройке. Ключ — тайл постройки.
+    pub building_breaks: HashMap<TilePos, BuildingBreak>,
+}
+
+/// Накопленный прогресс ломания постройки (simulation/actions.rs).
+#[derive(Clone, Copy, Debug)]
+pub struct BuildingBreak {
+    /// Тиков непрерывного зажатия накоплено.
+    pub progress: u16,
+    /// Тик последнего удара: большой зазор сбрасывает прогресс.
+    pub last_tick: u64,
 }
 
 impl World {
@@ -124,6 +163,7 @@ impl World {
         bytes += (self.projectiles.capacity() as u64) * size_of::<Projectile>();
         bytes += (self.stuck_spears.capacity() as u64) * size_of::<StuckSpear>();
         bytes += (self.item_entities.len() as u64) * size_of::<ItemEntity>();
+        bytes += map_bytes::<TilePos, BuildingBreak>(self.building_breaks.len());
         bytes
     }
 
@@ -142,6 +182,7 @@ impl World {
             stuck_spears: Vec::new(),
             next_projectile_id: 0,
             item_entities: ItemEntities::default(),
+            building_breaks: HashMap::new(),
         }
     }
 

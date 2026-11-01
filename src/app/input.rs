@@ -12,22 +12,25 @@ use bevy::ui_widgets::TextInput;
 
 use crate::app::settings::{ControlAction, Settings};
 use crate::app::state::{
-    ClockRes, CommandQueueRes, GameMode, GameState, MenuKind, PlayerRes, Tool, ToolCategory,
+    ClockRes, CommandQueueRes, EditorSelection, GameMode, GameState, MenuKind, Tool, ToolCategory,
     WindowFocusState,
 };
+use crate::simulation::actions;
 use crate::simulation::commands::Command;
 use crate::simulation::crops::CropKind;
 use crate::simulation::items::ItemKind;
 use crate::simulation::objects::{ObjectKind, WorldObject};
-use crate::simulation::player::{Player, WorldPos};
+use crate::simulation::world::WorldPos;
 use crate::simulation::{TILE_SIZE, TilePos, TileType, World};
 use crate::ui::UiFont;
 use crate::rendering::isometric::{
     WORLD_TILE_SIZE, ground_position_from_viewport, terrain_tile_from_viewport, world_position,
 };
-use crate::rendering::{
-    WOLF_SPRITE_PX, WOLF_VISIBLE_BOTTOM, WOLF_VISIBLE_LEFT, WOLF_VISIBLE_RIGHT, WOLF_VISIBLE_TOP,
-};
+use crate::rendering::{EntitySpriteVisuals, TileTextures, entity_sprite_size};
+
+/// Радиус выделения существа курсором, тайлов (задача «инспектор»):
+/// выбирается ближайшая к курсору сущность не дальше этого радиуса.
+pub(crate) const ENTITY_PICK_RADIUS_TILES: f32 = 2.0;
 use crate::ui::bottom_panel::{PanelMenu, PanelMenuState};
 use crate::ui::pause_menu::BindingCapture;
 use crate::ui::{BlocksWorldInput, cursor_over_ui, text_input_focused};
@@ -129,22 +132,24 @@ impl Plugin for InputPlugin {
     }
 }
 
-/// F1 — переключение режима наблюдатель ↔ игрок. Системная клавиша (как
-/// F11), пока не перебиндивается.
+/// F1 — захват существа под курсором / отпускание (GAME_DESIGN 4.1).
+/// Системная клавиша (как F11), пока не перебиндивается.
 ///
-/// Из наблюдателя игрок размещается на тайле под курсором; из игрока —
-/// «паркуется»: данные и инвентарь остаются в `PlayerRes` и переживут
-/// следующий вход в режим.
+/// По целевому формату отдельного игрока в мире нет: управление передаётся
+/// существу (человек, волк — любая сущность). В наблюдателе F1 захватывает
+/// существо под курсором; повторный F1 возвращает наблюдателя. Захват
+/// без сущности под курсором — no-op: существо спавнится редактором.
 fn toggle_player_mode(
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window>,
     mut state: ResMut<GameState>,
-    mut player: ResMut<PlayerRes>,
     cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
     capture: Res<BindingCapture>,
     focus: Res<InputFocus>,
     text_inputs: Query<(), With<TextInput>>,
+    textures: Res<TileTextures>,
+    visuals: Res<EntitySpriteVisuals>,
 ) {
     if !keys.just_pressed(KeyCode::F1) {
         return;
@@ -159,7 +164,15 @@ fn toggle_player_mode(
     }
 
     match state.mode {
-        GameMode::Player => state.mode = GameMode::Observer,
+        GameMode::Player => {
+            // Отпускание: сброс FSM-ходьбы, иначе освобождённое существо
+            // продолжило бы путь к устаревшей точке (цель осталась с
+            // момента захвата, а существо ушло далеко).
+            if let Some(entity) = state.controlled_entity_mut() {
+                reset_fsm_motion(entity);
+            }
+            state.set_controlled(None);
+        }
         GameMode::Observer => {
             let Ok(window) = windows.single() else {
                 return;
@@ -167,18 +180,30 @@ fn toggle_player_mode(
             if cursor_over_ui(window, &blockers) {
                 return;
             }
-            let Some(tile) = cursor_world_tile(window, &cameras, state.world.as_ref()) else {
+            let Some(world) = state.world.as_ref() else {
                 return;
             };
-            let pos = WorldPos::of_tile_center(tile);
-            match player.0.as_mut() {
-                // Существо уже было: переносим, инвентарь сохраняется.
-                Some(p) => p.teleport_to(pos),
-                None => player.0 = Some(Player::new(pos)),
+            let Some(id) = entity_at(world, window, &cameras, &textures, &visuals) else {
+                return;
+            };
+            state.set_controlled(Some(id));
+            // Захват перехватывает управление: сброс в стояние. Иначе
+            // спрайт анимировал бы FSM-путь, которым существо больше не
+            // идёт, а захваченный лежащим оставался бы лежащим до ввода.
+            if let Some(entity) = state.controlled_entity_mut() {
+                reset_fsm_motion(entity);
             }
-            state.mode = GameMode::Player;
         }
     }
+}
+
+/// Сброс движения FSM в стояние: цель приравнивается к позиции, счётчики
+/// обнуляются. Общая точка захвата/отпускания существа (F1).
+fn reset_fsm_motion(entity: &mut crate::simulation::SimEntity) {
+    entity.state = crate::simulation::EntityState::Standing;
+    entity.state_ticks = 0;
+    entity.target = entity.pos;
+    entity.stuck_ticks = 0;
 }
 
 /// Бинды движения — направление игрока. Пока фокус в текстовом поле
@@ -208,7 +233,9 @@ fn player_move_input(
 /// в руке: лук стреляет по нажатию (добычи нет), копьё на коротком
 /// нажатии бьёт, а на отпускании после удержания бросается в тайл под
 /// курсором; остальное — удар/добыча: сразу по нажатию, затем повтор
-/// каждые `INTERACT_REPEAT_SECS`. Бой и кулдауны считаются в симуляции;
+/// каждые `INTERACT_REPEAT_SECS`. Неразумное захваченное (волк) — только
+/// укус по курсору с тем же автоповтором (`Command::PlayerBite`): ломать
+/// и добывать он не умеет. Бой и кулдауны считаются в симуляции;
 /// след взмаха — косметика, сообщение уходит и на промахе. Публичная для
 /// порядка `apply_commands` в главном плагине.
 pub(crate) fn world_click_input(
@@ -216,7 +243,6 @@ pub(crate) fn world_click_input(
     time: Res<Time>,
     windows: Query<&Window>,
     state: Res<GameState>,
-    player: Res<PlayerRes>,
     clock: Res<ClockRes>,
     mut queue: ResMut<CommandQueueRes>,
     mut fx: MessageWriter<WeaponFx>,
@@ -295,21 +321,56 @@ pub(crate) fn world_click_input(
         *drag = None;
         return;
     }
-    let Some(p) = player.0.as_ref() else {
+    let Some(p) = state.controlled_entity() else {
         return;
     };
+    let attack_ready = p.mind.as_ref().map_or(u64::MAX, |m| m.attack_ready_tick);
+    let held = p.mind.as_ref().and_then(|m| m.selected_item());
+    let (actor_pos_x, actor_pos_y) = (p.pos.x, p.pos.y);
     let Some(tile) = cursor_world_tile(window, &cameras, Some(world)) else {
         return;
     };
+    // Неразумное захваченное (волк): ЛКМ — укус по курсору с тем же
+    // автоповтором зажатия, что у удара человека. Кусь — единственное
+    // действие волка: ломать постройки и добывать он не умеет, поэтому
+    // ветки ниже (ломание, лук, копьё, добыча) ему недоступны.
+    if !p.kind.is_sentient() {
+        if !mouse.pressed(MouseButton::Left) {
+            *hold = HarvestHold::default();
+            return;
+        }
+        if mouse.just_pressed(MouseButton::Left) {
+            queue.0.push(Command::PlayerBite { pos: tile });
+            hold.cooldown = INTERACT_REPEAT_SECS;
+            return;
+        }
+        hold.cooldown -= time.delta_secs();
+        if hold.cooldown <= 0.0 {
+            queue.0.push(Command::PlayerBite { pos: tile });
+            hold.cooldown =
+                INTERACT_REPEAT_SECS - (-hold.cooldown).rem_euclid(INTERACT_REPEAT_SECS);
+        }
+        return;
+    }
     let aim = cursor_world_pos(window, &cameras, world).unwrap_or_default();
-    let origin = Vec2::new(p.pos.x * TILE_SIZE, p.pos.y * TILE_SIZE);
-    let held = p.selected_item();
+    let origin = Vec2::new(actor_pos_x * TILE_SIZE, actor_pos_y * TILE_SIZE);
+
+    // Постройка под курсором — зажатие ЛКМ ломает её (любым предметом):
+    // команда уходит каждый кадр зажатия, тики непрерывности и разрушение
+    // считает симуляция. Обычная добыча и удары оружием на тайле постройки
+    // недоступны — ЛКМ занята ломанием.
+    if world.object_at(tile).is_some_and(|obj| obj.kind.is_building()) {
+        if mouse.pressed(MouseButton::Left) {
+            queue.0.push(Command::PlayerBreakBuilding { pos: tile });
+        }
+        return;
+    }
 
     // Лук: стрельба по нажатию. Добычи и ударов нет — луком нельзя ломать.
     // Эффект показывается только при реальном выстреле: на кулдауне
     // симуляция команду отклонит, и текстура лука не должна появляться.
     if held == Some(ItemKind::Bow) {
-        if mouse.just_pressed(MouseButton::Left) && clock.0.tick >= p.attack_ready_tick {
+        if mouse.just_pressed(MouseButton::Left) && clock.0.tick >= attack_ready {
             queue.0.push(Command::PlayerShootBow { target: tile });
             fx.write(WeaponFx { kind: WeaponFxKind::Bow, origin, aim });
         }
@@ -339,7 +400,7 @@ pub(crate) fn world_click_input(
                     .weapon_stats()
                     .map(|stats| stats.cooldown_ticks)
                     .unwrap_or(10);
-                if clock.0.tick >= p.attack_ready_tick && clock.0.tick >= *thrust_fx_ready_tick {
+                if clock.0.tick >= attack_ready && clock.0.tick >= *thrust_fx_ready_tick {
                     fx.write(WeaponFx { kind: WeaponFxKind::Thrust, origin, aim });
                     *thrust_fx_ready_tick = clock.0.tick + spear_cooldown;
                 }
@@ -366,7 +427,7 @@ pub(crate) fn world_click_input(
         // и инструменты без анимации, бой при этом считается всегда.
         // Анимация только когда кулдаун прошлой атаки вышел — как у лука
         // и копья, чтобы визуал не убегал вперёд реального урона.
-        if held == Some(ItemKind::Knife) && clock.0.tick >= p.attack_ready_tick {
+        if held == Some(ItemKind::Knife) && clock.0.tick >= attack_ready {
             fx.write(WeaponFx { kind: WeaponFxKind::Blade, origin, aim });
         }
         queue.0.push(Command::PlayerInteract { pos: tile });
@@ -392,7 +453,6 @@ fn player_drop_input(
     windows: Query<&Window>,
     state: Res<GameState>,
     mut queue: ResMut<CommandQueueRes>,
-    player: Res<PlayerRes>,
     cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
     focus: Res<InputFocus>,
@@ -408,7 +468,7 @@ fn player_drop_input(
     if !keys.just_pressed(settings.controls.key(ControlAction::DropItem)) {
         return;
     }
-    let Some(p) = player.0.as_ref() else {
+    let Some(actor) = state.controlled else {
         return;
     };
     let Some(world) = state.world.as_ref() else {
@@ -423,7 +483,7 @@ fn player_drop_input(
     let Some(tile) = cursor_world_tile(window, &cameras, Some(world)) else {
         return;
     };
-    if !p.reachable(tile, world) {
+    if !actions::reachable(world, actor, tile) {
         return;
     }
     queue.0.push(Command::PlayerDropItem { pos: tile });
@@ -437,7 +497,6 @@ fn player_throw_input(
     keys: Res<ButtonInput<KeyCode>>,
     settings: Res<Settings>,
     state: Res<GameState>,
-    player: Res<PlayerRes>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
@@ -454,7 +513,7 @@ fn player_throw_input(
     if !keys.just_pressed(settings.controls.key(ControlAction::ThrowItem)) {
         return;
     }
-    if player.0.is_none() || state.world.is_none() {
+    if state.controlled.is_none() || state.world.is_none() {
         return;
     }
     let Ok(window) = windows.single() else {
@@ -474,9 +533,9 @@ fn player_throw_input(
         KeyCode::ControlRight,
     ]);
     if whole_slot
-        && let Some(p) = player.0.as_ref()
+        && let Some(m) = state.controlled_mind()
     {
-        let slot = p.selected_slot.min(crate::simulation::MISC_SLOTS - 1) as u8;
+        let slot = m.selected_slot.min(crate::simulation::MISC_SLOTS - 1) as u8;
         queue.0.push(Command::PlayerThrowStack { target: tile, slot });
         return;
     }
@@ -498,11 +557,10 @@ fn player_pickup_input(
     state: Res<GameState>,
     construction: Res<crate::ui::construction::ConstructionUi>,
     mut queue: ResMut<CommandQueueRes>,
-    player: Res<PlayerRes>,
-    mut station: ResMut<crate::ui::station::StationUi>,
+    mut station: ResMut<crate::ui::stations::StationUi>,
     mut commands: Commands,
     font: Res<UiFont>,
-    station_roots: Query<Entity, With<crate::ui::station::StationRoot>>,
+    station_roots: Query<Entity, With<crate::ui::stations::StationRoot>>,
     mut hold: Local<HarvestHold>,
     cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
@@ -526,11 +584,10 @@ fn player_pickup_input(
     // поедания всё равно отбрасывал бы команды). НО сажаемый предмет
     // (семена, корнеплоды — тоже еда) по подходящей пашне сажается,
     // а не съедается: проверка как в `rmb_action`/`Player::sow`.
-    let sow_ready = match (player.0.as_ref(), state.world.as_ref()) {
-        (Some(p), Some(world)) => {
-            p.selected_item()
-                .and_then(CropKind::from_seed_item)
-                .is_some()
+    let held = state.controlled_mind().and_then(|m| m.selected_item());
+    let sow_ready = match (held, state.world.as_ref()) {
+        (Some(item), Some(world)) => {
+            CropKind::from_seed_item(item).is_some()
                 && cursor_world_tile(window, &cameras, Some(world)).is_some_and(|tile| {
                     world.terrain_kind(tile) == TileType::Farmland
                         && world.object_at(tile).is_none()
@@ -540,12 +597,7 @@ fn player_pickup_input(
         }
         _ => false,
     };
-    if !sow_ready
-        && player
-            .0
-            .as_ref()
-            .is_some_and(|p| p.selected_item().is_some_and(|kind| kind.food_value() > 0.0))
-    {
+    if !sow_ready && held.is_some_and(|kind| kind.food_value() > 0.0) {
         if mouse.just_pressed(MouseButton::Right) {
             queue.0.push(Command::PlayerEat);
         }
@@ -567,7 +619,6 @@ fn player_pickup_input(
             &mut station,
             &mut commands,
             &font,
-            &player,
             &station_roots,
         );
         hold.cooldown = INTERACT_REPEAT_SECS;
@@ -583,7 +634,6 @@ fn player_pickup_input(
             &mut station,
             &mut commands,
             &font,
-            &player,
             &station_roots,
         );
         hold.cooldown =
@@ -599,12 +649,15 @@ fn rmb_action(
     state: &GameState,
     windows: &Query<&Window>,
     cameras: &Query<(&Camera, &Transform), With<Camera2d>>,
-    station: &mut crate::ui::station::StationUi,
+    station: &mut crate::ui::stations::StationUi,
     commands: &mut Commands,
     font: &UiFont,
-    player: &PlayerRes,
-    station_roots: &Query<Entity, With<crate::ui::station::StationRoot>>,
+    station_roots: &Query<Entity, With<crate::ui::stations::StationRoot>>,
 ) {
+    let Some(actor) = state.controlled else {
+        return;
+    };
+    let held = state.controlled_mind().and_then(|m| m.selected_item());
     let Some(world) = state.world.as_ref() else {
         return;
     };
@@ -620,16 +673,13 @@ fn rmb_action(
         .object_at(tile)
         .map(|obj| obj.kind)
         .filter(|kind| kind.is_station())
-        .filter(|_| player.0.as_ref().is_some_and(|p| p.reachable(tile, world)))
+        .filter(|_| actions::reachable(world, actor, tile))
     {
-        crate::ui::station::toggle_station(commands, station, station_roots, font, tile, kind);
+        crate::ui::stations::toggle_station(commands, station, station_roots, font, tile, kind);
         return;
     }
     // Сажаемый предмет в руке и пашня без объекта — посев.
-    if player
-        .0
-        .as_ref()
-        .is_some_and(|p| p.selected_item().and_then(CropKind::from_seed_item).is_some())
+    if held.is_some_and(|kind| CropKind::from_seed_item(kind).is_some())
         && world.terrain_kind(tile) == TileType::Farmland
         && world.object_at(tile).is_none()
         && world.crop_at(tile).is_none()
@@ -680,6 +730,8 @@ pub(crate) fn editor_delete_input(
     mut queue: ResMut<CommandQueueRes>,
     cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
+    textures: Res<TileTextures>,
+    visuals: Res<EntitySpriteVisuals>,
     mut drag_distance: Local<Option<f32>>,
 ) {
     if state.mode != GameMode::Observer {
@@ -740,7 +792,7 @@ pub(crate) fn editor_delete_input(
             }
         }
         DeleteClass::Entities => {
-            if let Some(id) = entity_at(world, window, &cameras) {
+            if let Some(id) = entity_at(world, window, &cameras, &textures, &visuals) {
                 queue.0.push(Command::RemoveEntity { id });
             }
         }
@@ -752,38 +804,68 @@ pub(crate) fn editor_delete_input(
 /// отпускание освобождает. Каждый кадр уходит команда `MoveEntity`.
 pub(crate) fn editor_entity_drag(
     mouse: Res<ButtonInput<MouseButton>>,
+    mut motion: MessageReader<MouseMotion>,
     windows: Query<&Window>,
     focus: Res<WindowFocusState>,
     state: Res<GameState>,
+    mut selection: ResMut<EditorSelection>,
     mut queue: ResMut<CommandQueueRes>,
     cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
+    textures: Res<TileTextures>,
+    visuals: Res<EntitySpriteVisuals>,
     mut dragged: Local<Option<u64>>,
+    // Накопленное движение мыши с момента нажатия СКМ: клик без
+    // перетаскивания (порог в пикселях) открывает окно-инспектор.
+    mut drag_distance: Local<f32>,
 ) {
+    const CLICK_DRAG_THRESHOLD: f32 = 4.0;
+
     // Потеря фокуса окна: отпускание кнопки могло не дойти до игры
     // (например, кнопку отпустили в другом окне), поэтому перетаскивание
     // завершаем сразу, не дожидаясь следующего нажатия.
     if state.mode != GameMode::Observer || !focus.focused {
         *dragged = None;
+        selection.hovered = None;
         return;
     }
+
+    let Ok(window) = windows.single() else {
+        *dragged = None;
+        return;
+    };
+
+    // Наведение: существо под курсором (не над UI) подсвечивается белым
+    // контуром. Пересчёт только в наблюдателе — в игре выделения нет.
+    selection.hovered = if cursor_over_ui(window, &blockers) {
+        None
+    } else {
+        state
+            .world
+            .as_ref()
+            .and_then(|world| entity_at(world, window, &cameras, &textures, &visuals))
+    };
 
     // Нажатие на существо начинает перетаскивание. Клик мимо — ничего.
     if mouse.just_pressed(MouseButton::Middle) {
         *dragged = None;
-        let Ok(window) = windows.single() else {
-            return;
-        };
+        *drag_distance = 0.0;
         if cursor_over_ui(window, &blockers) {
             return;
         }
         let Some(world) = state.world.as_ref() else {
             return;
         };
-        let Some(_point) = cursor_world_pos(window, &cameras, world) else {
+        if cursor_world_pos(window, &cameras, world).is_none() {
             return;
-        };
-        *dragged = entity_at(world, window, &cameras);
+        }
+        *dragged = entity_at(world, window, &cameras, &textures, &visuals);
+    }
+    // Дрожание руки при клике не должно открывать инспектор вместо
+    // перетаскивания: порог тот же, что у удаления ПКМ.
+    let motion_delta: f32 = motion.read().map(|event| event.delta.length()).sum();
+    if mouse.pressed(MouseButton::Middle) {
+        *drag_distance += motion_delta;
     }
 
     let Some(id) = *dragged else {
@@ -795,13 +877,25 @@ pub(crate) fn editor_entity_drag(
         return;
     }
 
-    let Ok(window) = windows.single() else {
+    // Отпускание без движения — это клик по существу: открыть/закрыть
+    // окно-инспектор вместо переноса.
+    if releasing && *drag_distance <= CLICK_DRAG_THRESHOLD {
+        selection.selected = if selection.selected == Some(id) {
+            None
+        } else {
+            Some(id)
+        };
         *dragged = None;
         return;
-    };
-    // Над панелями UI существо не двигаем, но отпускание кнопки всё равно
-    // завершает перетаскивание.
-    if !cursor_over_ui(window, &blockers)
+    }
+
+    // Перенос начинается только когда зажатие переросло клик: раньше
+    // команда уходила уже в кадр нажатия, и СКМ-клик по сущности
+    // телепортировал её к курсору (радиус выбора — до 2 тайлов) до того,
+    // как releasing успевал превратить зажатие в инспектор.
+    if *drag_distance > CLICK_DRAG_THRESHOLD
+        && mouse.pressed(MouseButton::Middle)
+        && !cursor_over_ui(window, &blockers)
         && let Some(world) = state.world.as_ref()
         && let Some(point) = cursor_world_pos(window, &cameras, world)
     {
@@ -821,35 +915,63 @@ pub(crate) fn editor_entity_drag(
 }
 
 /// Выбирает существо по прямоугольнику экранного спрайта: луч пересекает
-/// поверхность земли, а не сам спрайт, поднятый над тайлом.
-fn entity_at(
+/// поверхность земли, а не сам спрайт, поднятый над тайлом. Границы рисунка
+/// берутся из альфа-канала текстуры (`EntitySpriteVisuals`) — пикинг
+/// попадает ровно в тот рисунок, что рисуется, без ручных констант.
+/// Берётся ближайшая к курсору сущность в радиусе `ENTITY_PICK_RADIUS_TILES`
+/// (общая логика для захвата по F1, инспектора и подсветки).
+pub(crate) fn entity_at(
     world: &World,
     window: &Window,
     cameras: &Query<(&Camera, &Transform), With<Camera2d>>,
+    textures: &TileTextures,
+    visuals: &EntitySpriteVisuals,
 ) -> Option<u64> {
     let cursor = window.cursor_position()?;
     let Ok((camera, camera_transform)) = cameras.single() else {
         return None;
     };
+    // Курсор в тайловых координатах — для ограничения радиуса выбора.
+    // `cursor_world_pos` даёт пиксели симуляции (TILE_SIZE на тайл),
+    // а `entity.pos` хранится в тайлах: без деления радиус сравнивал
+    // единицы разных масштабов и не пропускал ни одно существо.
+    let cursor_px = cursor_world_pos(window, cameras, world)?;
+    let cursor_tiles = WorldPos {
+        x: cursor_px.x / TILE_SIZE,
+        y: cursor_px.y / TILE_SIZE,
+    };
     let camera_global = GlobalTransform::from(*camera_transform);
     let camera_up = camera_transform.rotation * Vec3::Y;
     let camera_right = camera_transform.rotation * Vec3::X;
-    let half_width = WOLF_SPRITE_PX * (WOLF_VISIBLE_RIGHT - WOLF_VISIBLE_LEFT) * 0.5;
-    let half_height = WOLF_SPRITE_PX * (WOLF_VISIBLE_BOTTOM - WOLF_VISIBLE_TOP) * 0.5;
     let mut nearest: Option<(u64, f32)> = None;
 
     for entity in world.entities.iter() {
+        // Радиус выделения: только существа рядом с курсором.
+        if entity.pos.dist(cursor_tiles) > ENTITY_PICK_RADIUS_TILES {
+            continue;
+        }
+        // Границы ещё не отсканированы (текстура не догрузилась) — существо
+        // пропускается до ближайшего кадра: спрайт к этому моменту тоже
+        // ещё не отрисован.
+        let Some(bounds) = visuals.bounds(textures.entity_texture(entity).id()) else {
+            continue;
+        };
+        let size = entity_sprite_size(entity.kind);
+        let half_width = size.x * (bounds.right - bounds.left) * 0.5;
+        let half_height = size.y * (bounds.bottom - bounds.top) * 0.5;
         let ground = world_position(world, Vec2::new(entity.pos.x, entity.pos.y));
-        let alpha_center_x = (WOLF_VISIBLE_LEFT + WOLF_VISIBLE_RIGHT) * 0.5;
-        let alpha_center_y = (WOLF_VISIBLE_TOP + WOLF_VISIBLE_BOTTOM) * 0.5;
+        let alpha_center_x = (bounds.left + bounds.right) * 0.5;
+        let alpha_center_y = (bounds.top + bounds.bottom) * 0.5;
         let flip = if entity.facing == crate::simulation::Facing::Left {
             -1.0
         } else {
             1.0
         };
+        // Центр рисунка относительно земли: тот же вывод, что у трансформа
+        // спрайта с bottom_offset = 1 - bounds.bottom (см. entity_transform).
         let center = ground
-            + camera_right * (flip * WOLF_SPRITE_PX * (alpha_center_x - 0.5))
-            + camera_up * (WOLF_SPRITE_PX * (WOLF_VISIBLE_BOTTOM - alpha_center_y));
+            + camera_right * (flip * size.x * (alpha_center_x - 0.5))
+            + camera_up * (size.y * (bounds.bottom - alpha_center_y));
         let Ok(center_screen) = camera.world_to_viewport(&camera_global, center) else {
             continue;
         };
@@ -878,7 +1000,8 @@ fn entity_at(
     nearest.map(|(id, _)| id)
 }
 
-/// Позиция курсора в прежних единицах симуляции (32 px на тайл).
+/// Позиция курсора в единицах симуляции (`TILE_SIZE` px на тайл, не тайлы:
+/// для перевода в тайловые координаты делить на `TILE_SIZE`).
 /// `None` — луч камеры не пересёк рельеф мира.
 pub(crate) fn cursor_world_pos(
     window: &Window,

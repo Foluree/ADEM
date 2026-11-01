@@ -7,11 +7,12 @@ pub mod fps;
 pub mod health;
 pub mod hotbar;
 pub mod icons;
+pub mod inspector;
 pub mod inventory;
 pub mod menu_bg;
 pub mod menus;
 pub mod pause_menu;
-pub mod station;
+pub mod stations;
 pub mod style;
 pub mod tooltip;
 
@@ -103,7 +104,8 @@ impl Plugin for UiPlugin {
             .add_plugins(health::HealthPlugin)
             .add_plugins(hotbar::HotbarPlugin)
             .add_plugins(construction::ConstructionPlugin)
-            .add_plugins(station::StationPlugin)
+            .add_plugins(stations::StationPlugin)
+            .add_plugins(inspector::InspectorPlugin)
             .add_plugins(tooltip::TooltipPlugin);
     }
 }

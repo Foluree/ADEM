@@ -9,7 +9,7 @@ use bevy::ui_widgets::TextInput;
 
 use crate::app::input::move_dir;
 use crate::app::settings::Settings;
-use crate::app::state::{GameMode, GameState, PlayerRes, SimTick, TickAccumulator, player_render_pos};
+use crate::app::state::{GameMode, GameState, SimTick, TickAccumulator, controlled_render_pos};
 use crate::rendering::isometric::{WORLD_TILE_SIZE, world_position};
 use crate::ui::pause_menu::BindingCapture;
 use crate::ui::text_input_focused;
@@ -213,28 +213,25 @@ fn pan_system(
 
 fn follow_player(
     state: Res<GameState>,
-    player: Res<PlayerRes>,
     acc: Res<TickAccumulator>,
     time: Res<Time>,
     mut camera_target: ResMut<CameraTarget>,
 ) {
-    if state.mode != GameMode::Player {
+    let Some(entity) = state
+        .controlled_entity()
+        .filter(|_| state.mode == GameMode::Player)
+    else {
         camera_target.following_player = false;
         camera_target.height_velocity = 0.0;
         return;
-    }
+    };
     let Some(world) = state.world.as_ref() else {
         camera_target.following_player = false;
         camera_target.height_velocity = 0.0;
         return;
     };
-    let Some(player) = player.0.as_ref() else {
-        camera_target.following_player = false;
-        camera_target.height_velocity = 0.0;
-        return;
-    };
     let player_position = world_position(world, {
-        let pos = player_render_pos(player, &acc);
+        let pos = controlled_render_pos(entity, &acc);
         Vec2::new(pos.x, pos.y)
     });
     if !camera_target.following_player {

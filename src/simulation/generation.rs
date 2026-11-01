@@ -24,7 +24,7 @@ use rand::{RngExt, SeedableRng}; // Bevy 0.20 / rand 0.10: RngExt вместо R
 
 use super::entities::EntityKind;
 use super::objects::WorldObject;
-use super::player::WorldPos;
+use super::world::WorldPos;
 use super::tile::{ResourceKind, TileType};
 use super::world::{TilePos, World, WorldSize};
 

@@ -1,6 +1,8 @@
 //! Симуляция мира. Без зависимости от Bevy.
 //! Правила и данные мира — здесь; рендер и UI живут в других модулях.
 
+pub mod actions;
+pub mod ai;
 pub mod chunk;
 pub mod clothes;
 pub mod climate;
@@ -18,7 +20,6 @@ pub mod items;
 pub mod movement;
 pub mod needs;
 pub mod objects;
-pub mod player;
 pub mod save;
 pub mod scheduler;
 pub mod tile;
@@ -55,7 +56,7 @@ pub use crops::{Crop, CropKind, CROP_KIND_COUNT, MAX_CROP_STAGES};
 #[allow(unused_imports)]
 pub use dirty::DirtyTiles;
 #[allow(unused_imports)]
-pub use entities::{EntityKind, EntityState, EntityStore, Facing, SimEntity};
+pub use entities::{EntityKind, EntityStore, EntityState, Facing, HumanGoal, HumanMind, SimEntity};
 #[allow(unused_imports)]
 pub use hunger::{Activity, Hunger, EAT_COOLDOWN_TICKS, HUNGER_MAX};
 #[allow(unused_imports)]
@@ -67,7 +68,8 @@ pub use needs::{Need, NeedKind};
 #[allow(unused_imports)]
 pub use objects::{BuildingKind, ObjectKind, ObjectStage, WorldObject};
 #[allow(unused_imports)]
-pub use player::{Player, WorldPos};
+pub use actions::{INTERACT_REACH};
+pub use world::WorldPos;
 #[allow(unused_imports)]
 pub use scheduler::{Scheduler, Task, TaskId, TaskKind};
 #[allow(unused_imports)]

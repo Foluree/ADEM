@@ -4,6 +4,7 @@
 //! будет больше, а мешам блоков нужен только доступ к хэндлам по виду
 //! (`object_texture`, `item_texture`, …).
 
+use bevy::image::{ImageLoaderSettings, ImageSampler};
 use bevy::prelude::*;
 
 use crate::simulation::{
@@ -39,9 +40,9 @@ pub(crate) struct TileTextures {
     storage_flat: Handle<Image>,
     /// Текстуры станций по порядку `STATION_KINDS`.
     stations: [StationTextures; STATION_KIND_COUNT],
-    /// Стадии культур: `[культура][стадия]` (пустые хэндлы для
-    /// несуществующих стадий не грузятся — см. `crop_texture`).
-    crops: Vec<Handle<Image>>,
+    /// Стадии культур: плотный массив `[культура][стадия]` по
+    /// `crop_stage_slot` (несуществующие стадии — дубликат последней).
+    crops: [Handle<Image>; CROP_TEXTURE_COUNT],
     /// Иконки предметов по дискриминанту `ItemKind`.
     items: [Handle<Image>; ITEM_KIND_COUNT],
     player: Handle<Image>,
@@ -71,10 +72,36 @@ pub(crate) const STATION_KINDS: [BuildingKind; 5] = [
 
 pub(crate) const STATION_KIND_COUNT: usize = STATION_KINDS.len();
 
+/// Всего слотов текстур стадий культур (плотная раскладка по культурам).
+pub(crate) const CROP_TEXTURE_COUNT: usize = CROP_KIND_COUNT * MAX_CROP_STAGES;
+
+/// Смещение стадии культуры в плотном массиве текстур: `[культура][стадия]`.
+/// Стадия зажимается до последней существующей (у культур с меньшим числом
+/// стадий «лишние» слоты дублируют зрелую стадию). Чистая функция — без
+/// графики проверяется тестом.
+pub(crate) fn crop_stage_slot(kind: CropKind, stage: u8) -> usize {
+    let stage = (stage as usize).min(kind.stage_count() - 1);
+    kind as usize * MAX_CROP_STAGES + stage
+}
+
 impl TileTextures {
     /// Загружает все текстуры из `assets/textures/...`.
     pub(crate) fn load(assets: &AssetServer) -> Self {
-        // Стадии культур грузим подряд: для каждой культуры — её число стадий.
+        // Все игровые текстуры — пиксель-арт: грузим с nearest-семплированием,
+        // иначе при масштабировании квадов (объекты, существа, культуры,
+        // предметы на земле) рисунок размывается линейной фильтрацией.
+        // Приём тот же, что у UI-иконок (`UiIcons::load`).
+        let nearest = |path: String| {
+            assets
+                .load_builder()
+                .with_settings::<ImageLoaderSettings>(move |settings| {
+                    settings.sampler = ImageSampler::nearest();
+                })
+                .load(path)
+        };
+        // Стадии культур грузим в плотную раскладку: слот каждой культуры
+        // и стадии заполнен реальной текстурой, недостающие стадии —
+        // дубликатом последней существующей (см. `crop_stage_slot`).
         let crop_files: [&str; CROP_KIND_COUNT] = [
             "wheat",
             "beetroots",
@@ -82,169 +109,174 @@ impl TileTextures {
             "potatoes",
             "cherry",
         ];
-        let mut crops = Vec::with_capacity(CROP_KIND_COUNT * MAX_CROP_STAGES);
+        let mut crops: Vec<Handle<Image>> = Vec::with_capacity(CROP_TEXTURE_COUNT);
         for (kind, base) in crop_files.iter().enumerate() {
-            for stage in 0..CropKind::from_discriminant(kind as u8)
-                .map_or(0, CropKind::stage_count)
-            {
-                crops.push(assets.load(format!("textures/crops/{base}_stage{stage}.png")));
+            let kind = CropKind::from_discriminant(kind as u8).expect("культуры 0..COUNT валидны");
+            let stage_count = kind.stage_count();
+            for stage in 0..MAX_CROP_STAGES {
+                // Существующие стадии — свои файлы; остальные — дубликат зрелой.
+                let file_stage = stage.min(stage_count - 1);
+                crops.push(nearest(format!("textures/crops/{base}_stage{file_stage}.png")));
             }
         }
+        let crops: [Handle<Image>; CROP_TEXTURE_COUNT] = crops
+            .try_into()
+            .expect("все слоты культур заполнены");
 
         Self {
-            water: assets.load("textures/tiles/water.png"),
-            sand: assets.load("textures/tiles/sand.png"),
-            dirt: assets.load("textures/tiles/dirt.png"),
-            grass: assets.load("textures/tiles/grass.png"),
-            forest_grass: assets.load("textures/tiles/forest_grass.png"),
-            stone: assets.load("textures/tiles/stone.png"),
-            clay: assets.load("textures/tiles/clay.png"),
-            farmland: assets.load("textures/tiles/farmland.png"),
-            deep_water: assets.load("textures/tiles/deep_water.png"),
-            ocean: assets.load("textures/tiles/ocean.png"),
-            mountain: assets.load("textures/tiles/mountain.png"),
-            moss: assets.load("textures/tiles/moss.png"),
-            mud: assets.load("textures/tiles/mud.png"),
-            podzol: assets.load("textures/tiles/podzol.png"),
-            tree: assets.load("textures/objects/tree.png"),
-            bush: assets.load("textures/objects/bush.png"),
-            rock: assets.load("textures/objects/rock.png"),
-            apple_tree: assets.load("textures/objects/apple_tree.png"),
-            apple_tree_empty: assets.load("textures/objects/apple_tree_empty.png"),
-            campfire_cross: assets.load("textures/buildings/campfire_cross.png"),
-            storage_flat: assets.load("textures/buildings/storage.png"),
+            water: nearest("textures/tiles/water.png".into()),
+            sand: nearest("textures/tiles/sand.png".into()),
+            dirt: nearest("textures/tiles/dirt.png".into()),
+            grass: nearest("textures/tiles/grass.png".into()),
+            forest_grass: nearest("textures/tiles/forest_grass.png".into()),
+            stone: nearest("textures/tiles/stone.png".into()),
+            clay: nearest("textures/tiles/clay.png".into()),
+            farmland: nearest("textures/tiles/farmland.png".into()),
+            deep_water: nearest("textures/tiles/deep_water.png".into()),
+            ocean: nearest("textures/tiles/ocean.png".into()),
+            mountain: nearest("textures/tiles/mountain.png".into()),
+            moss: nearest("textures/tiles/moss.png".into()),
+            mud: nearest("textures/tiles/mud.png".into()),
+            podzol: nearest("textures/tiles/podzol.png".into()),
+            tree: nearest("textures/objects/tree.png".into()),
+            bush: nearest("textures/objects/bush.png".into()),
+            rock: nearest("textures/objects/rock.png".into()),
+            apple_tree: nearest("textures/objects/apple_tree.png".into()),
+            apple_tree_empty: nearest("textures/objects/apple_tree_empty.png".into()),
+            campfire_cross: nearest("textures/buildings/campfire_cross.png".into()),
+            storage_flat: nearest("textures/buildings/storage.png".into()),
             stations: [
                 // Верстак: боковины одинаковы, фронтальной грани нет.
                 StationTextures {
-                    top: assets.load("textures/buildings/crafting_table_top.png"),
-                    side: assets.load("textures/buildings/crafting_table_side.png"),
-                    front: assets.load("textures/buildings/crafting_table_side.png"),
+                    top: nearest("textures/buildings/crafting_table_top.png".into()),
+                    side: nearest("textures/buildings/crafting_table_side.png".into()),
+                    front: nearest("textures/buildings/crafting_table_side.png".into()),
                     front_on: None,
                 },
                 StationTextures {
-                    top: assets.load("textures/buildings/furnace_top.png"),
-                    side: assets.load("textures/buildings/furnace_side.png"),
-                    front: assets.load("textures/buildings/furnace_front.png"),
-                    front_on: Some(assets.load("textures/buildings/furnace_front_on.png")),
+                    top: nearest("textures/buildings/furnace_top.png".into()),
+                    side: nearest("textures/buildings/furnace_side.png".into()),
+                    front: nearest("textures/buildings/furnace_front.png".into()),
+                    front_on: Some(nearest("textures/buildings/furnace_front_on.png".into())),
                 },
                 StationTextures {
-                    top: assets.load("textures/buildings/barrel_top.png"),
-                    side: assets.load("textures/buildings/barrel_side.png"),
-                    front: assets.load("textures/buildings/barrel_side.png"),
+                    top: nearest("textures/buildings/barrel_top.png".into()),
+                    side: nearest("textures/buildings/barrel_side.png".into()),
+                    front: nearest("textures/buildings/barrel_side.png".into()),
                     front_on: None,
                 },
                 StationTextures {
-                    top: assets.load("textures/buildings/blast_furnace_top.png"),
-                    side: assets.load("textures/buildings/blast_furnace_side.png"),
-                    front: assets.load("textures/buildings/blast_furnace_front.png"),
-                    front_on: Some(assets.load("textures/buildings/blast_furnace_front_on.png")),
+                    top: nearest("textures/buildings/blast_furnace_top.png".into()),
+                    side: nearest("textures/buildings/blast_furnace_side.png".into()),
+                    front: nearest("textures/buildings/blast_furnace_front.png".into()),
+                    front_on: Some(nearest("textures/buildings/blast_furnace_front_on.png".into())),
                 },
                 StationTextures {
-                    top: assets.load("textures/buildings/smithing_table_top.png"),
-                    side: assets.load("textures/buildings/smithing_table_side.png"),
-                    front: assets.load("textures/buildings/smithing_table_front.png"),
+                    top: nearest("textures/buildings/smithing_table_top.png".into()),
+                    side: nearest("textures/buildings/smithing_table_side.png".into()),
+                    front: nearest("textures/buildings/smithing_table_front.png".into()),
                     front_on: None,
                 },
             ],
             crops,
             items: [
-                assets.load("textures/items/stick.png"),
-                assets.load("textures/items/rock.png"),
-                assets.load("textures/items/food/apple.png"),
-                assets.load("textures/items/grass_bunch_raw.png"),
-                assets.load("textures/items/plant_fiber.png"),
-                assets.load("textures/items/cordage_fiber.png"),
-                assets.load("textures/items/tools/axe_primal.png"),
-                assets.load("textures/items/tools/pickaxe_primal.png"),
-                assets.load("textures/items/tools/hoe_primal.png"),
-                assets.load("textures/items/tools/shovel_primal.png"),
-                assets.load("textures/items/weapon/spear_primal.png"),
-                assets.load("textures/items/tools/knife_stone.png"),
-                assets.load("textures/items/tools/fishing_rod_primal.png"),
-                assets.load("textures/items/weapon/arrow.png"),
-                assets.load("textures/items/weapon/bow_wood.png"),
-                assets.load("textures/items/armor/helmet_chainmail.png"),
-                assets.load("textures/items/armor/chestplate_chainmail.png"),
-                assets.load("textures/items/armor/leggings_chainmail.png"),
-                assets.load("textures/items/armor/boots_chainmail.png"),
-                assets.load("textures/items/bone.png"),
-                assets.load("textures/items/shard/shard_bone.png"),
-                assets.load("textures/items/arrow_fletching.png"),
-                assets.load("textures/items/feather.png"),
-                assets.load("textures/items/string.png"),
-                assets.load("textures/items/stick_bundle.png"),
-                assets.load("textures/items/book.png"),
-                assets.load("textures/items/paper.png"),
-                assets.load("textures/items/paper_pulp.png"),
-                assets.load("textures/items/clods/clod_clay.png"),
-                assets.load("textures/items/brick_clay_unfired.png"),
-                assets.load("textures/items/brick_clay_baked.png"),
-                assets.load("textures/items/seeds/seeds_wheat.png"),
-                assets.load("textures/items/wheat.png"),
-                assets.load("textures/items/tools/hammer_stone.png"),
-                assets.load("textures/items/nugget/nugget_copper.png"),
-                assets.load("textures/items/nugget/nugget_gold.png"),
-                assets.load("textures/items/nugget/nugget_silver.png"),
-                assets.load("textures/items/ingot/ingot_copper.png"),
-                assets.load("textures/items/ingot/ingot_bronze.png"),
-                assets.load("textures/items/ingot/ingot_tin.png"),
-                assets.load("textures/items/ingot/ingot_gold.png"),
-                assets.load("textures/items/ingot/ingot_silver.png"),
-                assets.load("textures/items/gem/gem_quartz.png"),
-                assets.load("textures/items/gem/gem_flint.png"),
-                assets.load("textures/items/gem/gem_emerald.png"),
-                assets.load("textures/items/gem/gem_ruby.png"),
-                assets.load("textures/items/dust/dust_bronze.png"),
-                assets.load("textures/items/dust/dust_charcoal.png"),
-                assets.load("textures/items/dust/dust_copper.png"),
-                assets.load("textures/items/dust/dust_flour.png"),
-                assets.load("textures/items/dust/dust_gold.png"),
-                assets.load("textures/items/dust/dust_pit_ash.png"),
-                assets.load("textures/items/dust/dust_silver.png"),
-                assets.load("textures/items/dust/dust_sugar.png"),
-                assets.load("textures/items/dust/dust_sulfur.png"),
-                assets.load("textures/items/dust/dust_tin.png"),
-                assets.load("textures/items/dust/dust_wood_chips.png"),
-                assets.load("textures/items/food/apple_baked.png"),
-                assets.load("textures/items/food/carrot.png"),
-                assets.load("textures/items/food/carrot_baked.png"),
-                assets.load("textures/items/food/egg.png"),
-                assets.load("textures/items/food/egg_roasted.png"),
-                assets.load("textures/items/food/lard.png"),
-                assets.load("textures/items/food/meat_bird_raw.png"),
-                assets.load("textures/items/food/meat_bird_cooked.png"),
-                assets.load("textures/items/food/meat_herbivore_raw.png"),
-                assets.load("textures/items/food/meat_herbivore_cooked.png"),
-                assets.load("textures/items/food/meat_predator_raw.png"),
-                assets.load("textures/items/food/meat_predator_cooked.png"),
-                assets.load("textures/items/food/potato.png"),
-                assets.load("textures/items/food/potato_baked.png"),
-                assets.load("textures/items/food/strange_tuber.png"),
-                assets.load("textures/items/raw_ore/raw_copper.png"),
-                assets.load("textures/items/raw_ore/raw_gold.png"),
-                assets.load("textures/items/raw_ore/raw_silver.png"),
-                assets.load("textures/items/raw_ore/raw_tin.png"),
-                assets.load("textures/items/tools/axe_copper.png"),
-                assets.load("textures/items/tools/hammer_copper.png"),
-                assets.load("textures/items/tools/hoe_copper.png"),
-                assets.load("textures/items/tools/pickaxe_copper.png"),
-                assets.load("textures/items/tools/saw_copper.png"),
-                assets.load("textures/items/tools/shears_copper.png"),
-                assets.load("textures/items/tools/shovel_copper.png"),
-                assets.load("textures/items/tools/sickle_copper.png"),
-                assets.load("textures/items/seeds/seeds_beetroot.png"),
-                assets.load("textures/items/food/beetroot.png"),
-                assets.load("textures/items/food/beetroot_roasted.png"),
-                assets.load("textures/items/food/cherry.png"),
-                assets.load("textures/items/coal.png"),
-                assets.load("textures/items/charcoal.png"),
+                nearest("textures/items/stick.png".into()),
+                nearest("textures/items/rock.png".into()),
+                nearest("textures/items/food/apple.png".into()),
+                nearest("textures/items/grass_bunch_raw.png".into()),
+                nearest("textures/items/plant_fiber.png".into()),
+                nearest("textures/items/cordage_fiber.png".into()),
+                nearest("textures/items/tools/axe_primal.png".into()),
+                nearest("textures/items/tools/pickaxe_primal.png".into()),
+                nearest("textures/items/tools/hoe_primal.png".into()),
+                nearest("textures/items/tools/shovel_primal.png".into()),
+                nearest("textures/items/weapon/spear_primal.png".into()),
+                nearest("textures/items/tools/knife_stone.png".into()),
+                nearest("textures/items/tools/fishing_rod_primal.png".into()),
+                nearest("textures/items/weapon/arrow.png".into()),
+                nearest("textures/items/weapon/bow_wood.png".into()),
+                nearest("textures/items/armor/helmet_chainmail.png".into()),
+                nearest("textures/items/armor/chestplate_chainmail.png".into()),
+                nearest("textures/items/armor/leggings_chainmail.png".into()),
+                nearest("textures/items/armor/boots_chainmail.png".into()),
+                nearest("textures/items/bone.png".into()),
+                nearest("textures/items/shard/shard_bone.png".into()),
+                nearest("textures/items/arrow_fletching.png".into()),
+                nearest("textures/items/feather.png".into()),
+                nearest("textures/items/string.png".into()),
+                nearest("textures/items/stick_bundle.png".into()),
+                nearest("textures/items/book.png".into()),
+                nearest("textures/items/paper.png".into()),
+                nearest("textures/items/paper_pulp.png".into()),
+                nearest("textures/items/clods/clod_clay.png".into()),
+                nearest("textures/items/brick_clay_unfired.png".into()),
+                nearest("textures/items/brick_clay_baked.png".into()),
+                nearest("textures/items/seeds/seeds_wheat.png".into()),
+                nearest("textures/items/wheat.png".into()),
+                nearest("textures/items/tools/hammer_stone.png".into()),
+                nearest("textures/items/nugget/nugget_copper.png".into()),
+                nearest("textures/items/nugget/nugget_gold.png".into()),
+                nearest("textures/items/nugget/nugget_silver.png".into()),
+                nearest("textures/items/ingot/ingot_copper.png".into()),
+                nearest("textures/items/ingot/ingot_bronze.png".into()),
+                nearest("textures/items/ingot/ingot_tin.png".into()),
+                nearest("textures/items/ingot/ingot_gold.png".into()),
+                nearest("textures/items/ingot/ingot_silver.png".into()),
+                nearest("textures/items/gem/gem_quartz.png".into()),
+                nearest("textures/items/gem/gem_flint.png".into()),
+                nearest("textures/items/gem/gem_emerald.png".into()),
+                nearest("textures/items/gem/gem_ruby.png".into()),
+                nearest("textures/items/dust/dust_bronze.png".into()),
+                nearest("textures/items/dust/dust_charcoal.png".into()),
+                nearest("textures/items/dust/dust_copper.png".into()),
+                nearest("textures/items/dust/dust_flour.png".into()),
+                nearest("textures/items/dust/dust_gold.png".into()),
+                nearest("textures/items/dust/dust_pit_ash.png".into()),
+                nearest("textures/items/dust/dust_silver.png".into()),
+                nearest("textures/items/dust/dust_sugar.png".into()),
+                nearest("textures/items/dust/dust_sulfur.png".into()),
+                nearest("textures/items/dust/dust_tin.png".into()),
+                nearest("textures/items/dust/dust_wood_chips.png".into()),
+                nearest("textures/items/food/apple_baked.png".into()),
+                nearest("textures/items/food/carrot.png".into()),
+                nearest("textures/items/food/carrot_baked.png".into()),
+                nearest("textures/items/food/egg.png".into()),
+                nearest("textures/items/food/egg_roasted.png".into()),
+                nearest("textures/items/food/lard.png".into()),
+                nearest("textures/items/food/meat_bird_raw.png".into()),
+                nearest("textures/items/food/meat_bird_cooked.png".into()),
+                nearest("textures/items/food/meat_herbivore_raw.png".into()),
+                nearest("textures/items/food/meat_herbivore_cooked.png".into()),
+                nearest("textures/items/food/meat_predator_raw.png".into()),
+                nearest("textures/items/food/meat_predator_cooked.png".into()),
+                nearest("textures/items/food/potato.png".into()),
+                nearest("textures/items/food/potato_baked.png".into()),
+                nearest("textures/items/food/strange_tuber.png".into()),
+                nearest("textures/items/raw_ore/raw_copper.png".into()),
+                nearest("textures/items/raw_ore/raw_gold.png".into()),
+                nearest("textures/items/raw_ore/raw_silver.png".into()),
+                nearest("textures/items/raw_ore/raw_tin.png".into()),
+                nearest("textures/items/tools/axe_copper.png".into()),
+                nearest("textures/items/tools/hammer_copper.png".into()),
+                nearest("textures/items/tools/hoe_copper.png".into()),
+                nearest("textures/items/tools/pickaxe_copper.png".into()),
+                nearest("textures/items/tools/saw_copper.png".into()),
+                nearest("textures/items/tools/shears_copper.png".into()),
+                nearest("textures/items/tools/shovel_copper.png".into()),
+                nearest("textures/items/tools/sickle_copper.png".into()),
+                nearest("textures/items/seeds/seeds_beetroot.png".into()),
+                nearest("textures/items/food/beetroot.png".into()),
+                nearest("textures/items/food/beetroot_roasted.png".into()),
+                nearest("textures/items/food/cherry.png".into()),
+                nearest("textures/items/coal.png".into()),
+                nearest("textures/items/charcoal.png".into()),
             ],
-            player: assets.load("textures/entities/player.png"),
-            wolf_standing: assets.load("textures/entities/wolf/wolf_standing.png"),
-            wolf_lying: assets.load("textures/entities/wolf/wolf_lying.png"),
+            player: nearest("textures/entities/player.png".into()),
+            wolf_standing: nearest("textures/entities/wolf/wolf_standing.png".into()),
+            wolf_lying: nearest("textures/entities/wolf/wolf_lying.png".into()),
             wolf_walk: [
-                assets.load("textures/entities/wolf/wolf_walk1.png"),
-                assets.load("textures/entities/wolf/wolf_walk2.png"),
+                nearest("textures/entities/wolf/wolf_walk1.png".into()),
+                nearest("textures/entities/wolf/wolf_walk2.png".into()),
             ],
         }
     }
@@ -294,11 +326,9 @@ impl TileTextures {
         &self.storage_flat
     }
 
-    /// Хэндл текстуры стадии культуры.
+    /// Хэндл текстуры стадии культуры (плотная раскладка — `crop_stage_slot`).
     pub(crate) fn crop_texture(&self, kind: CropKind, stage: u8) -> &Handle<Image> {
-        let base = kind as usize * MAX_CROP_STAGES;
-        let stage = (stage as usize).min(kind.stage_count() - 1);
-        &self.crops[base + stage]
+        &self.crops[crop_stage_slot(kind, stage)]
     }
 
     /// Хэндл текстуры предмета.
@@ -306,13 +336,9 @@ impl TileTextures {
         &self.items[kind as usize]
     }
 
-    /// Хэндл текстуры игрока.
-    pub(crate) fn player_texture(&self) -> &Handle<Image> {
-        &self.player
-    }
-
     /// Текстура существа по виду, состоянию и кадру анимации ходьбы.
     /// Исходники нарисованы смотрящими вправо; зеркалит рендер.
+    /// Человек временно рисуется текстурой игрока (решение автора).
     pub(crate) fn entity_texture(&self, entity: &crate::simulation::SimEntity) -> &Handle<Image> {
         match entity.kind {
             EntityKind::Wolf => match entity.state {
@@ -320,7 +346,22 @@ impl TileTextures {
                 EntityState::Lying => &self.wolf_lying,
                 EntityState::Walking => &self.wolf_walk[entity.walk_frame() as usize],
             },
+            EntityKind::Human => &self.player,
         }
+    }
+
+    /// Все текстуры существ: скан видимых областей (`EntitySpriteVisuals`)
+    /// должен покрыть каждую — пикинг и рендер обязаны видеть один рисунок.
+    /// Новый вид существ добавляет свою текстуру сюда же.
+    pub(crate) fn entity_textures(&self) -> impl Iterator<Item = &Handle<Image>> {
+        [
+            &self.player,
+            &self.wolf_standing,
+            &self.wolf_lying,
+            &self.wolf_walk[0],
+            &self.wolf_walk[1],
+        ]
+        .into_iter()
     }
 
     /// Хэндлы тайлов в порядке индексов атласа: Water … Podzol.

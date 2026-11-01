@@ -8,7 +8,7 @@
 //! дёшево); рендер читает только видимые.
 
 use super::items::ItemStack;
-use super::player::{Player, WorldPos};
+use super::world::{World, WorldPos};
 
 /// Радиус автоподбора: игрок подбирает предмет при приближении, тайлов.
 pub const PICKUP_RADIUS: f32 = 0.75;
@@ -32,6 +32,15 @@ pub const THROW_FLY_MIN_TICKS: u64 = 6;
 pub const THROW_FLY_MAX_TICKS: u64 = 60;
 /// Разброс позиции при дропе, тайлов (в каждую сторону).
 pub const SCATTER_TILES: f32 = 0.3;
+/// Радиус поедания мяса волком (как автоподбор — «наступил и съел»), тайлов.
+pub const WOLF_EAT_RADIUS: f32 = 0.75;
+/// Волк ест, пока сытость не близка к максимуму: упитанный хищник
+/// добирает еду до отвала.
+pub const WOLF_EAT_BELOW: f32 = super::hunger::HUNGER_MAX - 0.5;
+/// Радиус поиска лежащего мяса голодным волком, тайлов.
+pub const WOLF_MEAT_SEEK_RADIUS: f32 = 16.0;
+/// Порог голода, ниже которого волк ищет мясо, тайлов сытости.
+pub const WOLF_SEEK_BELOW: f32 = 60.0;
 
 /// Полёт брошенного предмета: интерполяция от точки броска к цели
 /// с замедлением. Транзиентное состояние — в сейв не пишется (предмет
@@ -173,10 +182,9 @@ impl ItemEntities {
         id
     }
 
-    /// Тик хранилища: автоподбор игроком и исчезновение старых предметов.
-    /// `player: Option<&mut Player>` — в наблюдателе игрока нет, подбор не
-    /// работает, но despawn продолжается.
-    pub fn tick(&mut self, tick: u64, player: Option<&mut Player>) {
+    /// Тик дропа без подбора: despawn по возрасту и полёт брошенных.
+    /// Автоподбор выполняет `World::tick_item_entities` (ему нужны люди).
+    pub fn tick(&mut self, tick: u64) {
         // Возрастные предметы исчезают; порядок Vec сохраняется (детерминизм).
         self.items
             .retain(|entity| entity.spawn_tick + DESPAWN_TICKS > tick);
@@ -199,33 +207,6 @@ impl ItemEntities {
                 entity.fly = None;
             }
         }
-
-        let Some(player) = player else {
-            return;
-        };
-        // Автоподбор: если влезает целиком — забираем сущность, иначе
-        // оставляем остаток (инвентарь полон).
-        let mut leftover_ids = Vec::new();
-        for entity in self.items.iter_mut() {
-            if tick < entity.pickup_after_tick || entity.fly.is_some() {
-                continue;
-            }
-            if player.pos.dist(entity.pos) > PICKUP_RADIUS {
-                continue;
-            }
-            let stack = entity.stack;
-            let leftover = player.inventory.add(stack.kind, stack.count);
-            if leftover == 0 {
-                leftover_ids.push(entity.id);
-            } else if leftover < stack.count {
-                entity.stack.count = leftover;
-                // Пока инвентарь полон, не пинаем предмет каждый тик.
-                entity.pickup_after_tick = tick + PICKUP_DELAY_TICKS;
-            }
-        }
-        if !leftover_ids.is_empty() {
-            self.items.retain(|entity| !leftover_ids.contains(&entity.id));
-        }
     }
 
     /// Сущность по id (для рендера).
@@ -236,5 +217,103 @@ impl ItemEntities {
     fn alloc_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+}
+
+impl World {
+    /// Полный тик дропа: despawn, полёт, автоподбор людьми и поедание
+    /// мяса волками.
+    ///
+    /// Автоподбор: предмет подбирает ближайший человек в радиусе
+    /// `PICKUP_RADIUS` (люди единицы — O(люди) на предмет; за весь тик
+    /// O(дроп × едоки)). Если влезает целиком — забирается сущность, иначе
+    /// остаётся остаток (инвентарь полон).
+    ///
+    /// Волк не подбирает в инвентарь: мясо его вида съедается на месте —
+    /// одна единица за тик в радиусе `WOLF_EAT_RADIUS` (тот же проход,
+    /// без второго скана мира).
+    pub fn tick_item_entities(&mut self, tick: u64) {
+        self.item_entities.tick(tick);
+
+        // Позиции едоков снимаются один раз за тик: люди (подбор в
+        // инвентарь) и голодные волки (поедание мяса с земли).
+        let humans: Vec<(u64, super::world::WorldPos)> = self
+            .entities
+            .iter()
+            .filter(|e| e.mind.is_some())
+            .map(|e| (e.id, e.pos))
+            .collect();
+        let wolves: Vec<(u64, super::world::WorldPos)> = self
+            .entities
+            .iter()
+            .filter(|e| e.kind == super::entities::EntityKind::Wolf && e.hunger.value() < WOLF_EAT_BELOW)
+            .map(|e| (e.id, e.pos))
+            .collect();
+
+        let mut leftover_ids = Vec::new();
+        for entity in self.item_entities.items.iter_mut() {
+            if tick < entity.pickup_after_tick || entity.fly.is_some() {
+                continue;
+            }
+            let stack = entity.stack;
+
+            // Мясо — еда волков: ближайший голодный волк съедает единицу
+            // за тик (глотает на месте, без инвентаря). При равенстве
+            // дистанций — меньший id (детерминизм).
+            if stack.kind.is_wolf_food()
+                && let Some((wolf_id, _)) = wolves
+                    .iter()
+                    .filter(|(_, pos)| pos.dist(entity.pos) <= WOLF_EAT_RADIUS)
+                    .min_by(|a, b| {
+                        a.1.dist(entity.pos)
+                            .total_cmp(&b.1.dist(entity.pos))
+                            .then_with(|| a.0.cmp(&b.0))
+                    })
+            {
+                let Some(wolf) = self.entities.get_mut(*wolf_id) else {
+                    continue;
+                };
+                wolf.hunger.eat(stack.kind.food_value());
+                entity.stack.count -= 1;
+                if entity.stack.count == 0 {
+                    leftover_ids.push(entity.id);
+                }
+                continue;
+            }
+
+            // Ближайший человек в радиусе подбора (при равенстве — меньший id:
+            // выбор стабильный и детерминированный).
+            let Some((picker, _)) = humans
+                .iter()
+                .filter(|(_, pos)| pos.dist(entity.pos) <= PICKUP_RADIUS)
+                .min_by(|a, b| {
+                    a.1.dist(entity.pos)
+                        .total_cmp(&b.1.dist(entity.pos))
+                        .then_with(|| a.0.cmp(&b.0))
+                })
+            else {
+                continue;
+            };
+            let Some(m) = self
+                .entities
+                .get_mut(*picker)
+                .and_then(|e| e.mind.as_mut())
+            else {
+                continue;
+            };
+            let leftover = m.inventory.add(stack.kind, stack.count);
+            if leftover == 0 {
+                leftover_ids.push(entity.id);
+            } else if leftover < stack.count {
+                entity.stack.count = leftover;
+                // Пока инвентарь полон, не пинаем предмет каждый тик.
+                entity.pickup_after_tick = tick + PICKUP_DELAY_TICKS;
+            }
+        }
+        if !leftover_ids.is_empty() {
+            self.item_entities
+                .items
+                .retain(|entity| !leftover_ids.contains(&entity.id));
+        }
     }
 }

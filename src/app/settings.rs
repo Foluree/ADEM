@@ -559,6 +559,10 @@ pub struct Settings {
     /// Сглаживание: Выкл / FXAA / MSAA / SMAA (категория «Графика»).
     #[serde(default)]
     pub antialias: AntiAlias,
+    /// Освещение: ночная тьма и свет костров. Отключение — упрощённый
+    /// режим для слабых машин и отладки (мир всегда полностью светлый).
+    #[serde(default = "default_true")]
+    pub lighting: bool,
 
     /// Ставить ли игру на паузу при потере фокуса или сворачивании.
     #[serde(default = "default_true")]
@@ -580,6 +584,7 @@ impl Default for Settings {
             fps_limit: FpsLimit::default(),
             window_mode: WindowModeSetting::default(),
             antialias: AntiAlias::default(),
+            lighting: true,
             pause_on_focus_loss: true,
             controls: Controls::default(),
         }

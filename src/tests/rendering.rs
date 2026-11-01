@@ -185,3 +185,111 @@ fn editable_reset_keeps_widget_state() {
         .iter()
         .any(|edit| matches!(edit, TextEdit::TextEnd(_))));
 }
+
+/// Тестовая RGBA8-текстура с непрозрачными точками по списку координат.
+fn test_image(width: u32, height: u32, opaque: &[(u32, u32)]) -> bevy::image::Image {
+    let mut data = vec![0_u8; (width * height * 4) as usize];
+    for &(x, y) in opaque {
+        let offset = ((y * width + x) * 4) as usize;
+        data[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    bevy::image::Image::new(
+        bevy::render::render_resource::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        bevy::render::render_resource::TextureDimension::D2,
+        data,
+        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::default(),
+    )
+}
+
+/// Видимые области по альфе считаются в долях текстуры, правая и нижняя
+/// границы — исключающие; пустая (полностью прозрачная) текстура — None.
+#[test]
+fn alpha_bounds_scan_fractions() {
+    use crate::rendering::scan_alpha_bounds;
+
+    let image = test_image(8, 4, &[(2, 1), (5, 2)]);
+    let bounds = scan_alpha_bounds(&image).expect("есть непрозрачные пиксели");
+    assert_eq!(bounds.left, 2.0 / 8.0);
+    assert_eq!(bounds.top, 1.0 / 4.0);
+    assert_eq!(bounds.right, 6.0 / 8.0);
+    assert_eq!(bounds.bottom, 3.0 / 4.0);
+    // «Ноги на землю»: под рисунком одна прозрачная строка из четырёх.
+    assert_eq!(bounds.bottom_offset(), 0.25);
+
+    assert_eq!(scan_alpha_bounds(&test_image(4, 4, &[])), None);
+}
+
+/// Дилатация прямоугольником: непрозрачная точка расширяется на радиус
+/// во все стороны, окно у краёв обрезается, прозрачная маска не растёт.
+#[test]
+fn dilate_mask_expands_by_radius() {
+    use crate::rendering::dilate_mask;
+
+    let mut mask = vec![false; 25];
+    mask[2 * 5 + 2] = true; // точка (2, 2) в сетке 5×5
+    let dilated = dilate_mask(&mask, 5, 5, 1, 1);
+    for y in 1..=3 {
+        for x in 1..=3 {
+            assert!(dilated[y * 5 + x], "точка ({x}, {y}) должна быть закрашена");
+        }
+    }
+    // Углы сетки за пределами радиуса остаются прозрачными.
+    assert!(!dilated[0] && !dilated[4] && !dilated[20] && !dilated[24]);
+
+    // Радиус больше текстуры: закрашено всё, выхода за границы нет.
+    assert!(dilate_mask(&mask, 5, 5, 7, 7).iter().all(|pixel| *pixel));
+    assert!(dilate_mask(&[false; 9], 3, 3, 2, 2)
+        .iter()
+        .all(|pixel| !pixel));
+}
+
+/// Канвас контура больше исходника на двойной радиус с каждой стороны,
+/// непрозрачные пиксели — белые и лежат со сдвигом на радиус.
+#[test]
+fn outline_image_canvas_padding() {
+    use crate::rendering::build_outline_image;
+
+    // 9×5, одна точка (4, 2); радиус 2×1 → канвас 13×7.
+    let source = test_image(9, 5, &[(4, 2)]);
+    let outline = build_outline_image(&source, 2, 1).expect("RGBA8-источник");
+    assert_eq!(outline.width(), 13);
+    assert_eq!(outline.height(), 7);
+
+    let data = outline.data.as_deref().expect("данные канваса");
+    let pixel = |x: u32, y: u32| {
+        let offset = ((y * 13 + x) * 4) as usize;
+        (data[offset], data[offset + 3])
+    };
+    // Точка канваса (4+2, 2+1) = (6, 3); дилатация даёт прямоугольник
+    // x 4..=8, y 2..=4.
+    for y in 2..=4 {
+        for x in 4..=8 {
+            assert_eq!(pixel(x, y), (255, 255), "кольцо ({x}, {y})");
+        }
+    }
+    // Вне кольца и по углам — прозрачный чёрный.
+    assert_eq!(pixel(0, 0), (0, 0));
+    assert_eq!(pixel(3, 2), (0, 0));
+    assert_eq!(pixel(9, 4), (0, 0));
+    assert_eq!(pixel(12, 6), (0, 0));
+}
+
+/// Радиус дилатации компенсирует плотность пикселей текстуры: контур
+/// одной мировой толщины у человека (256 текселей на 16 мировых) и волка
+/// (128 текселей на 32 мировых), минимум — один тексель.
+#[test]
+fn outline_radius_matches_texel_density() {
+    use crate::rendering::{OUTLINE_THICKNESS_PX, outline_radius_texels};
+
+    let human = outline_radius_texels(256, 16.0);
+    let wolf = outline_radius_texels(128, 32.0);
+    assert_eq!(human, (OUTLINE_THICKNESS_PX * 16.0).round() as u32);
+    assert_eq!(wolf, (OUTLINE_THICKNESS_PX * 4.0).round() as u32);
+    assert!(human > wolf, "более плотная текстура — больший радиус");
+    assert_eq!(outline_radius_texels(1, 1000.0), 1, "минимум один тексель");
+}

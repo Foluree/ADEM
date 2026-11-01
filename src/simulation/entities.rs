@@ -15,11 +15,12 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng}; // Bevy 0.20 / rand 0.10: RngExt вместо Rng
 
 use super::chunk::Chunk;
+use super::hunger::{Activity, Hunger};
+use super::items::Inventory;
 use super::movement;
-use super::player::WorldPos;
 use super::tile::TileType;
 use super::time::TICKS_PER_SEC;
-use super::world::{World, split_tile, TilePos};
+use super::world::{World, WorldPos, split_tile, TilePos};
 
 /// Радиус, в котором волк выбирает следующую точку брожения, тайлов.
 /// Точка отсчитывается от текущей позиции, а не от «дома»: так животное
@@ -68,22 +69,42 @@ const LAND_SEARCH_RETRY_TICKS: u64 = 5 * TICKS_PER_SEC as u64;
 /// при равном расстоянии выбирается один и тот же берег (детерминизм).
 const LAND_NEIGHBORS: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
 
-/// Вид существа. Значения стабильны для сохранений.
+/// Урон укуса волка (решение автора: 8 здоровья) — и ответного, и
+/// захваченного под контролем: это один и тот же прикус существа.
+pub const WOLF_BITE_DAMAGE: f32 = 8.0;
+/// Кулдаун укуса волка, тиков (общий для ИИ-куса и контроля).
+pub(crate) const WOLF_BITE_COOLDOWN_TICKS: u64 = TICKS_PER_SEC as u64;
+/// Дальность укуса волка, тайлов.
+pub(crate) const WOLF_BITE_REACH_TILES: f32 = 1.4;
+/// Сколько тиков волк помнит обиду: кусается и убегает, пока не забыто.
+pub const WOLF_PROVOKE_TICKS: u64 = 5 * TICKS_PER_SEC as u64;
+/// Дальность убегания от обидчика, тайлов.
+const WOLF_FLEE_DISTANCE_TILES: f32 = 10.0;
+
+/// Базовая скорость ходьбы человека, тайлов за тик (GAME_DESIGN 4.4:
+/// 0.2 тайла/тик — как у волка; модификаторы рельефа — общие правила мира).
+pub const HUMAN_WALK_SPEED: f32 = 0.2;
+
+/// Максимальный запас здоровья человека.
+pub const HUMAN_MAX_HP: f32 = 100.0;
+
+/// Вид существа. Значения стабильны для сохранений; новые — только в конец.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum EntityKind {
     Wolf,
+    Human,
 }
 
 impl EntityKind {
     /// Все виды существ в стабильном порядке (генерация, UI редактора).
-    pub const ALL: [EntityKind; 1] = [EntityKind::Wolf];
+    pub const ALL: [EntityKind; 2] = [EntityKind::Wolf, EntityKind::Human];
 
-    /// Максимальный запас здоровья вида. HP пока только данные —
-    /// механика урона появится позже.
+    /// Максимальный запас здоровья вида.
     pub fn max_hp(self) -> f32 {
         match self {
             EntityKind::Wolf => 80.0,
+            EntityKind::Human => HUMAN_MAX_HP,
         }
     }
 
@@ -92,15 +113,99 @@ impl EntityKind {
     pub fn walk_speed(self) -> f32 {
         match self {
             EntityKind::Wolf => WOLF_WALK_SPEED,
+            EntityKind::Human => HUMAN_WALK_SPEED,
         }
+    }
+
+    /// Разумен ли вид (есть ли «ум»: инвентарь, голод, автономное поведение).
+    /// Разумные — только люди (GAME_DESIGN 4.4).
+    pub fn is_sentient(self) -> bool {
+        matches!(self, EntityKind::Human)
     }
 
     /// Вид существа по стабильному значению u8 (сохранения).
     pub fn from_discriminant(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Wolf),
+            1 => Some(Self::Human),
             _ => None,
         }
+    }
+}
+
+/// «Ум» разумного существа: то, что делает человека человеком —
+/// инвентарь и кулдауны действий. Живёт в `SimEntity.mind` только у
+/// разумных видов (волк — `None`), поэтому неразумные существа не платят
+/// памятью за механики, которых у них нет. Голод — общая потребность
+/// существа, живёт на `SimEntity` (волк тоже голодает).
+///
+/// По целевому формату (GAME_DESIGN 4.1) игрок — это захваченная сущность:
+/// UI отдаёт команды управляемому существу, а это хранилище даёт ему те же
+/// возможности, что и раньше были у `Player` (ARCHITECTURE 2.7).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct HumanMind {
+    /// Инвентарь разумного существа: 8 предметов + 4 брони + 4 одежды
+    /// + 4 косметики + слот-мусорка UI.
+    pub inventory: Inventory,
+    /// Выбранный слот хотбара (индекс в секции misc), 0..MISC_SLOTS.
+    pub selected_slot: usize,
+    /// Тик, с которого снова можно есть (кулдаун поедания). Transient:
+    /// в сейв не пишется.
+    pub eat_ready_tick: u64,
+    /// Тик, с которого снова доступна атака в ближнем бою (кулдаун оружия).
+    /// Атака без попадания кулдаун не списывает. Transient: в сейв не пишется.
+    pub attack_ready_tick: u64,
+    /// Текущая цель автономного поведения (ИИ выживания). У захваченного
+    /// человека цель не используется — им управляет контроллер. Transient:
+    /// в сейв не пишется (после загрузки человек сам выберет цель заново).
+    pub goal: Option<HumanGoal>,
+    /// Запомненный костёр племени (ИИ ходит и ищет, найдя — помнит).
+    /// Transient: в сейв не пишется.
+    pub known_campfire: Option<TilePos>,
+    /// Запомненный тайл с едой (яблоня с плодами, зрелая культура).
+    /// Transient: в сейв не пишется.
+    pub known_food: Option<TilePos>,
+    /// Тик следующего «обдумывания» ИИ (переоценка цели, скан окрестностей).
+    /// Разрежает дорогие сканы объектов: между обдумываниями ИИ только
+    /// исполняет текущую цель. Transient: в сейв не пишется.
+    pub next_think_tick: u64,
+}
+
+/// Цель автономного поведения человека (ИИ выживания, simulation/ai.rs).
+/// Данные цели — только то, что нужно для проверки её исполнения.
+/// Transient: в сейв не пишется, после загрузки человек выберет цель заново.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum HumanGoal {
+    /// Ночь: дойти до костра племени и стоять рядом до утра.
+    Campfire(TilePos),
+    /// Дойти до тайла с едой (яблоня с плодами или зрелая культура)
+    /// и собрать урожай в инвентарь.
+    Food(TilePos),
+    /// Охота: догнать животное и убить (мясо подберётся с земли).
+    Hunt(u64),
+    /// Сбор ресурсов с куста (палки): дойти и облупить куст.
+    Gather(TilePos),
+}
+
+impl HumanMind {
+    /// Новый ум с пустым инвентарём.
+    pub fn new() -> Self {
+        Self {
+            inventory: Inventory::default(),
+            selected_slot: 0,
+            eat_ready_tick: 0,
+            attack_ready_tick: 0,
+            goal: None,
+            known_campfire: None,
+            known_food: None,
+            next_think_tick: 0,
+        }
+    }
+
+    /// Предмет в выбранном слоте хотбара, если там что-то лежит.
+    pub fn selected_item(&self) -> Option<super::items::ItemKind> {
+        let slot = self.selected_slot.min(super::items::MISC_SLOTS - 1);
+        self.inventory.items[slot].map(|stack| stack.kind)
     }
 }
 
@@ -163,6 +268,10 @@ pub struct SimEntity {
     pub state: EntityState,
     /// Текущее здоровье; максимум задаётся видом.
     pub hp: f32,
+    /// Потребность голода — общая для всех видов (simulation/hunger.rs):
+    /// волк тоже голодает и получает урон от голода. Еда для волка —
+    /// будущая механика; пока его сытость только расходуется.
+    pub hunger: Hunger,
     /// Тиков подряд, проведённых в воде. Сбрасывается на суше; после
     /// `WATER_PANIC_TICKS` волк идёт к ближайшему берегу.
     pub water_ticks: u16,
@@ -177,10 +286,21 @@ pub struct SimEntity {
     /// Тик последней неудачи поиска суши (0 — неудач не было). До
     /// `LAND_SEARCH_RETRY_TICKS` после неё BFS не повторяется.
     pub land_search_failed_at: u64,
+    /// «Ум» разумного существа: инвентарь, кулдауны. `None` —
+    /// у неразумных видов (волк). Разумные — только люди (GAME_DESIGN 4.4).
+    pub mind: Option<HumanMind>,
+    /// Кулдаун ответного укуса волка. Transient: в сейв не пишется.
+    pub next_bite_tick: u64,
+    /// Кто последний раз ударил волка (ответный кусь и убегание).
+    /// Transient: в сейв не пишется.
+    pub provoked_by: Option<u64>,
+    /// Тик, до которого волк помнит обиду. Transient: в сейв не пишется.
+    pub provoked_until_tick: u64,
 }
 
 impl SimEntity {
-    /// Новое существо в состоянии «стоит» с полным здоровьем.
+    /// Новое существо в состоянии «стоит» с полным здоровьем. Разумные
+    /// виды получают пустой ум.
     fn new(id: u64, kind: EntityKind, pos: WorldPos) -> Self {
         Self {
             id,
@@ -190,12 +310,17 @@ impl SimEntity {
             facing: Facing::Right,
             state: EntityState::Standing,
             hp: kind.max_hp(),
+            hunger: Hunger::new(),
             water_ticks: 0,
             state_ticks: 0,
             state_duration: INITIAL_STAND_TICKS,
             target: pos,
             stuck_ticks: 0,
             land_search_failed_at: 0,
+            mind: kind.is_sentient().then(HumanMind::new),
+            next_bite_tick: 0,
+            provoked_by: None,
+            provoked_until_tick: 0,
         }
     }
 
@@ -243,6 +368,16 @@ impl EntityStore {
         self.entities.len() != before
     }
 
+    /// Существо по id.
+    pub fn get(&self, id: u64) -> Option<&SimEntity> {
+        self.entities.iter().find(|entity| entity.id == id)
+    }
+
+    /// Существо по id (мутабельно).
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut SimEntity> {
+        self.entities.iter_mut().find(|entity| entity.id == id)
+    }
+
     /// Переносит существо в точку (перетаскивание колёсиком в редакторе).
     /// `prev_pos` выравнивается с `pos`: иначе рендер плавно догонял бы
     /// старое место и существо «уезжало» от курсора. Состояние сбрасывается
@@ -277,9 +412,30 @@ impl EntityStore {
     /// Обход существ, а не тайлов мира: спящие/стоящие существа почти
     /// ничего не делают, а ходящие обязаны двигаться каждый тик. Решения
     /// принимаются только в момент смены состояния.
-    fn update(&mut self, seed: u64, tick: u64, terrain: &TerrainView<'_>) {
+    ///
+    /// `skip` — захваченное существо контроллера: весь FSM его не ведёт
+    /// (куда идти и когда стоять — решает игрок через `step_direction`,
+    /// который сам ставит `prev_pos` для интерполяции). ИИ людей его
+    /// пропускает по тому же правилу. Голод захваченного тикает на
+    /// app-слое (`actions::tick_hunger`), поэтому здесь он тоже пропущен.
+    ///
+    /// Умершие от голода собираются в `dead` — вызывающая сторона
+    /// (`World::tick_entities`) исполняет смерть с дропом лута.
+    fn update(
+        &mut self,
+        seed: u64,
+        tick: u64,
+        terrain: &TerrainView<'_>,
+        skip: Option<u64>,
+        dead: &mut Vec<u64>,
+    ) {
         let side = terrain.side as f32;
         for entity in &mut self.entities {
+            // Захваченное существо пропускается до всяких мутаций: его
+            // `prev_pos` уже выставил `step_direction` на этом тике.
+            if Some(entity.id) == skip {
+                continue;
+            }
             entity.prev_pos = entity.pos;
 
             // Время в воде копится только подряд: на суше счётчик сброшен.
@@ -287,6 +443,27 @@ impl EntityStore {
                 entity.water_ticks = entity.water_ticks.saturating_add(1);
             } else {
                 entity.water_ticks = 0;
+            }
+
+            // Голод — общая потребность всех видов: расход по активности,
+            // урон при пустой сытости. Смерть от голода исполняет
+            // вызывающая сторона (нужен мир для дропа лута).
+            let activity = if terrain.is_water(entity.pos) {
+                Activity::Swimming
+            } else if entity.state == EntityState::Walking {
+                Activity::Walking
+            } else {
+                Activity::Idle
+            };
+            let damage = entity.hunger.tick(activity);
+            if damage > 0.0 {
+                entity.hp -= damage;
+            }
+            // Сытый организм подлечивается (полное HP — скип внутри).
+            entity.hunger.regen(&mut entity.hp, entity.kind.max_hp());
+            if entity.hp <= 0.0 {
+                dead.push(entity.id);
+                continue;
             }
 
             // В воде нельзя стоять или лежать: сразу идём к ближайшей суше.
@@ -360,21 +537,199 @@ impl World {
     ///
     /// Метод на `World` нужен, чтобы одновременно взять `entities` мутабельно,
     /// а чанки — только для чтения: существа не меняют рельеф.
-    pub fn tick_entities(&mut self, tick: u64) {
-        let World {
-            entities,
-            chunks,
-            chunks_per_side,
-            size,
-            seed,
-            ..
-        } = self;
-        let terrain = TerrainView {
-            chunks,
-            chunks_per_side: *chunks_per_side,
-            side: size.tiles() as i32,
-        };
-        entities.update(*seed, tick, &terrain);
+    /// `player_controlled` — существо, которым управляет контроллер (режим
+    /// игрока; при включённом ИИ захваченного — `None`): FSM-автоматика
+    /// (брожение, лежание) его не ведёт, ИИ тоже — движение и голод
+    /// обеспечивает контроллер.
+    pub fn tick_entities(&mut self, tick: u64, player_controlled: Option<u64>) {
+        let mut dead: Vec<u64> = Vec::new();
+        {
+            let World {
+                entities,
+                chunks,
+                chunks_per_side,
+                size,
+                seed,
+                ..
+            } = self;
+            let terrain = TerrainView {
+                chunks,
+                chunks_per_side: *chunks_per_side,
+                side: size.tiles() as i32,
+            };
+            entities.update(*seed, tick, &terrain, player_controlled, &mut dead);
+        }
+        // Смерти от голода: лут на землю, существо из мира (нужен мир,
+        // поэтому не внутри `update`).
+        for id in dead {
+            super::combat::kill_entity(self, id, tick);
+        }
+        // Ответный кусь и убегание волка — после FSM: провокация
+        // переопределяет цель обычного поведения.
+        self.tick_wolf_provocations(tick);
+        // Голодный волк ищет лёжащее мясо (подъест в радиусе поедания).
+        self.seek_wolf_meat();
+        // Автономное поведение людей — после FSM: ИИ выставляет цели,
+        // движение исполняется общим кодом на следующем тике.
+        self.tick_human_ai(player_controlled, tick);
+    }
+
+    /// Голодный стоящий волк идёт к ближайшему лежащему мясу: дроп-сущности
+    /// перебираются в поиске еды, само поедание — в `tick_item_entities`
+    /// при подходе. O(голодные стоящие волки × дроп мяса) за тик, только
+    /// когда такие волки есть. Идущие волки цель не меняют (не дёргаются).
+    fn seek_wolf_meat(&mut self) {
+        use super::item_entity::{WOLF_MEAT_SEEK_RADIUS, WOLF_SEEK_BELOW};
+
+        let hungry: Vec<u64> = self
+            .entities
+            .iter()
+            .filter(|e| {
+                e.kind == EntityKind::Wolf
+                    && e.state == EntityState::Standing
+                    && e.provoked_by.is_none()
+                    && e.hunger.value() < WOLF_SEEK_BELOW
+            })
+            .map(|e| e.id)
+            .collect();
+        if hungry.is_empty() {
+            return;
+        }
+        let meats: Vec<WorldPos> = self
+            .item_entities
+            .items
+            .iter()
+            .filter(|e| e.stack.kind.is_wolf_food() && e.fly.is_none())
+            .map(|e| e.pos)
+            .collect();
+        if meats.is_empty() {
+            return;
+        }
+        for id in hungry {
+            let Some(pos) = self.entities.get(id).map(|e| e.pos) else {
+                continue;
+            };
+            // Ближайшее мясо в радиусе поиска.
+            let Some(target) = meats
+                .iter()
+                .copied()
+                .filter(|meat| pos.dist(*meat) <= WOLF_MEAT_SEEK_RADIUS)
+                .min_by(|a, b| pos.dist(*a).total_cmp(&pos.dist(*b)))
+            else {
+                continue;
+            };
+            let Some(entity) = self.entities.get_mut(id) else {
+                continue;
+            };
+            entity.state = EntityState::Walking;
+            entity.state_ticks = 0;
+            entity.state_duration = 10 * TICKS_PER_SEC as u64;
+            entity.target = target;
+            entity.stuck_ticks = 0;
+            if (target.x - pos.x).abs() > f32::EPSILON {
+                entity.facing = if target.x > pos.x {
+                    Facing::Right
+                } else {
+                    Facing::Left
+                };
+            }
+        }
+    }
+
+    /// Поведение провоцированного волка: кусает обидчика в досягаемости
+    /// (по кулдауну), иначе убегает на `WOLF_FLEE_DISTANCE_TILES` прочь.
+    /// Вызывается после FSM — цель и состояние провокации сильнее брожения.
+    /// Обидчик мёртв или обида забылась — волк спокоен.
+    fn tick_wolf_provocations(&mut self, tick: u64) {
+        // Снимки позиций до мутаций: заём сущности не должен мешать
+        // менять состояние волка.
+        let positions: Vec<(u64, WorldPos)> = self
+            .entities
+            .iter()
+            .map(|e| (e.id, e.pos))
+            .collect();
+        let provoked: Vec<u64> = self
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Wolf && e.provoked_by.is_some())
+            .map(|e| e.id)
+            .collect();
+        let mut killed: Vec<u64> = Vec::new();
+        for id in provoked {
+            let Some(entity) = self.entities.get_mut(id) else {
+                continue;
+            };
+            if tick >= entity.provoked_until_tick {
+                // Обида забылась.
+                entity.provoked_by = None;
+                continue;
+            }
+            let Some(attacker) = entity.provoked_by else {
+                continue;
+            };
+            let Some(attacker_pos) = positions.iter().find(|(aid, _)| *aid == attacker) else {
+                // Обидчика нет в мире (убит/убран) — обида бесполезна.
+                entity.provoked_by = None;
+                continue;
+            };
+            let (pos, attacker_pos) = (entity.pos, attacker_pos.1);
+            let distance = pos.dist(attacker_pos);
+            if distance <= WOLF_BITE_REACH_TILES {
+                // В досягаемости: стоим лицом к обидчику и кусаем по кулдауну.
+                if (attacker_pos.x - pos.x).abs() > f32::EPSILON {
+                    entity.facing = if attacker_pos.x > pos.x {
+                        Facing::Right
+                    } else {
+                        Facing::Left
+                    };
+                }
+                if entity.state != EntityState::Standing {
+                    entity.state = EntityState::Standing;
+                    entity.state_ticks = 0;
+                    entity.state_duration = u64::MAX;
+                    entity.target = entity.pos;
+                    entity.stuck_ticks = 0;
+                }
+                if tick >= entity.next_bite_tick {
+                    entity.next_bite_tick = tick + WOLF_BITE_COOLDOWN_TICKS;
+                    // Обида продлевается, пока волк дерётся.
+                    entity.provoked_until_tick = tick + WOLF_PROVOKE_TICKS;
+                    let Some(victim) = self.entities.get_mut(attacker) else {
+                        continue;
+                    };
+                    victim.hp = (victim.hp - WOLF_BITE_DAMAGE).max(0.0);
+                    if victim.hp <= 0.0 {
+                        killed.push(attacker);
+                    }
+                }
+            } else {
+                // Убегание: цель — прочь от обидчика на заданное расстояние.
+                let dx = pos.x - attacker_pos.x;
+                let dy = pos.y - attacker_pos.y;
+                let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+                let side = self.size.tiles() as f32;
+                let flee = WorldPos {
+                    x: (pos.x + dx / len * WOLF_FLEE_DISTANCE_TILES).clamp(0.0, side),
+                    y: (pos.y + dy / len * WOLF_FLEE_DISTANCE_TILES).clamp(0.0, side),
+                };
+                entity.state = EntityState::Walking;
+                entity.state_ticks = 0;
+                entity.state_duration = 10 * TICKS_PER_SEC as u64;
+                entity.target = flee;
+                entity.stuck_ticks = 0;
+                if (flee.x - pos.x).abs() > f32::EPSILON {
+                    entity.facing = if flee.x > pos.x {
+                        Facing::Right
+                    } else {
+                        Facing::Left
+                    };
+                }
+            }
+        }
+        // Обидчик, забитый насмерть: лут и удаление — как в бою.
+        for id in killed {
+            super::combat::kill_entity(self, id, tick);
+        }
     }
 }
 
@@ -390,6 +745,14 @@ fn choose_from_standing(
     // На кулдауне поиска суши состояние сохраняем — BFS повторится позже.
     if terrain.is_water(entity.pos) && !land_search_on_cooldown(entity, tick) {
         enter_escape(entity, terrain, tick);
+        return;
+    }
+    // Поведением человека ведает ИИ (simulation/ai.rs): из стояния FSM
+    // ничего не решает. Стояние не сбрасывается: пока `state_ticks`
+    // растёт past длительности, условие брожения ИИ (`state_ticks >=
+    // state_duration`) становится достижимым — раньше вечный сброс
+    // стояния делал брожение недостижимым, и люди стояли на месте.
+    if entity.kind.is_sentient() {
         return;
     }
     if rng.random::<f32>() < LIE_CHANCE {
@@ -475,7 +838,9 @@ fn random_duration(rng: &mut StdRng, secs: (u64, u64)) -> u64 {
     min + rng.random_range(0..=(max - min))
 }
 
-/// Выбирает точку в радиусе брожения, лежащую на проходимом тайле.
+/// Выбирает точку в радиусе брожения, лежащую на проходимом тайле, до
+/// которой по прямой не лежит глубокая вода (лёгкая проверка пути: рёбра
+/// и мелководье не мешают, глубокие озёра и океан отбрасывают цель).
 /// Сначала ищет сушу; вода — только запасной вариант, чтобы волк мог
 /// перейти реку, если вокруг неё всё остальное тоже вода или глубоко.
 /// `None` — подходящей точки не нашли.
@@ -497,10 +862,12 @@ fn pick_target(
         if !terrain.passable(pos) {
             continue;
         }
-        if !terrain.is_water(pos) {
-            return Some(pos);
+        if terrain.line_avoids_deep_water(from, pos) {
+            if !terrain.is_water(pos) {
+                return Some(pos);
+            }
+            water_fallback.get_or_insert(pos);
         }
-        water_fallback.get_or_insert(pos);
     }
     water_fallback
 }
@@ -603,6 +970,28 @@ impl TerrainView<'_> {
     /// Вода ли под позицией (любая глубина).
     fn is_water(&self, pos: WorldPos) -> bool {
         matches!(self.terrain_at(pos), Some(kind) if kind.is_water())
+    }
+
+    /// Лёгкая проверка прямой «от—до»: нет ли на пути глубокой воды
+    /// (DeepWater/Ocean). 8 проб по отрезку; мелководье и реки 1–2 тайла
+    /// не мешают — через них существо переходит вброд. Для BFS-точности
+    /// не претендует, только отсеивает заведомо «пловцовые» цели брожения.
+    fn line_avoids_deep_water(&self, from: WorldPos, to: WorldPos) -> bool {
+        const SAMPLES: usize = 8;
+        for step in 1..=SAMPLES {
+            let t = step as f32 / SAMPLES as f32;
+            let point = WorldPos {
+                x: from.x + (to.x - from.x) * t,
+                y: from.y + (to.y - from.y) * t,
+            };
+            if matches!(
+                self.terrain_at(point),
+                Some(TileType::DeepWater | TileType::Ocean)
+            ) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Суша ли под позицией (вне мира сушей не считается).

@@ -10,10 +10,9 @@
 //! Небольшая высота дуги = «смягчённое» движение вверх/вниз. Всё
 //! детерминировано, без RNG; порядок в `Vec` стабилен для сохранений.
 
-use super::entities::EntityKind;
+use super::entities::{EntityKind, Facing, WOLF_BITE_COOLDOWN_TICKS, WOLF_BITE_DAMAGE, WOLF_BITE_REACH_TILES};
 use super::items::{self, ItemStack, ItemKind};
-use super::player::{Player, WorldPos};
-use super::world::{TilePos, World};
+use super::world::{TilePos, World, WorldPos};
 
 /// Дальность броска копья, тайлов.
 pub const SPEAR_THROW_RANGE_TILES: f32 = 12.0;
@@ -97,6 +96,10 @@ pub struct Projectile {
     pub arc_height: f32,
     /// Урон при попадании.
     pub damage: f32,
+    /// Стрелок (id существа). Снаряд не может попасть в того, кто
+    /// выпустил его: стрела рождается в точке стрелка. 0 — снаряд без
+    /// стрелка (появится с механиками мира).
+    pub shooter: u64,
 }
 
 impl Projectile {
@@ -137,7 +140,7 @@ impl Projectile {
     }
 
     /// Создаёт снаряд от `origin` к `target` с параметрами вида.
-    fn new(id: u64, kind: ProjectileKind, origin: WorldPos, target: WorldPos) -> Self {
+    fn new(id: u64, kind: ProjectileKind, origin: WorldPos, target: WorldPos, shooter: u64) -> Self {
         let distance = target.dist(origin);
         let (speed, arc) = match kind {
             ProjectileKind::Arrow => (
@@ -161,6 +164,7 @@ impl Projectile {
                 ProjectileKind::Arrow => 10.0,
                 ProjectileKind::ThrownSpear => 5.0,
             },
+            shooter,
         }
     }
 }
@@ -179,8 +183,15 @@ pub struct StuckSpear {
 
 impl World {
     /// Создаёт снаряд от `origin` к `target` (точка падения клампится к
-    /// границам мира) и возвращает его id.
-    pub fn spawn_projectile(&mut self, kind: ProjectileKind, origin: WorldPos, target: WorldPos) -> u64 {
+    /// границам мира) и возвращает его id. `shooter` — id существа-стрелка:
+    /// снаряд не может попасть в того, кто выпустил его.
+    pub fn spawn_projectile(
+        &mut self,
+        kind: ProjectileKind,
+        origin: WorldPos,
+        target: WorldPos,
+        shooter: u64,
+    ) -> u64 {
         let side = self.size.tiles() as f32;
         let target = WorldPos {
             x: target.x.clamp(0.0, side),
@@ -191,7 +202,7 @@ impl World {
         }
         let id = self.next_projectile_id;
         self.next_projectile_id += 1;
-        self.projectiles.push(Projectile::new(id, kind, origin, target));
+        self.projectiles.push(Projectile::new(id, kind, origin, target, shooter));
         id
     }
 
@@ -208,7 +219,9 @@ impl World {
             // Существо высотой около тайла: снаряд выше него пролетает мимо.
             if projectile.height() <= 1.0 {
                 for entity in self.entities.iter() {
-                    if entity.pos.dist(pos) <= PROJECTILE_HIT_RADIUS_TILES {
+                    if entity.id != projectile.shooter
+                        && entity.pos.dist(pos) <= PROJECTILE_HIT_RADIUS_TILES
+                    {
                         hits.push((projectile.id, entity.id));
                         break;
                     }
@@ -222,12 +235,13 @@ impl World {
             };
             // Все нужные значения снимаются до мутаций мира (смерть существа,
             // дроп) — заём снаряда не должен пересекаться с &mut self.
-            let (damage, kind, pos, heading, landing_pitch) = (
+            let (damage, kind, pos, heading, landing_pitch, shooter) = (
                 projectile.damage,
                 projectile.kind,
                 projectile.pos(),
                 projectile.heading(),
                 projectile.landing_pitch(),
+                projectile.shooter,
             );
             // Урон и смерть.
             let died = {
@@ -235,6 +249,9 @@ impl World {
                 match entity {
                     Some(entity) => {
                         entity.hp = (entity.hp - damage).max(0.0);
+                        if entity.hp > 0.0 {
+                            provoke_wolf(entity, Some(shooter), tick);
+                        }
                         entity.hp <= 0.0
                     }
                     None => false,
@@ -275,21 +292,26 @@ impl World {
 }
 
 /// Пытается ударить существо в ближнем бою из точки прицела `target`.
+/// Атакующий — существо `actor` (захваченное существо или ИИ человека):
+/// урон и кулдаун берутся из оружия в его руке (пусто — руки).
 ///
 /// Возвращает `true`, если удар состоялся (кулдаун списан). Кулдаун
 /// списывается только при реальном попадании: промах не мешает добыче
-/// и не наказывает игрока за пустой клик. Дальность — от атакующего до
-/// существа; попадание — от точки прицела до центра существа.
-pub fn try_melee_attack(
-    world: &mut World,
-    player: &mut Player,
-    target: TilePos,
-    tick: u64,
-) -> bool {
-    if tick < player.attack_ready_tick {
+/// и не наказывает за пустой клик. Дальность — от атакующего до существа;
+/// попадание — от точки прицела до центра существа. Сам атакующий попадать
+/// не может.
+pub fn try_melee_attack(world: &mut World, actor: u64, target: TilePos, tick: u64) -> bool {
+    let Some(mind) = world.entities.get(actor).and_then(|e| e.mind.as_ref()) else {
+        return false;
+    };
+    if tick < mind.attack_ready_tick {
         return false;
     }
-    let held = player.selected_item();
+    let origin = world.entities.get(actor).map(|e| e.pos);
+    let Some(origin) = origin else {
+        return false;
+    };
+    let held = mind.selected_item();
     let stats = held
         .and_then(ItemKind::weapon_stats)
         .unwrap_or(items::HAND_ATTACK);
@@ -298,7 +320,8 @@ pub fn try_melee_attack(
     let victim = world
         .entities
         .iter()
-        .filter(|entity| entity.pos.dist(player.pos) <= stats.range_tiles)
+        .filter(|entity| entity.id != actor)
+        .filter(|entity| entity.pos.dist(origin) <= stats.range_tiles)
         .filter(|entity| entity.pos.dist(point) <= MELEE_HIT_RADIUS_TILES)
         .min_by(|a, b| {
             a.pos
@@ -310,13 +333,112 @@ pub fn try_melee_attack(
         return false;
     };
 
-    player.attack_ready_tick = tick + stats.cooldown_ticks;
-    apply_damage(world, victim, stats.damage, tick);
+    if let Some(mind) = world
+        .entities
+        .get_mut(actor)
+        .and_then(|e| e.mind.as_mut())
+    {
+        mind.attack_ready_tick = tick + stats.cooldown_ticks;
+    }
+    apply_damage(world, victim, stats.damage, tick, Some(actor));
+    true
+}
+
+/// Удар по конкретному существу (ИИ охоты): то же оружие и кулдаун, что и
+/// `try_melee_attack`, но жертва задана id — ИИ не нужно «целиться» тайлом.
+/// `false` — не хватает дальности или кулдаун ещё не истёк.
+pub fn attack_entity(world: &mut World, actor: u64, victim_id: u64, tick: u64) -> bool {
+    let Some(mind) = world.entities.get(actor).and_then(|e| e.mind.as_ref()) else {
+        return false;
+    };
+    if tick < mind.attack_ready_tick {
+        return false;
+    }
+    let (origin, victim) = match (
+        world.entities.get(actor).map(|e| e.pos),
+        world.entities.get(victim_id).map(|e| e.pos),
+    ) {
+        (Some(origin), Some(victim)) => (origin, victim),
+        _ => return false,
+    };
+    let held = mind.selected_item();
+    let stats = held
+        .and_then(ItemKind::weapon_stats)
+        .unwrap_or(items::HAND_ATTACK);
+    if origin.dist(victim) > stats.range_tiles {
+        return false;
+    }
+    if let Some(mind) = world
+        .entities
+        .get_mut(actor)
+        .and_then(|e| e.mind.as_mut())
+    {
+        mind.attack_ready_tick = tick + stats.cooldown_ticks;
+    }
+    apply_damage(world, victim_id, stats.damage, tick, Some(actor));
+    true
+}
+
+/// Кусь захваченного волка по точке прицела: ближайшее к курсору существо
+/// в радиусе попадания и в досягаемости укуса. Правила те же, что у
+/// `try_melee_attack` (кулдаун списывается только при попадании, сам себя
+/// не кусает), но характеристики — волчьи, а кулдаун живёт на сущности
+/// (`next_bite_tick`) и общий с ответными кусами ИИ: включённый после
+/// укуса «ИИ» не сможет откусить второй раз мгновенно. Единственное
+/// действие ЛКМ под контролем неразумного существа — добывать и ломать
+/// оно не умеет. `false` — мимо, не достал или кулдаун не истёк.
+pub fn wolf_bite(world: &mut World, actor: u64, target: TilePos, tick: u64) -> bool {
+    let Some(wolf) = world.entities.get(actor) else {
+        return false;
+    };
+    if wolf.kind != EntityKind::Wolf || tick < wolf.next_bite_tick {
+        return false;
+    }
+    let origin = wolf.pos;
+    let point = WorldPos::of_tile_center(target);
+
+    let victim = world
+        .entities
+        .iter()
+        .filter(|entity| entity.id != actor)
+        .filter(|entity| entity.pos.dist(origin) <= WOLF_BITE_REACH_TILES)
+        .filter(|entity| entity.pos.dist(point) <= MELEE_HIT_RADIUS_TILES)
+        .min_by(|a, b| {
+            a.pos
+                .dist(point)
+                .total_cmp(&b.pos.dist(point))
+        })
+        .map(|entity| entity.id);
+    let Some(victim) = victim else {
+        return false;
+    };
+
+    if let Some(wolf) = world.entities.get_mut(actor) {
+        wolf.next_bite_tick = tick + WOLF_BITE_COOLDOWN_TICKS;
+        // Морда к жертве — как у ответного укуса ИИ (`tick_wolf_provocations`):
+        // стоящий волк разворачивается, идущий следующий тик повернёт ввод.
+        if (point.x - origin.x).abs() > f32::EPSILON {
+            wolf.facing = if point.x > origin.x {
+                Facing::Right
+            } else {
+                Facing::Left
+            };
+        }
+    }
+    apply_damage(world, victim, WOLF_BITE_DAMAGE, tick, Some(actor));
     true
 }
 
 /// Наносит урон существу; смерть (hp ≤ 0) удаляет его из мира с дропом.
-fn apply_damage(world: &mut World, entity_id: u64, damage: f32, tick: u64) {
+/// Выживший волк запоминает обидчика (`attacker`): ответный кусь и
+/// убегание ведёт `World::tick_wolf_provocations`.
+fn apply_damage(
+    world: &mut World,
+    entity_id: u64,
+    damage: f32,
+    tick: u64,
+    attacker: Option<u64>,
+) {
     let died = {
         let entity = world
             .entities
@@ -326,6 +448,9 @@ fn apply_damage(world: &mut World, entity_id: u64, damage: f32, tick: u64) {
         match entity {
             Some(entity) => {
                 entity.hp = (entity.hp - damage).max(0.0);
+                if entity.hp > 0.0 {
+                    provoke_wolf(entity, attacker, tick);
+                }
                 entity.hp <= 0.0
             }
             None => false,
@@ -337,9 +462,22 @@ fn apply_damage(world: &mut World, entity_id: u64, damage: f32, tick: u64) {
     }
 }
 
-/// Дроп добычи с погибшего существа (item-сущности у места смерти).
-/// Дробится детерминированно от (seed, тик, id существа).
-fn drop_entity_loot(world: &mut World, entity_id: u64, tick: u64) {
+/// Выживший после удара волк запоминает обидчика на `WOLF_PROVOKE_TICKS`
+/// (ответный кусь + убегание). Прочие виды обид не помнят.
+fn provoke_wolf(entity: &mut super::entities::SimEntity, attacker: Option<u64>, tick: u64) {
+    if entity.kind != super::entities::EntityKind::Wolf {
+        return;
+    }
+    if let Some(attacker) = attacker {
+        entity.provoked_by = Some(attacker);
+        entity.provoked_until_tick = tick + super::entities::WOLF_PROVOKE_TICKS;
+    }
+}
+
+/// Дроп с погибшего существа (item-сущности у места смерти). Человек
+/// теряет весь инвентарь: каждый стек — отдельная дроп-сущность.
+/// Животные дробятся детерминированно от (seed, тик, id существа).
+pub(crate) fn drop_entity_loot(world: &mut World, entity_id: u64, tick: u64) {
     let Some(entity) = world.entities.entities.iter().find(|e| e.id == entity_id) else {
         return;
     };
@@ -351,7 +489,17 @@ fn drop_entity_loot(world: &mut World, entity_id: u64, tick: u64) {
     h ^= h >> 32;
     let roll = (h >> 40) as f32 / (1u32 << 24) as f32;
 
+    // Инвентарь человека падает на землю: снимаем стеки до мутаций мира
+    // (существо ещё живо — заём читает данные до дропа).
+    let carried: Vec<ItemStack> = entity
+        .mind
+        .as_ref()
+        .map(|m| m.inventory.items.iter().flatten().copied().collect())
+        .unwrap_or_default();
     let items = &mut world.item_entities;
+    for stack in carried {
+        items.drop_stack(seed, pos, stack, tick);
+    }
     match entity.kind {
         EntityKind::Wolf => {
             // Мясо хищника: 2–3 куска, плюс кость с шансом 30%.
@@ -364,19 +512,46 @@ fn drop_entity_loot(world: &mut World, entity_id: u64, tick: u64) {
                 items.drop_stack(seed, pos, ItemStack { kind: ItemKind::Bone, count: 1 }, tick);
             }
         }
+        EntityKind::Human => {
+            // Всё ценное уже упало инвентарём; тело и падаль — позже
+            // (роадмап «Правила трупов/падали»).
+        }
     }
 }
 
+/// Смерть существа: дроп добычи и удаление из мира. Общая точка для боя,
+/// голода и будущих причин смерти.
+pub(crate) fn kill_entity(world: &mut World, entity_id: u64, tick: u64) {
+    drop_entity_loot(world, entity_id, tick);
+    world.entities.remove(entity_id);
+}
+
 /// Автоподбор воткнутых копьёв: всё, что ближе `SPEAR_PICKUP_RADIUS_TILES`
-/// к игроку и влезает в инвентарь, возвращается как предмет. Вызывается
-/// после шага игрока (раз в тик в режиме игрока).
-pub fn pickup_stuck_spears(world: &mut World, player: &mut Player) -> usize {
+/// к существу и влезает в инвентарь, возвращается как предмет. Вызывается
+/// после шага захваченного существа (раз в тик в режиме захвата).
+pub fn pickup_stuck_spears(world: &mut World, actor: u64) -> usize {
+    let Some(pos) = world.entities.get(actor).map(|e| e.pos) else {
+        return 0;
+    };
+    let fits = world
+        .entities
+        .get(actor)
+        .and_then(|e| e.mind.as_ref())
+        .is_some_and(|m| m.inventory.can_fit(ItemKind::Spear, 1));
+    if !fits {
+        return 0;
+    }
     let mut picked = 0;
     let mut i = 0;
     while i < world.stuck_spears.len() {
-        if world.stuck_spears[i].pos.dist(player.pos) <= SPEAR_PICKUP_RADIUS_TILES 
-                && player.inventory.can_fit(ItemKind::Spear, 1) {
-            player.inventory.add(ItemKind::Spear, 1);
+        if world.stuck_spears[i].pos.dist(pos) <= SPEAR_PICKUP_RADIUS_TILES {
+            if let Some(m) = world
+                .entities
+                .get_mut(actor)
+                .and_then(|e| e.mind.as_mut())
+            {
+                m.inventory.add(ItemKind::Spear, 1);
+            }
             world.stuck_spears.swap_remove(i);
             picked += 1;
         } else {

@@ -19,8 +19,8 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite_render::Material2dPlugin;
 
 use crate::app::camera::WorldCamera;
-use crate::app::input::{PlayerInput, cursor_world_tile};
-use crate::app::state::{GameMode, GameState, PlayerRes, SimTick, TickAccumulator, interpolate_pos, player_render_pos};
+use crate::app::input::cursor_world_tile;
+use crate::app::state::{EditorSelection, GameMode, GameState, SimTick, TickAccumulator, interpolate_pos};
 use crate::simulation::commands::buildable_at;
 use crate::simulation::objects::build_cost;
 use crate::simulation::{BuildingKind, ChunkPos, EntityKind, Facing, ObjectKind, TerrainTiles, TilePos, TileType, World, CHUNK_SIZE, TILE_SIZE, WorldPos};
@@ -30,11 +30,12 @@ use crate::ui::construction::ConstructionUi;
 pub(crate) mod isometric;
 
 mod combat;
+mod lenses;
 mod lighting;
 mod textures;
 
 use isometric::{WORLD_TILE_SIZE, tile_elevation, world_position};
-use textures::TileTextures;
+pub(crate) use textures::TileTextures;
 
 /// Сторона terrain-блока в тайлах. 64 делит все поддерживаемые размеры мира.
 const BLOCK_TILES: i32 = 64;
@@ -87,7 +88,9 @@ impl Plugin for RenderingPlugin {
             .init_resource::<EntitySprites>()
             .init_resource::<ItemEntitySprites>()
             .init_resource::<WorldSpriteAssets>()
+            .init_resource::<EntitySpriteVisuals>()
             .init_resource::<HurtFlashes>()
+            .init_resource::<SelectionOutlines>()
             .init_resource::<lighting::CampfireLights>()
             .init_resource::<lighting::DarknessOverlay>()
             .add_systems(
@@ -112,7 +115,15 @@ impl Plugin for RenderingPlugin {
             )
             .add_systems(
                 Update,
-                (update_player_sprite, update_item_entity_sprites, update_entity_sprites)
+                (
+                    // Кэш видимых областей — до спрайтов и контуров: из него
+                    // берутся «ноги на землю» и радиус дилатации.
+                    update_entity_sprite_visuals,
+                    update_item_entity_sprites,
+                    update_entity_sprites,
+                    // Контур поверх спрайтов: рисуется по их же трансформам.
+                    update_selection_outlines.after(update_entity_sprites),
+                )
                     .after(SimTick)
                     .after(crate::app::camera::update_camera_transforms),
             )
@@ -126,7 +137,9 @@ impl Plugin for RenderingPlugin {
             )
             .add_systems(Update, update_build_hologram.after(crate::app::camera::update_camera_transforms))
             // Боевые визуализации: след взмаха, снаряды, воткнутые копья.
-            .add_plugins(combat::CombatFxPlugin);
+            .add_plugins(combat::CombatFxPlugin)
+            // Линзы карты (редактор): подсветка чанков по флагам.
+            .add_plugins(lenses::LensPlugin);
     }
 }
 
@@ -189,11 +202,7 @@ pub(crate) struct RenderMetrics {
 #[derive(Component)]
 struct TerrainBlock;
 
-/// Метка спрайта игрока.
-#[derive(Component)]
-struct PlayerSprite;
-
-/// Метка динамического спрайта существа (животного).
+/// Метка динамического спрайта существа (животного, человека).
 #[derive(Component)]
 struct EntitySprite;
 
@@ -230,7 +239,22 @@ struct ItemEntitySprites {
 struct WorldSpriteAssets {
     quad: Option<Handle<Mesh>>,
     materials: HashMap<(AssetId<Image>, bool), Handle<StandardMaterial>>,
+    /// Кэш контуров выделения: материал + пад-факторы квада по исходной
+    /// текстуре (одна запись вместо двух согласованных кэшей).
+    outlines: HashMap<AssetId<Image>, OutlineAsset>,
+    /// Кэш материалов голограммы: (текстура, зелёная/красная сторона).
+    hologram_materials: HashMap<(AssetId<Image>, bool), Handle<StandardMaterial>>,
     object_sizes: HashMap<AssetId<Image>, Vec2>,
+}
+
+/// Контур выделения для одной текстуры: материал белого дилатированного
+/// силуэта и пад-факторы квада — во сколько раз канвас контура шире/выше
+/// исходной текстуры. Внутренняя область канваса при таком масштабе ложится
+/// на спрайт один в один, кольцо выходит ровно на радиус дилатации.
+#[derive(Clone)]
+struct OutlineAsset {
+    material: Handle<StandardMaterial>,
+    pad: Vec2,
 }
 
 /// Сколько секунд после удара существо подсвечивается красным.
@@ -247,18 +271,133 @@ struct HurtFlashes {
     overlays: HashMap<u64, Entity>,
 }
 
+/// Контур выделения существа в редакторе (белая рамка): соответствие
+/// «id существа → Bevy-сущность квадрата-контура». Контуры живут, пока
+/// сущность подсвечена (`EditorSelection`) и видна.
+#[derive(Resource, Default)]
+struct SelectionOutlines {
+    map: HashMap<u64, Entity>,
+    /// Текстура, из которой собран материал контура. Смена состояния/кадра
+    /// анимации меняет текстуру спрайта — без трекинга силуэт оставался бы
+    /// от прежнего состояния и рассинхронизировался с целью.
+    textures: HashMap<u64, bevy::asset::AssetId<Image>>,
+}
+
+/// Толщина белого контура выделения в мировых пикселях (с каждой стороны).
+/// Одна для всех существ: кольцо одинаково выглядит на одном зуме независимо
+/// от плотности пикселей текстуры.
+pub(crate) const OUTLINE_THICKNESS_PX: f32 = 0.33;
+
 /// Размер спрайта волка в пикселях мира. Текстура 128×128, но рисунок
 /// занимает её центр (тело — около 1/3 кадра), поэтому два тайла дают
 /// зверя длиной примерно в тайл, сопоставимо с игроком.
 pub(crate) const WOLF_SPRITE_PX: f32 = TILE_SIZE * 2.0;
-pub(crate) const WOLF_VISIBLE_BOTTOM: f32 = 80.0 / 128.0;
-pub(crate) const WOLF_VISIBLE_TOP: f32 = 45.0 / 128.0;
-pub(crate) const WOLF_VISIBLE_LEFT: f32 = 40.0 / 128.0;
-pub(crate) const WOLF_VISIBLE_RIGHT: f32 = 92.0 / 128.0;
 
-/// Размер спрайта игрока в пикселях мира (текстура 64×64 масштабируется
+/// Размер спрайта игрока в пикселях мира (текстура 256×256 масштабируется
 /// до тайла; объекты масштабируются отдельно — см. `object_sprite_size`).
 const PLAYER_SPRITE_PX: f32 = TILE_SIZE;
+
+/// Непрозрачная область рисунка в текстуре, в долях ширины/высоты
+/// (правая и нижняя границы — исключающие). Считается по альфа-каналу
+/// один раз на текстуру; из неё выводятся «ноги на землю», зона пикинга
+/// курсором и радиус дилатации контура выделения — ручные константы
+/// протухали при каждой перерисовке спрайтов.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SpriteAlphaBounds {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl SpriteAlphaBounds {
+    /// Сдвиг спрайта вниз, в долях высоты, чтобы нижние пиксели рисунка
+    /// стояли на земле: доля прозрачной полосы под рисунком.
+    pub fn bottom_offset(self) -> f32 {
+        1.0 - self.bottom
+    }
+}
+
+/// Кэш видимых областей спрайтов существ по альфа-каналу их текстур.
+/// Заполняется по мере загрузки ассетов (`update_entity_sprite_visuals`);
+/// рендер и пикинг обязаны видеть один и тот же рисунок, поэтому источник
+/// один — фактические пиксели текстуры.
+#[derive(Resource, Default)]
+pub(crate) struct EntitySpriteVisuals {
+    map: HashMap<AssetId<Image>, Option<SpriteAlphaBounds>>,
+    /// Все текстуры существ отсканированы — дальше система бесплатна.
+    warm: bool,
+}
+
+impl EntitySpriteVisuals {
+    /// Границы рисунка текстуры. `None` — текстура ещё не отсканирована
+    /// или непрозрачных пикселей в ней нет.
+    pub(crate) fn bounds(&self, texture: AssetId<Image>) -> Option<SpriteAlphaBounds> {
+        self.map.get(&texture).copied().flatten()
+    }
+
+    /// Сдвиг «ног на землю» для текстуры; 0.0, пока границы неизвестны.
+    pub(crate) fn bottom_offset(&self, texture: AssetId<Image>) -> f32 {
+        self.bounds(texture).map_or(0.0, SpriteAlphaBounds::bottom_offset)
+    }
+}
+
+/// Непрозрачные границы рисунка по альфа-каналу (порог 128 — тот же, что
+/// у контура выделения). `None` — формат не RGBA8 или рисунка нет.
+pub(crate) fn scan_alpha_bounds(image: &Image) -> Option<SpriteAlphaBounds> {
+    if image.texture_descriptor.format != TextureFormat::Rgba8UnormSrgb {
+        return None;
+    }
+    let pixels = image.data.as_deref()?;
+    let width = image.width();
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0, 0);
+    for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+        if pixel[3] < 128 {
+            continue;
+        }
+        let x = index as u32 % width;
+        let y = index as u32 / width;
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    (max_x >= min_x).then(|| SpriteAlphaBounds {
+        left: min_x as f32 / width as f32,
+        top: min_y as f32 / image.height() as f32,
+        right: (max_x + 1) as f32 / width as f32,
+        bottom: (max_y + 1) as f32 / image.height() as f32,
+    })
+}
+
+/// Скан видимых областей текстур существ: кэш наполняется по мере загрузки
+/// ассетов, после полного прогрева система сводится к раннему выходу.
+/// Хэндлы текстур известны на старте, ассеты грузятся асинхронно — недостающие
+/// досканиваются на следующих кадрах.
+fn update_entity_sprite_visuals(
+    textures: Res<TileTextures>,
+    images: Res<Assets<Image>>,
+    mut visuals: ResMut<EntitySpriteVisuals>,
+) {
+    if visuals.warm {
+        return;
+    }
+    let mut scanned = 0;
+    let mut total = 0;
+    for handle in textures.entity_textures() {
+        total += 1;
+        let id = handle.id();
+        if visuals.map.contains_key(&id) {
+            scanned += 1;
+            continue;
+        }
+        if let Some(image) = images.get(handle) {
+            visuals.map.insert(id, scan_alpha_bounds(image));
+            scanned += 1;
+        }
+    }
+    visuals.warm = scanned == total;
+}
 
 /// Кегль счётчика лежащих предметов и его масштаб. Растр крупный
 /// (40 px × 0.1): при мелком кегле глифы состоят из нескольких пикселей
@@ -281,6 +420,157 @@ fn world_sprite_quad(
         .quad
         .get_or_insert_with(|| meshes.add(Rectangle::new(1.0, 1.0)))
         .clone()
+}
+
+/// Материал контура выделения для текстуры: белый силуэт, дилатированный
+/// на радиус, соответствующий `OUTLINE_THICKNESS_PX` при данном размере
+/// спрайта. `None` — текстура ещё не загружена (контур появится на кадре
+/// после загрузки; система вызывается на каждый кадр выделения).
+fn world_outline_asset(
+    images: &mut Assets<Image>,
+    texture: &Handle<Image>,
+    sprite_size: Vec2,
+    sprite_assets: &mut WorldSpriteAssets,
+    materials: &mut Assets<StandardMaterial>,
+) -> Option<OutlineAsset> {
+    if let Some(asset) = sprite_assets.outlines.get(&texture.id()) {
+        return Some(asset.clone());
+    }
+    // Размеры и канвас извлекаются до вставки новой текстуры: мутация
+    // `Assets<Image>` несовместима с живым заёмом источника.
+    let (width, height, radius_x, radius_y, image) = {
+        let source = images.get(texture)?;
+        let radius_x = outline_radius_texels(source.width(), sprite_size.x);
+        let radius_y = outline_radius_texels(source.height(), sprite_size.y);
+        let image = build_outline_image(source, radius_x, radius_y)?;
+        (source.width(), source.height(), radius_x, radius_y, image)
+    };
+    let asset = OutlineAsset {
+        material: materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            base_color_texture: Some(images.add(image)),
+            alpha_mode: AlphaMode::Mask(0.5),
+            cull_mode: None,
+            unlit: true,
+            ..default()
+        }),
+        pad: Vec2::new(
+            (width + 2 * radius_x) as f32 / width as f32,
+            (height + 2 * radius_y) as f32 / height as f32,
+        ),
+    };
+    sprite_assets.outlines.insert(texture.id(), asset.clone());
+    Some(asset)
+}
+
+/// Радиус дилатации в текселях, дающий `OUTLINE_THICKNESS_PX` мировых
+/// пикселей. Плотность пикселей у текстур разная (человек — 256 текселей
+/// на 16 мировых, волк — 128 на 32), радиус её компенсирует.
+pub(crate) fn outline_radius_texels(texture_px: u32, sprite_world_px: f32) -> u32 {
+    (OUTLINE_THICKNESS_PX * texture_px as f32 / sprite_world_px)
+        .round()
+        .max(1.0) as u32
+}
+
+/// Белый силуэт рисунка, дилатированный на заданный радиус: канвас на
+/// 2·radius шире и выше исходника, непрозрачные пиксели — белые. Контур
+/// рисуется этим канвасом с трансформом спрайта (масштаб — на канвасные
+/// доли, см. `OutlineAsset::pad`), поэтому кольцо везде одной толщины
+/// и не зависит от того, где в текстуре лежит рисунок. `None` — формат
+/// не RGBA8 или рисунка нет (строить контур не из чего).
+pub(crate) fn build_outline_image(source: &Image, radius_x: u32, radius_y: u32) -> Option<Image> {
+    if source.texture_descriptor.format != TextureFormat::Rgba8UnormSrgb {
+        return None;
+    }
+    let pixels = source.data.as_deref()?;
+    let width = source.width();
+    let height = source.height();
+    let mut mask = Vec::with_capacity((width * height) as usize);
+    for pixel in pixels.as_chunks::<4>().0 {
+        mask.push(pixel[3] >= 128);
+    }
+    let dilated = dilate_mask(&mask, width, height, radius_x, radius_y);
+
+    let canvas_width = width + 2 * radius_x;
+    let canvas_height = height + 2 * radius_y;
+    let mut data = vec![0_u8; (canvas_width * canvas_height * 4) as usize];
+    for (index, &set) in dilated.iter().enumerate() {
+        if !set {
+            continue;
+        }
+        let x = index as u32 % width;
+        let y = index as u32 / width;
+        let offset = ((y + radius_y) * canvas_width + x + radius_x) as usize * 4;
+        data[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    let mut outline = Image::new(
+        Extent3d {
+            width: canvas_width,
+            height: canvas_height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    // Рисунок пиксель-арта: жёсткие края кольца без размытия.
+    outline.sampler = ImageSampler::nearest();
+    Some(outline)
+}
+
+/// Дилатация бинарной маски прямоугольником (2·radius+1)², сепарабельно:
+/// горизонтальный и вертикальный проходы со скользящим окном пересчёта
+/// счётчика — O(W·H) независимо от радиуса. Углы кольца прямые; для
+/// контура в несколько мировых пикселей это неотличимо от круга.
+pub(crate) fn dilate_mask(mask: &[bool], width: u32, height: u32, radius_x: u32, radius_y: u32) -> Vec<bool> {
+    let width = width as usize;
+    let height = height as usize;
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let rx = radius_x as usize;
+    let ry = radius_y as usize;
+
+    // Горизонтальный проход: окно [x - rx, x + rx] по строке, счётчик
+    // непрозрачных пикселей в нём обновляется инкрементально.
+    let mut horizontal = vec![false; mask.len()];
+    for y in 0..height {
+        let row = y * width;
+        let mut count = mask[row..row + rx.min(width - 1) + 1]
+            .iter()
+            .filter(|pixel| **pixel)
+            .count();
+        for x in 0..width {
+            horizontal[row + x] = count > 0;
+            if x >= rx && mask[row + x - rx] {
+                count -= 1;
+            }
+            let added = x + rx + 1;
+            if added < width && mask[row + added] {
+                count += 1;
+            }
+        }
+    }
+
+    // Вертикальный проход: то же окно по столбцу результата.
+    let mut dilated = vec![false; mask.len()];
+    for x in 0..width {
+        let mut count = (0..=ry.min(height - 1))
+            .filter(|offset| horizontal[offset * width + x])
+            .count();
+        for y in 0..height {
+            dilated[y * width + x] = count > 0;
+            if y >= ry && horizontal[(y - ry) * width + x] {
+                count -= 1;
+            }
+            let added = y + ry + 1;
+            if added < height && horizontal[added * width + x] {
+                count += 1;
+            }
+        }
+    }
+    dilated
 }
 
 fn world_sprite_material(
@@ -828,71 +1118,9 @@ fn refresh_block_decor(
     );
 }
 
-/// Обновляет спрайт игрока: существует и следует за сущностью в режиме
-/// игрока, удаляется в наблюдателе (игрок «припаркован»). Позиция
-/// интерполируется между тиками, иначе движение выглядит рывками.
-/// Спрайт зеркалит текстуру по горизонтали при движении влево; при
-/// отсутствии горизонтального ввода сохраняет последнее направление.
-fn update_player_sprite(
-    mut commands: Commands,
-    state: Res<GameState>,
-    player: Res<PlayerRes>,
-    acc: Res<TickAccumulator>,
-    input: Res<PlayerInput>,
-    textures: Res<TileTextures>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut sprite_assets: ResMut<WorldSpriteAssets>,
-    camera: Query<&Transform, (With<Camera2d>, Without<PlayerSprite>)>,
-    mut last_flip: Local<bool>,
-    mut existing: Query<(Entity, &mut Transform), With<PlayerSprite>>,
-) {
-    let screen_horizontal = input.dir.0 - input.dir.1;
-    if screen_horizontal < 0.0 {
-        *last_flip = true;
-    } else if screen_horizontal > 0.0 {
-        *last_flip = false;
-    }
-
-    let Some(world) = state.world.as_ref() else {
-        for (entity, _) in &mut existing {
-            commands.entity(entity).despawn();
-        }
-        return;
-    };
-    let Some(p) = player.0.as_ref().filter(|_| state.mode == GameMode::Player) else {
-        for (entity, _) in &mut existing {
-            commands.entity(entity).despawn();
-        }
-        return;
-    };
-    let Ok(camera_transform) = camera.single() else {
-        return;
-    };
-    let transform = player_transform(
-        &player_render_pos(p, &acc),
-        world,
-        camera_transform.rotation,
-        *last_flip,
-    );
-    let texture = textures.player_texture();
-    let material = world_sprite_material(texture, false, &mut sprite_assets, &mut materials);
-    let quad = world_sprite_quad(&mut meshes, &mut sprite_assets);
-    let mut updated = false;
-    for (_, mut tf) in &mut existing {
-        *tf = transform;
-        updated = true;
-    }
-    if !updated {
-        commands.spawn((
-            Mesh3d(quad),
-            MeshMaterial3d(material),
-            transform,
-            PlayerSprite,
-        ));
-    }
-}
-
+/// Спрайт игрока больше не нужен отдельной сущностью: по целевому формату
+/// игрок — это захваченное существо мира и рисуется общим кодом спрайтов
+/// существ (`update_entity_sprites`), текстура — прежняя `player.png`.
 /// Синхронизирует спрайты item-сущностей дропа с `world.item_entities`:
 /// новый дроп — спрайт, подбор/исчезновение — снятие спрайта. Позиция
 /// статична (дроп не двигается),Billboard повёрнут к камере при спавне.
@@ -969,6 +1197,7 @@ fn update_entity_sprites(
     acc: Res<TickAccumulator>,
     time: Res<Time>,
     textures: Res<TileTextures>,
+    visuals: Res<EntitySpriteVisuals>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut sprite_assets: ResMut<WorldSpriteAssets>,
@@ -1036,6 +1265,7 @@ fn update_entity_sprites(
             world,
             camera_transform.rotation,
             entity_sprite_size(entity.kind),
+            visuals.bottom_offset(texture.id()),
             entity.facing == Facing::Left,
         );
 
@@ -1111,52 +1341,167 @@ fn update_entity_sprites(
     }
 }
 
+/// Белый контур выделения существа в редакторе: подсветка под курсором
+/// (`EditorSelection::hovered`) и открытое окно-инспектор (`selected`).
+/// Контур — дилатированный белый силуэт текстуры (`world_outline_asset`),
+/// нарисованный на канвасе с паддингом тем же трансформом, что у спрайта:
+/// кольцо везде одной мировой толщины и не смещается при рисунке,
+/// нецентрованном в текстуре. Рисуется только в наблюдателе; существо
+/// ушло — контур снят.
+fn update_selection_outlines(
+    mut commands: Commands,
+    state: Res<GameState>,
+    selection: Res<EditorSelection>,
+    acc: Res<TickAccumulator>,
+    textures: Res<TileTextures>,
+    visuals: Res<EntitySpriteVisuals>,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut sprite_assets: ResMut<WorldSpriteAssets>,
+    mut outlines: ResMut<SelectionOutlines>,
+    camera: Query<(&Camera, &Transform), With<Camera2d>>,
+) {
+    let Some(world) = state.world.as_ref() else {
+        for (_, entity) in outlines.map.drain() {
+            commands.entity(entity).despawn();
+        }
+        outlines.textures.clear();
+        return;
+    };
+    // Список существ с контуром: hovered и selected (без дубликатов),
+    // только живые и только в режиме редактора.
+    let mut want: Vec<u64> = Vec::new();
+    if state.mode == GameMode::Observer {
+        for id in [selection.hovered, selection.selected].into_iter().flatten() {
+            if world.entities.get(id).is_some() && !want.contains(&id) {
+                want.push(id);
+            }
+        }
+    }
+    let stale: Vec<u64> = outlines
+        .map
+        .keys()
+        .copied()
+        .filter(|id| !want.contains(id))
+        .collect();
+    for id in stale {
+        if let Some(entity) = outlines.map.remove(&id) {
+            commands.entity(entity).despawn();
+        }
+        outlines.textures.remove(&id);
+    }
+    if want.is_empty() {
+        return;
+    }
+    let Ok((_, camera_transform)) = camera.single() else {
+        return;
+    };
+    let quad = world_sprite_quad(&mut meshes, &mut sprite_assets);
+    // Контур рисуется чуть глубже сцены: он за спрайтом существа, но
+    // перед рельефом.
+    let back = camera_transform.rotation * -Vec3::Z * 0.05;
+    for id in want {
+        let Some(entity) = world.entities.get(id) else {
+            continue;
+        };
+        let pos = interpolate_pos(entity.prev_pos, entity.pos, &acc);
+        let texture = textures.entity_texture(entity);
+        // Трансформ ровно тот же, что у спрайта; масштаб домножается на
+        // пад-факторы канваса контура (перевод текселей канваса в тексели
+        // исходника), поэтому внутренняя область ложится на спрайт 1:1,
+        // а кольцо везде ровно OUTLINE_THICKNESS_PX.
+        let size = entity_sprite_size(entity.kind);
+        let mut transform = entity_transform(
+            &pos,
+            world,
+            camera_transform.rotation,
+            size,
+            visuals.bottom_offset(texture.id()),
+            entity.facing == Facing::Left,
+        );
+        transform.translation += back;
+        match outlines.map.get(&id).copied() {
+            Some(bevy_entity) => {
+                // Материал меняется вместе с текстурой (состояние/кадр
+                // анимации): волк лёг — силуэт обязан смениться на лежачего,
+                // иначе контур останется от прежнего состояния.
+                if outlines.textures.get(&id) != Some(&texture.id()) {
+                    let Some(asset) = world_outline_asset(
+                        &mut images,
+                        texture,
+                        size,
+                        &mut sprite_assets,
+                        &mut materials,
+                    ) else {
+                        continue;
+                    };
+                    transform.scale.x *= asset.pad.x;
+                    transform.scale.y *= asset.pad.y;
+                    commands
+                        .entity(bevy_entity)
+                        .insert((MeshMaterial3d(asset.material), transform));
+                    outlines.textures.insert(id, texture.id());
+                } else {
+                    if let Some(asset) = sprite_assets.outlines.get(&texture.id()) {
+                        transform.scale.x *= asset.pad.x;
+                        transform.scale.y *= asset.pad.y;
+                    }
+                    commands.entity(bevy_entity).insert(transform);
+                }
+            }
+            None => {
+                // Текстура не загружена — силуэт построить не из чего:
+                // контур появится на следующем кадре выделения.
+                let Some(asset) = world_outline_asset(
+                    &mut images,
+                    texture,
+                    size,
+                    &mut sprite_assets,
+                    &mut materials,
+                ) else {
+                    continue;
+                };
+                transform.scale.x *= asset.pad.x;
+                transform.scale.y *= asset.pad.y;
+                let bevy_entity = commands
+                    .spawn((Mesh3d(quad.clone()), MeshMaterial3d(asset.material), transform))
+                    .id();
+                outlines.map.insert(id, bevy_entity);
+                outlines.textures.insert(id, texture.id());
+            }
+        }
+    }
+}
+
 /// Спрайт существа развёрнут к камере и стоит на поверхности тайла.
+/// `bottom_offset` опускает квадрат, если у текстуры снизу прозрачная
+/// полоса (видимые пиксели должны касаться земли).
 fn entity_transform(
     pos: &WorldPos,
     world: &World,
     camera_rotation: Quat,
     size: Vec2,
+    bottom_offset: f32,
     flip_x: bool,
 ) -> Transform {
     let location = world_position(world, Vec2::new(pos.x, pos.y));
     let camera_up = camera_rotation * Vec3::Y;
-    //let visible_bottom = 200.0 / 256.0;
     let mut transform =
-        Transform::from_translation(location + camera_up * (size.y * 0.5))
+        Transform::from_translation(location + camera_up * (size.y * (0.5 - bottom_offset)))
             .with_rotation(camera_rotation);
     transform.scale = Vec3::new(if flip_x { -size.x } else { size.x }, size.y, 1.0);
     transform
 }
 
-/// Размер спрайта животного в пикселях мира.
-fn entity_sprite_size(kind: EntityKind) -> Vec2 {
+/// Размер спрайта существа в пикселях мира.
+pub(crate) fn entity_sprite_size(kind: EntityKind) -> Vec2 {
     match kind {
         EntityKind::Wolf => Vec2::splat(WOLF_SPRITE_PX),
+        // Человек временно рисуется текстурой игрока (решение автора):
+        // квадрат в один тайл, как раньше был спрайт игрока.
+        EntityKind::Human => Vec2::splat(PLAYER_SPRITE_PX),
     }
-}
-
-/// Позиция спрайта игрока (в тайлах, уже интерполированная). Z повторяет
-/// формулу объектов — сортировка «за/перед» по Y (2.5D, GAME_DESIGN 3.2).
-fn player_transform(
-    p: &WorldPos,
-    world: &World,
-    camera_rotation: Quat,
-    flip_x: bool,
-) -> Transform {
-    let location = world_position(world, Vec2::new(p.x, p.y));
-    let camera_up = camera_rotation * Vec3::Y;
-    let visible_bottom = 234.0 / 256.0;
-    let mut transform = Transform::from_translation(
-        location + camera_up * (PLAYER_SPRITE_PX * (visible_bottom - 0.5)),
-    )
-    .with_rotation(camera_rotation);
-    transform.scale = Vec3::new(
-        if flip_x { -PLAYER_SPRITE_PX } else { PLAYER_SPRITE_PX },
-        PLAYER_SPRITE_PX,
-        1.0,
-    );
-    transform
 }
 
 /// Деспавнит сущность блока и освобождает его меш.
@@ -1825,21 +2170,21 @@ fn spawn_station_block(
     ));
 }
 
-/// Крест костра: два вертикальных квада вдоль осей X и Y через центр тайла
-/// (из середин противоположных сторон), двойная сторона и маска-альфа
+/// Крест из двух вертикальных квадов вдоль осей X и Y через центр точки
+/// (из середин противоположных сторон): двойная сторона и маска-альфа
 /// материалов спрайтов дают правильный вид с фиксированной камеры.
-fn spawn_campfire_cross(
+/// Общая основа костра и культур.
+fn spawn_cross(
     parent: &mut ChildSpawnerCommands,
     quad: &Handle<Mesh>,
     sprite_assets: &mut WorldSpriteAssets,
     materials: &mut Assets<StandardMaterial>,
-    textures: &TileTextures,
+    texture: &Handle<Image>,
     anchor: Vec3,
+    edge: f32,
+    height: f32,
 ) {
-    let texture = textures.campfire_cross();
     let material = world_sprite_material(texture, false, sprite_assets, materials);
-    let edge = WORLD_TILE_SIZE;
-    let height = TILE_SIZE * 0.6;
     let center = anchor + Vec3::Z * height * 0.5;
     // Квад 1: стена вдоль оси X (нормаль −Y, ширина по X, высота по Z).
     parent.spawn((
@@ -1859,6 +2204,22 @@ fn spawn_campfire_cross(
             )
             .with_scale(Vec3::new(edge, height, 1.0)),
     ));
+}
+
+/// Крест костра в тайле.
+fn spawn_campfire_cross(
+    parent: &mut ChildSpawnerCommands,
+    quad: &Handle<Mesh>,
+    sprite_assets: &mut WorldSpriteAssets,
+    materials: &mut Assets<StandardMaterial>,
+    textures: &TileTextures,
+    anchor: Vec3,
+) {
+    spawn_cross(
+        parent, quad, sprite_assets, materials,
+        textures.campfire_cross(), anchor,
+        WORLD_TILE_SIZE, TILE_SIZE * 0.6,
+    );
 }
 
 /// Плоский декаль на поверхность тайла (культуры, склад): горизонтальный
@@ -1921,7 +2282,10 @@ fn object_sprite_size_cached(
     }
 }
 
-/// Спавнит культуры блока как плоские декалями на поверхности пашни.
+/// Высота креста культуры, мировых единиц (как у костра — часть тайла).
+const CROP_HEIGHT: f32 = TILE_SIZE * 0.55;
+
+/// Спавнит культуры блока крестами из двух вертикальных квадов (как костёр).
 /// Идёт по разреженному слою культур четырёх чанков блока.
 fn spawn_crops(
     parent: &mut EntityCommands,
@@ -1956,10 +2320,11 @@ fn spawn_crops(
                     let tile_world = world_position(
                         world, Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),
                     );
-                    spawn_flat_decal(
+                    spawn_cross(
                         parent, &quad, sprite_assets, materials,
                         textures.crop_texture(crop.kind, crop.stage),
-                        tile_world - origin, 1.0,
+                        tile_world - origin,
+                        WORLD_TILE_SIZE, CROP_HEIGHT,
                     );
                 }
             }
@@ -2052,13 +2417,15 @@ fn spawn_items(
 #[derive(Component)]
 struct BuildHologram;
 
-/// Голограмма постройки из меню строительства: полупрозрачный спрайт
-/// выбранного вида на тайле под курсором (привязка к сетке тайлов).
-/// Зелёная — поставить можно (тайл свободен, не вода, в радиусе
-/// взаимодействия и хватает предметов), красная — нельзя.
+/// Голограмма постройки из меню строительства: та же геометрия, что у
+/// реальной постройки (крест костра, изометрический блок станции, декаль
+/// склада — см. `spawn_objects`), но из полупрозрачных квадов. Зелёная —
+/// поставить можно (тайл свободен, не вода, в радиусе взаимодействия и
+/// хватает предметов), красная — нельзя.
 ///
 /// Пересчёт только при изменении ввода (курсор, камера): выбор тайла —
-/// луч по рельефу, а он одинаков, пока ничего не двигалось. Финальную
+/// луч по рельефу, а он одинаков, пока ничего не двигалось. Голограмма
+/// пересобирается целиком (единицы квадов за редкий кадр). Финальную
 /// корректность всё равно проверяет симуляция при применении команды,
 /// поэтому устаревший цвет после подбора предмета с неподвижным курсором
 /// поправится при первом же движении мыши.
@@ -2066,9 +2433,9 @@ fn update_build_hologram(
     mut commands: Commands,
     state: Res<GameState>,
     construction: Res<ConstructionUi>,
-    player: Res<PlayerRes>,
     textures: Res<TileTextures>,
-    images: Res<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut sprite_assets: ResMut<WorldSpriteAssets>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &Transform, &Projection), With<Camera2d>>,
@@ -2082,7 +2449,8 @@ fn update_build_hologram(
     } else {
         None
     };
-    let (Some(kind), Some(world), Some(p)) = (selected, state.world.as_ref(), player.0.as_ref())
+    let (Some(kind), Some(world), Some(mind)) =
+        (selected, state.world.as_ref(), state.controlled_mind())
     else {
         for entity in &existing {
             commands.entity(entity).despawn();
@@ -2117,38 +2485,145 @@ fn update_build_hologram(
     // Правило установки дублирует проверку команды: голограмма —
     // предсказание результата, а не источник истины (финальную проверку
     // всё равно делает симуляция при применении команды).
-    let affordable = build_cost(kind).is_none_or(|(item, count)| p.inventory.count_of(item) >= count);
-    let valid = affordable && buildable_at(world, tile) && p.reachable(tile, world);
+    let affordable =
+        build_cost(kind).is_none_or(|(item, count)| mind.inventory.count_of(item) >= count);
+    let actor = state.controlled.unwrap_or(0);
+    let valid = affordable
+        && buildable_at(world, tile)
+        && crate::simulation::actions::reachable(world, actor, tile);
 
-    let object_kind = ObjectKind::Building(kind);
-    let handle = textures.kind_texture(object_kind).clone();
-    let size = object_sprite_size_cached(object_kind, &handle, &images, &mut sprite_assets);
-    let tile_world = world_position(
-        world,
-        Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),
-    );
-    let camera_up = camera_transform.rotation * Vec3::Y;
-    let transform = Transform::from_translation(tile_world + camera_up * (size.y * 0.5))
-        .with_rotation(camera_transform.rotation);
-    let color = if valid {
-        Color::srgba(0.45, 1.0, 0.45, 0.55)
-    } else {
-        Color::srgba(1.0, 0.35, 0.35, 0.55)
-    };
-    let sprite = Sprite {
-        image: handle,
-        custom_size: Some(size),
-        color,
-        ..default()
-    };
+    // Пересборка целиком: геометрия зависит от вида, цвет — от допустимости.
+    let anchor = world_position(world, Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5));
+    for entity in &existing {
+        commands.entity(entity).despawn_related::<Children>();
+        commands.entity(entity).despawn();
+    }
+    let quad = world_sprite_quad(&mut meshes, &mut sprite_assets);
+    commands
+        .spawn((
+            Transform::from_translation(anchor),
+            // Корень обязан иметь Visibility: Mesh3d-квады (дети) получают
+            // Visibility автоматически, и без него InheritedVisibility детей
+            // оказывается при родителе без неё — предупреждение B0004
+            // («parent without InheritedVisibility») и сломанное наследование.
+            Visibility::default(),
+            BuildHologram,
+        ))
+        .with_children(|root| {
+            spawn_hologram_building(root, &quad, &mut sprite_assets, &mut materials, &textures, kind, valid);
+        });
+}
 
-    match existing.iter().next() {
-        Some(entity) => {
-            commands.entity(entity).insert((sprite, transform));
+/// Материал голограммы: текстура постройки с полупрозрачным тинтом
+/// подсказки. Кэшируется по (текстура, зелёная/красная) — без кэша
+/// каждое движение курсора создавало бы новые материалы в `Assets`.
+fn hologram_material(
+    sprite_assets: &mut WorldSpriteAssets,
+    materials: &mut Assets<StandardMaterial>,
+    texture: &Handle<Image>,
+    valid: bool,
+) -> Handle<StandardMaterial> {
+    sprite_assets
+        .hologram_materials
+        .entry((texture.id(), valid))
+        .or_insert_with(|| {
+            let tint = if valid {
+                Color::srgba(0.45, 1.0, 0.45, 0.55)
+            } else {
+                Color::srgba(1.0, 0.35, 0.35, 0.55)
+            };
+            materials.add(StandardMaterial {
+                base_color: tint,
+                base_color_texture: Some(texture.clone()),
+                alpha_mode: AlphaMode::Blend,
+                cull_mode: None,
+                unlit: true,
+                ..default()
+            })
+        })
+        .clone()
+}
+
+/// Квад голограммы в координатах относительно корня (центра тайла).
+fn hologram_quad(
+    parent: &mut ChildSpawnerCommands,
+    quad: &Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+    transform: Transform,
+) {
+    parent.spawn((Mesh3d(quad.clone()), MeshMaterial3d(material), transform));
+}
+
+/// Геометрия голограммы — та же, что у реальной постройки в
+/// `spawn_objects`, но с материалами-тинтами.
+fn spawn_hologram_building(
+    parent: &mut ChildSpawnerCommands,
+    quad: &Handle<Mesh>,
+    sprite_assets: &mut WorldSpriteAssets,
+    materials: &mut Assets<StandardMaterial>,
+    textures: &TileTextures,
+    kind: BuildingKind,
+    valid: bool,
+) {
+    match kind {
+        // Костёр — крест из двух вертикальных квадов вдоль осей X и Y.
+        BuildingKind::Campfire => {
+            let material = hologram_material(sprite_assets, materials, textures.campfire_cross(), valid);
+            let edge = WORLD_TILE_SIZE;
+            let height = TILE_SIZE * 0.6;
+            let center = Vec3::Z * (height * 0.5);
+            hologram_quad(
+                parent, quad, material.clone(),
+                Transform::from_translation(center)
+                    .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                    .with_scale(Vec3::new(edge, height, 1.0)),
+            );
+            hologram_quad(
+                parent, quad, material,
+                Transform::from_translation(center)
+                    .with_rotation(
+                        Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)
+                            * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                    )
+                    .with_scale(Vec3::new(edge, height, 1.0)),
+            );
         }
-        None => {
-            commands.spawn((sprite, transform, BuildHologram));
+        // Склад — плоская декаль на поверхности тайла.
+        BuildingKind::Storage => {
+            let material = hologram_material(sprite_assets, materials, textures.storage_flat(), valid);
+            let edge = WORLD_TILE_SIZE;
+            hologram_quad(
+                parent, quad, material,
+                Transform::from_translation(Vec3::Z * DECAL_Z_OFFSET)
+                    .with_scale(Vec3::new(edge, edge, 1.0)),
+            );
+        }
+        // Остальные станции — изометрический блок: верх + видимые грани.
+        kind => {
+            let station = textures.station_textures(kind);
+            let edge = WORLD_TILE_SIZE * STATION_BLOCK_SCALE;
+            let half = edge * 0.5;
+            let height = STATION_BLOCK_HEIGHT;
+            hologram_quad(
+                parent, quad, hologram_material(sprite_assets, materials, &station.top, valid),
+                Transform::from_translation(Vec3::Z * height)
+                    .with_scale(Vec3::new(edge, edge, 1.0)),
+            );
+            hologram_quad(
+                parent, quad, hologram_material(sprite_assets, materials, &station.side, valid),
+                Transform::from_translation(Vec3::new(0.0, -half, height * 0.5))
+                    .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                    .with_scale(Vec3::new(edge, height, 1.0)),
+            );
+            hologram_quad(
+                parent, quad, hologram_material(sprite_assets, materials, &station.front, valid),
+                Transform::from_translation(Vec3::new(-half, 0.0, height * 0.5))
+                    .with_rotation(
+                        Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2)
+                            * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                    )
+                    .with_scale(Vec3::new(edge, height, 1.0)),
+            );
         }
     }
-
 }

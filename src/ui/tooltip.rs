@@ -11,13 +11,14 @@ use std::collections::HashMap;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 
-use crate::app::state::{GameMode, GameState, MenuKind, PlayerRes};
+use crate::app::state::{GameMode, GameState, MenuKind};
 use crate::simulation::containers;
+use crate::ui::bottom_panel::{self, PanelAction};
 use crate::simulation::items::{ItemKind, SlotRef};
 use crate::ui::cursor_over_node;
 use crate::ui::UiFont;
 use crate::ui::creative::CreativeTile;
-use crate::ui::station::{SlotIndex, StationPlayerSlot, StationSlot, StationUi};
+use crate::ui::stations::{SlotIndex, StationPlayerSlot, StationSlot, StationUi};
 use crate::ui::inventory::{CraftBookRes, CraftResultSlot, CraftingUi, InventoryUi, InventoryWindowSlot};
 use crate::ui::inventory::{CraftSlot, InvSlot};
 use crate::ui::style;
@@ -105,8 +106,8 @@ fn update_tooltip(
     inv: Res<InventoryUi>,
     craft: Res<CraftingUi>,
     book: Res<CraftBookRes>,
-    player: Res<PlayerRes>,
     station: Res<StationUi>,
+    inspector: Res<crate::ui::inspector::InspectorUi>,
     names: Res<ItemNames>,
     font: Res<UiFont>,
     inv_slots: Query<(
@@ -117,12 +118,14 @@ fn update_tooltip(
     )>,
     craft_slots: Query<(&CraftSlot, &ComputedNode, &UiGlobalTransform)>,
     result_slots: Query<(&ComputedNode, &UiGlobalTransform), With<CraftResultSlot>>,
-    // Слоты всех окон одним параметром-кортежем: у систем Bevy предел в
-    // 16 параметров.
-    (creative_tiles, station_slots, station_player_slots): (
+    // Слоты всех окон и кнопки панели редактора одним параметром-кортежем:
+    // у систем Bevy предел в 16 параметров.
+    (creative_tiles, station_slots, station_player_slots, inspector_slots, panel_buttons): (
         Query<(&CreativeTile, &ComputedNode, &UiGlobalTransform)>,
         Query<(&StationSlot, &ComputedNode, &UiGlobalTransform)>,
         Query<(&StationPlayerSlot, &SlotIndex, &ComputedNode, &UiGlobalTransform)>,
+        Query<(&crate::ui::inspector::InspectorSlot, &ComputedNode, &UiGlobalTransform)>,
+        Query<(&PanelAction, &ComputedNode, &UiGlobalTransform)>,
     ),
     mut tooltips: Query<(Entity, &mut Node, Option<&Children>), With<TooltipNode>>,
     mut texts: Query<&mut Text>,
@@ -153,15 +156,18 @@ fn update_tooltip(
         &inv,
         &craft,
         &book,
-        &player,
+        state.controlled_mind(),
         &station,
+        inspector.open,
         &names,
         &inv_slots,
         &craft_slots,
         &result_slots,
         &creative_tiles,
         &station_slots,
+        &inspector_slots,
         &station_player_slots,
+        &panel_buttons,
     );
 
     let Some(name) = name else {
@@ -235,8 +241,9 @@ fn hovered_item_name(
     inv: &InventoryUi,
     craft: &CraftingUi,
     book: &CraftBookRes,
-    player: &PlayerRes,
+    mind: Option<&crate::simulation::entities::HumanMind>,
     station: &StationUi,
+    inspector_open: Option<u64>,
     names: &ItemNames,
     inv_slots: &Query<(
         &InvSlot,
@@ -248,12 +255,14 @@ fn hovered_item_name(
     result_slots: &Query<(&ComputedNode, &UiGlobalTransform), With<CraftResultSlot>>,
     creative_tiles: &Query<(&CreativeTile, &ComputedNode, &UiGlobalTransform)>,
     station_slots: &Query<(&StationSlot, &ComputedNode, &UiGlobalTransform)>,
+    inspector_slots: &Query<(&crate::ui::inspector::InspectorSlot, &ComputedNode, &UiGlobalTransform)>,
     station_player_slots: &Query<(
         &StationPlayerSlot,
         &SlotIndex,
         &ComputedNode,
         &UiGlobalTransform,
     )>,
+    panel_buttons: &Query<(&PanelAction, &ComputedNode, &UiGlobalTransform)>,
 ) -> Option<String> {
     if inv.drag.is_some() || station.drag.is_some() {
         return None;
@@ -261,6 +270,43 @@ fn hovered_item_name(
     let under_cursor = |computed: &ComputedNode, transform: &UiGlobalTransform| -> bool {
         cursor_over_node(window, computed, transform, cursor)
     };
+
+    // Нижняя панель редактора: названия категорий, инструментов и линз.
+    // Панель живёт в наблюдателе (в режиме игрока она скрыта), тултип
+    // не нужен поверх модальных меню. Курсор не на панели — смотрим
+    // остальные источники (окно инспектора тоже работает в наблюдателе).
+    if state.mode == GameMode::Observer
+        && state.active_menu.is_none()
+        && let Some((action, ..)) =
+            panel_buttons.iter().find(|(_, computed, transform)| under_cursor(computed, transform))
+    {
+        // Над кнопкой панели показывается только её название (у плиток
+        // времени названия нет — они подписаны сами).
+        return bottom_panel::panel_action_tooltip(action).map(str::to_string);
+    }
+
+    // Окно инспектора: слот показывает название предмета из инвентаря
+    // выбранного существа.
+    if let Some(id) = inspector_open
+        && let Some(slot) = inspector_slots
+            .iter()
+            .find(|(_, computed, transform)| under_cursor(computed, transform))
+    {
+        let slot_ref = crate::simulation::items::SlotRef {
+            area: slot.0.area,
+            index: slot.0.index,
+        };
+        if let Some(stack) = state
+            .world
+            .as_ref()
+            .and_then(|world| world.entities.get(id))
+            .and_then(|e| e.mind.as_ref())
+            .and_then(|m| m.inventory.get(slot_ref))
+        {
+            return Some(names.name(stack.kind));
+        }
+        return None;
+    }
 
     // Творческое меню: плитка показывает название своего предмета.
     if state.active_menu == Some(MenuKind::Creative) {
@@ -294,17 +340,14 @@ fn hovered_item_name(
         if let Some((_, index, ..)) = station_player_slots
             .iter()
             .find(|(_, _, computed, transform)| under_cursor(computed, transform))
-            && let Some(stack) = player
-                .0
-                .as_ref()
-                .and_then(|p| p.inventory.items.get(index.0).copied().flatten())
+            && let Some(stack) = mind.and_then(|m| m.inventory.items.get(index.0).copied().flatten())
         {
             return Some(names.name(stack.kind));
         }
         return None;
     }
 
-    let p = player.0.as_ref()?;
+    let p = mind?;
     // Слот под курсором: общий хит-тест UI (физические пиксели, как в
     // пикинге bevy) — тот же, что у остальных проверок курсора.
 

@@ -9,10 +9,11 @@ use crate::simulation::containers::{
 };
 use crate::simulation::crafts::CraftBook;
 use crate::simulation::dirty::DirtyTiles;
+use crate::simulation::entities::EntityKind;
 use crate::simulation::items::{ItemKind, ItemStack};
 use crate::simulation::objects::{BuildingKind, ObjectKind, WorldObject};
 use crate::simulation::scheduler::TaskKind;
-use crate::simulation::world::{TilePos, World, WorldSize};
+use crate::simulation::world::{TilePos, World, WorldPos, WorldSize};
 
 /// Мир со станцией-постройкой на тайле (10, 10) и игроком рядом.
 fn furnace_world(kind: BuildingKind) -> (World, CraftBook) {
@@ -22,6 +23,25 @@ fn furnace_world(kind: BuildingKind) -> (World, CraftBook) {
     let (book, errors) = CraftBook::load_dir("data/crafts");
     assert!(errors.is_empty());
     (world, book)
+}
+
+/// Человек рядом со станцией: инвентарь существует у существа с «умом».
+fn spawn_human_nearby(world: &mut World) -> u64 {
+    world.entities.spawn(
+        EntityKind::Human,
+        WorldPos::of_tile_center(TilePos { x: 11, y: 10 }),
+    )
+}
+
+/// Ум существа (мутабельно): инвентарь, голод, выбранный слот.
+fn mind_mut(world: &mut World, actor: u64) -> &mut crate::simulation::HumanMind {
+    world
+        .entities
+        .get_mut(actor)
+        .unwrap()
+        .mind
+        .as_mut()
+        .unwrap()
 }
 
 /// Ставит печь в слот `slot` со стеком `stack`.
@@ -155,7 +175,7 @@ fn station_move_item_between_container_and_player() {
     let cooked = ItemKind::MeatHerbivoreCooked;
     put(&mut world, pos, FURNACE_OUTPUT, ItemStack { kind: cooked, count: 2 });
 
-    let mut player = crate::simulation::Player::new(crate::simulation::WorldPos::of_tile_center(TilePos { x: 11, y: 10 }));
+    let human = spawn_human_nearby(&mut world);
     let mut sched = crate::simulation::Scheduler::default();
     let mut queue = crate::simulation::CommandQueue::default();
     let mut dirty = DirtyTiles::default();
@@ -167,37 +187,37 @@ fn station_move_item_between_container_and_player() {
         to: (SLOT_AREA_PLAYER_MISC, 0),
         count: 0,
     });
-    queue.apply_all(&mut world, Some(&mut player), &mut dirty, &mut sched, 0, &book);
-    assert_eq!(player.inventory.count_of(cooked), 2);
+    queue.apply_all(&mut world, Some(human), &mut dirty, &mut sched, 0, &book);
+    assert_eq!(mind_mut(&mut world, human).inventory.count_of(cooked), 2);
     assert_eq!(container_at(&world, pos).unwrap().get(FURNACE_OUTPUT), None);
 
     // Обратный перенос камня в топливный слот невозможен (не топливо):
     // камень остаётся в инвентаре, слот пуст.
-    player.inventory.add(ItemKind::Rock, 1);
+    mind_mut(&mut world, human).inventory.add(ItemKind::Rock, 1);
     queue.push(Command::StationMoveItem {
         pos,
         from: (SLOT_AREA_PLAYER_MISC, 1),
         to: (FURNACE_FUEL as u8, 0),
         count: 0,
     });
-    queue.apply_all(&mut world, Some(&mut player), &mut dirty, &mut sched, 0, &book);
+    queue.apply_all(&mut world, Some(human), &mut dirty, &mut sched, 0, &book);
     assert_eq!(container_at(&world, pos).unwrap().get(FURNACE_FUEL), None);
-    assert_eq!(player.inventory.count_of(ItemKind::Rock), 1);
+    assert_eq!(mind_mut(&mut world, human).inventory.count_of(ItemKind::Rock), 1);
 
     // Уголь в топливный слот проходит.
-    player.inventory.add(ItemKind::Coal, 1);
+    mind_mut(&mut world, human).inventory.add(ItemKind::Coal, 1);
     queue.push(Command::StationMoveItem {
         pos,
         from: (SLOT_AREA_PLAYER_MISC, 2),
         to: (FURNACE_FUEL as u8, 0),
         count: 0,
     });
-    queue.apply_all(&mut world, Some(&mut player), &mut dirty, &mut sched, 0, &book);
+    queue.apply_all(&mut world, Some(human), &mut dirty, &mut sched, 0, &book);
     assert_eq!(
         container_at(&world, pos).unwrap().get(FURNACE_FUEL).map(|s| s.count),
         Some(1)
     );
-    assert_eq!(player.inventory.count_of(ItemKind::Coal), 0);
+    assert_eq!(mind_mut(&mut world, human).inventory.count_of(ItemKind::Coal), 0);
 }
 
 /// Обмен занятых слотов: предмет игрока уезжает в контейнер, предмет
@@ -214,10 +234,9 @@ fn station_move_swaps_occupied_slots() {
         ItemStack { kind: ItemKind::Rock, count: 3 },
     );
 
-    let mut player = crate::simulation::Player::new(crate::simulation::WorldPos::of_tile_center(
-        TilePos { x: 11, y: 10 },
-    ));
-    player.inventory.items[0] = Some(ItemStack { kind: ItemKind::Apple, count: 5 });
+    let human = spawn_human_nearby(&mut world);
+    mind_mut(&mut world, human).inventory.items[0] =
+        Some(ItemStack { kind: ItemKind::Apple, count: 5 });
 
     let mut sched = crate::simulation::Scheduler::default();
     let mut queue = crate::simulation::CommandQueue::default();
@@ -228,7 +247,7 @@ fn station_move_swaps_occupied_slots() {
         to: (0, 0),
         count: 0,
     });
-    queue.apply_all(&mut world, Some(&mut player), &mut dirty, &mut sched, 0, &book);
+    queue.apply_all(&mut world, Some(human), &mut dirty, &mut sched, 0, &book);
 
     // Обмен состоялся в обе стороны.
     assert_eq!(
@@ -236,7 +255,7 @@ fn station_move_swaps_occupied_slots() {
         Some(ItemStack { kind: ItemKind::Apple, count: 5 })
     );
     assert_eq!(
-        player.inventory.items[0],
+        mind_mut(&mut world, human).inventory.items[0],
         Some(ItemStack { kind: ItemKind::Rock, count: 3 })
     );
 }

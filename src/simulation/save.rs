@@ -26,10 +26,16 @@
 //!   существа:
 //!     next_id u64
 //!     count   u32 + [id u64, kind u8, x f32, y f32, prev_x f32, prev_y f32,
-//!                    state u8, facing u8, hp f32, water_ticks u16,
+//!                    state u8, facing u8, hp f32, hunger f32,
+//!                    water_ticks u16,
 //!                    state_ticks u64, state_duration u64,
 //!                    target_x f32, target_y f32, stuck_ticks u16,
-//!                    land_search_failed_at u64]
+//!                    land_search_failed_at u64,
+//!                    mind u8: 0 = нет (неразумное) | 1 = запись ниже]
+//!                    mind:  selected_slot u8,
+//!                           слоты misc / брони / одежды / косметики /
+//!                           мусорки (слот: tag u8: 0 = пусто | 1 =
+//!                           kind u8 + count u32)]
 //!                    по возрастанию id
 //!   снаряды:
 //!     next_projectile_id u64
@@ -47,50 +53,38 @@
 //!     ближнее окно:    u64 число бакетов + бакеты
 //!                      [u64 count + [id u64, вид задачи] на бакет]
 //!     дальние:         u64 count + [tick u64, id u64, вид задачи] по (tick, id)
-//!   игрок:
-//!     present          u8 (0 = игрока нет, 1 = запись ниже)
-//!     x f32, y f32     (позиция; prev_pos при загрузке = позиция)
-//!     selected_slot    u8 (< MISC_SLOTS)
-//!     hp f32, hunger f32 (в допустимых диапазонах)
-//!     слоты misc:      MISC_SLOTS слотов
-//!     слоты брони:     ARMOR_SLOTS слотов
-//!     слоты одежды:    CLOTHES_SLOTS слотов
-//!     слоты косметики: BAUBLE_SLOTS слотов
-//!     мусорка:         1 слот
-//!       слот:          tag u8: 0 = пусто | 1 = kind u8 + count u32
 //! ```
 //!
 //! Обход разреженных слоёв идёт по возрастанию индексов, списки
 //! планировщика отсортированы — одинаковые состояния дают одинаковые байты.
 //! Файл должен читаться обратно без потерь: счёт скорости, пауза и прочее
 //! transient-состояние UI сюда не входят — это выбор игрока, а не мира.
-//! Кулдауны игрока (атака, еда) при загрузке сбрасываются: тики мира
-//! могли уйти вперёд.
+//! Кулдауны ума существа (атака, еда) и цель ИИ при загрузке сбрасываются:
+//! тики мира могли уйти вперёд.
 
 use std::fmt;
 
 use super::chunk::{TerrainTiles, CHUNK_SIZE, CHUNK_TILES};
-use super::entities::{EntityKind, EntityState, EntityStore, Facing, SimEntity};
-use super::hunger::{Hunger, HUNGER_MAX};
+use super::entities::{EntityKind, EntityState, EntityStore, Facing, HumanMind, SimEntity};
 use super::items::{
     Inventory, ItemKind, ItemStack, SlotArea, ARMOR_SLOTS, BAUBLE_SLOTS, CLOTHES_SLOTS, MISC_SLOTS,
 };
 use super::needs::NeedKind;
 use super::objects::{ObjectKind, ObjectStage, WorldObject};
-use super::player::{Player, WorldPos, PLAYER_MAX_HP};
 use super::scheduler::{Scheduler, SchedulerSnapshot, Task, TaskKind};
 use super::tile::{ResourceKind, TileType};
 use super::time::GameClock;
-use super::world::{ChunkPos, World, WorldSize};
+use super::world::{ChunkPos, World, WorldPos, WorldSize};
 
 /// Версия формата сохранения. При несовместимых изменениях — увеличить
-/// и решить, поддерживать ли чтение старых версий. Версия 4: слой
-/// предметов на земле и поле `land_search_failed_at` существ. Версия 5:
-/// снаряды в полёте и воткнутые копья (боевая система). Версия 6: игрок
-/// (позиция, hp, голод, инвентарь со всеми секциями и мусоркой).
-/// Версия 1: основа. Версия 2: слои культур и контейнеров станций,
-/// item-сущности дропа, задачи CropGrowth/StationTick.
-pub const SAVE_FORMAT_VERSION: u32 = 2;
+/// и решить, поддерживать ли чтение старых версий. Версия 1: основа.
+/// Версия 2: слои культур и контейнеров станций, item-сущности дропа,
+/// задачи CropGrowth/StationTick. Версия 3: игрок стал сущностью мира —
+/// у существ появился «ум» (инвентарь/голод/слот хотбара), секция игрока
+/// удалена, у снаряда появилось поле стрелка. Версия 4: голод перенесён
+/// из «ума» на уровень существа — голодают все виды, включая волка.
+/// Сейвы v3 и старше не читаются.
+pub const SAVE_FORMAT_VERSION: u32 = 4;
 
 /// Магия в начале файла.
 const MAGIC: [u8; 4] = *b"ADEM";
@@ -140,20 +134,17 @@ pub struct SavedGame {
     pub tick: u64,
     pub world: World,
     pub scheduler: Scheduler,
-    /// Игрок из сохранения; `None` — на момент сохранения существа не было.
-    pub player: Option<Player>,
 }
 
 /// Записывает состояние симуляции в байты.
 ///
-/// `player` — данные игрока (живут вне мира); `game_version` — версия
-/// игры (константа проекта), пишется в заголовок для диагностики; на
-/// совместимость не влияет — за это отвечает `SAVE_FORMAT_VERSION`.
+/// `game_version` — версия игры (константа проекта), пишется в заголовок
+/// для диагностики; на совместимость не влияет — за это отвечает
+/// `SAVE_FORMAT_VERSION`.
 pub fn save_game(
     world: &World,
     clock: &GameClock,
     scheduler: &Scheduler,
-    player: Option<&Player>,
     game_version: &str,
 ) -> Vec<u8> {
     let mut w = Vec::with_capacity(1024);
@@ -206,6 +197,7 @@ pub fn save_game(
         write_u64(&mut w, p.duration_ticks);
         write_f32(&mut w, p.arc_height);
         write_f32(&mut w, p.damage);
+        write_u64(&mut w, p.shooter);
     }
     write_u32(&mut w, world.stuck_spears.len() as u32);
     for spear in &world.stuck_spears {
@@ -251,8 +243,6 @@ pub fn save_game(
         write_task_kind(&mut w, &task.kind);
     }
 
-    // Игрок (живёт вне мира; в старых форматах не сохранялся вовсе).
-    write_player(&mut w, player);
     w
 }
 
@@ -409,8 +399,8 @@ pub fn load_game(bytes: &[u8]) -> Result<SavedGame, SaveError> {
         far.push((far_tick, id, Task { id, kind }));
     }
 
-    // Игрок.
-    let player = read_player(&mut r)?;
+    // Игрок больше не секция формата: он — существо мира (ум в записях
+    // существ). Лишние данные в конце файла считаются повреждением.
     if r.remaining() != 0 {
         return Err(SaveError::BadData("лишние данные в конце файла"));
     }
@@ -437,9 +427,10 @@ pub fn load_game(bytes: &[u8]) -> Result<SavedGame, SaveError> {
             stuck_spears,
             next_projectile_id,
             item_entities,
+            // Прогресс ломания — транзиент: после загрузки зажатие начинать заново.
+            building_breaks: std::collections::HashMap::new(),
         },
         scheduler,
-        player,
     })
 }
 
@@ -573,6 +564,7 @@ fn write_entities(w: &mut Vec<u8>, store: &EntityStore) {
         w.push(entity.state as u8);
         w.push(entity.facing as u8);
         write_f32(w, entity.hp);
+        write_f32(w, entity.hunger.value());
         write_u16(w, entity.water_ticks);
         write_u64(w, entity.state_ticks);
         write_u64(w, entity.state_duration);
@@ -580,7 +572,27 @@ fn write_entities(w: &mut Vec<u8>, store: &EntityStore) {
         write_f32(w, entity.target.y);
         write_u16(w, entity.stuck_ticks);
         write_u64(w, entity.land_search_failed_at);
+        write_mind(w, entity.mind.as_ref());
     }
+}
+
+/// Пишет «ум» существа (инвентарь, слот хотбара). Кулдауны атаки/еды,
+/// цель ИИ и память (костёр/еда) не пишутся — transient: тики мира при
+/// загрузке могли уйти вперёд, человек сам выберет цель заново.
+/// `None` — неразумное существо (волк).
+fn write_mind(w: &mut Vec<u8>, mind: Option<&HumanMind>) {
+    let Some(m) = mind else {
+        w.push(0);
+        return;
+    };
+    w.push(1);
+    debug_assert!(m.selected_slot < MISC_SLOTS);
+    w.push(m.selected_slot as u8);
+    write_slots(w, &m.inventory.items);
+    write_slots(w, &m.inventory.armor);
+    write_slots(w, &m.inventory.clothes);
+    write_slots(w, &m.inventory.baubles);
+    write_slots(w, std::slice::from_ref(&m.inventory.trash));
 }
 
 /// Читает существ мира. Проверяет стабильные виды, порядок id и HP:
@@ -625,6 +637,11 @@ fn read_entity(r: &mut Reader<'_>) -> Result<SimEntity, SaveError> {
     if !hp.is_finite() || hp < 0.0 || hp > kind.max_hp() {
         return Err(SaveError::BadData("HP существа"));
     }
+    // Голод — свойство существа (v4): пишется сразу после HP.
+    let hunger = r.read_f32()?;
+    if !hunger.is_finite() || !(0.0..=super::hunger::HUNGER_MAX).contains(&hunger) {
+        return Err(SaveError::BadData("голод существа"));
+    }
     let water_ticks = r.read_u16()?;
     let state_ticks = r.read_u64()?;
     let state_duration = r.read_u64()?;
@@ -632,10 +649,15 @@ fn read_entity(r: &mut Reader<'_>) -> Result<SimEntity, SaveError> {
     let target_y = r.read_f32()?;
     let stuck_ticks = r.read_u16()?;
     let land_search_failed_at = r.read_u64()?;
+    let mind = read_mind(r)?;
 
     let coords = [x, y, prev_x, prev_y, target_x, target_y];
     if !coords.iter().all(|value| value.is_finite()) {
         return Err(SaveError::BadData("координаты существа"));
+    }
+    // Неразумное существо с «умом» — рассинхрон вида и данных.
+    if mind.is_some() != kind.is_sentient() {
+        return Err(SaveError::BadData("ум не соответствует виду существа"));
     }
 
     Ok(SimEntity {
@@ -646,13 +668,44 @@ fn read_entity(r: &mut Reader<'_>) -> Result<SimEntity, SaveError> {
         facing,
         state,
         hp,
+        hunger: super::hunger::Hunger::with_value(hunger),
         water_ticks,
         state_ticks,
         state_duration,
         target: WorldPos { x: target_x, y: target_y },
         stuck_ticks,
         land_search_failed_at,
+        mind,
+        // Кулдаун укуса и обида — transient: мир после загрузки жил дальше.
+        next_bite_tick: 0,
+        provoked_by: None,
+        provoked_until_tick: 0,
     })
+}
+
+/// Читает «ум» существа. Проверяет адрес слота хотбара, виды предметов
+/// и пределы стаков; секции брони/одежды — ещё и соответствие части тела
+/// (`Inventory::accepts`).
+fn read_mind(r: &mut Reader<'_>) -> Result<Option<HumanMind>, SaveError> {
+    if r.read_u8()? == 0 {
+        return Ok(None);
+    }
+    let selected_slot = r.read_u8()? as usize;
+    if selected_slot >= MISC_SLOTS {
+        return Err(SaveError::BadData("выбранный слот хотбара"));
+    }
+
+    let mut mind = HumanMind::new();
+    mind.selected_slot = selected_slot;
+    read_slots(r, SlotArea::Misc, MISC_SLOTS, &mut mind.inventory.items)?;
+    read_slots(r, SlotArea::Armor, ARMOR_SLOTS, &mut mind.inventory.armor)?;
+    read_slots(r, SlotArea::Clothes, CLOTHES_SLOTS, &mut mind.inventory.clothes)?;
+    read_slots(r, SlotArea::Bauble, BAUBLE_SLOTS, &mut mind.inventory.baubles)?;
+    // Мусорка — один слот отдельной секции: читаем во временный массив.
+    let mut trash = [None; 1];
+    read_slots(r, SlotArea::Trash, 1, &mut trash)?;
+    mind.inventory.trash = trash[0];
+    Ok(Some(mind))
 }
 
 // ---------- Снаряды и воткнутые копья ----------
@@ -670,6 +723,7 @@ fn read_projectile(r: &mut Reader<'_>) -> Result<super::combat::Projectile, Save
     let duration_ticks = r.read_u64()?;
     let arc_height = r.read_f32()?;
     let damage = r.read_f32()?;
+    let shooter = r.read_u64()?;
 
     let coords = [ox, oy, tx, ty, t, arc_height, damage];
     if !coords.iter().all(|value| value.is_finite()) {
@@ -688,6 +742,7 @@ fn read_projectile(r: &mut Reader<'_>) -> Result<super::combat::Projectile, Save
         duration_ticks,
         arc_height,
         damage,
+        shooter,
     })
 }
 
@@ -707,30 +762,7 @@ fn read_stuck_spear(r: &mut Reader<'_>) -> Result<super::combat::StuckSpear, Sav
     })
 }
 
-// ---------- Игрок ----------
-
-/// Пишет данные игрока: наличие, позиция, выбранный слот, hp, голод и все
-/// секции инвентаря (misc, броня, одежда, косметика, мусорка). Кулдауны
-/// (атака, еда) не пишутся — transient: тики мира при загрузке могли
-/// уйти вперёд.
-fn write_player(w: &mut Vec<u8>, player: Option<&Player>) {
-    let Some(p) = player else {
-        w.push(0);
-        return;
-    };
-    w.push(1);
-    write_f32(w, p.pos.x);
-    write_f32(w, p.pos.y);
-    debug_assert!(p.selected_slot < MISC_SLOTS);
-    w.push(p.selected_slot as u8);
-    write_f32(w, p.hp);
-    write_f32(w, p.hunger.value());
-    write_slots(w, &p.inventory.items);
-    write_slots(w, &p.inventory.armor);
-    write_slots(w, &p.inventory.clothes);
-    write_slots(w, &p.inventory.baubles);
-    write_slots(w, std::slice::from_ref(&p.inventory.trash));
-}
+// ---------- Слоты инвентаря ума ----------
 
 /// Пишет массив слотов: на каждый — тег пустоты или стек (вид + количество).
 fn write_slots(w: &mut Vec<u8>, slots: &[Option<ItemStack>]) {
@@ -744,47 +776,6 @@ fn write_slots(w: &mut Vec<u8>, slots: &[Option<ItemStack>]) {
             }
         }
     }
-}
-
-/// Читает данные игрока. Проверяет диапазоны hp/голода, адрес слота хотбара,
-/// виды предметов и пределы стаков; слоты брони и одежды дополнительно —
-/// соответствие части тела. Битый файл не должен воскресить игрока с
-/// отрицательным здоровьем или надетым шлемом на ногах.
-fn read_player(r: &mut Reader<'_>) -> Result<Option<Player>, SaveError> {
-    if r.read_u8()? == 0 {
-        return Ok(None);
-    }
-    let x = r.read_f32()?;
-    let y = r.read_f32()?;
-    if ![x, y].iter().all(|value| value.is_finite()) {
-        return Err(SaveError::BadData("координаты игрока"));
-    }
-    let selected_slot = r.read_u8()? as usize;
-    if selected_slot >= MISC_SLOTS {
-        return Err(SaveError::BadData("выбранный слот хотбара"));
-    }
-    let hp = r.read_f32()?;
-    if !hp.is_finite() || !(0.0..=PLAYER_MAX_HP).contains(&hp) {
-        return Err(SaveError::BadData("HP игрока"));
-    }
-    let hunger = r.read_f32()?;
-    if !hunger.is_finite() || !(0.0..=HUNGER_MAX).contains(&hunger) {
-        return Err(SaveError::BadData("голод игрока"));
-    }
-
-    let mut player = Player::new(WorldPos { x, y });
-    player.selected_slot = selected_slot;
-    player.hp = hp;
-    player.hunger = Hunger::with_value(hunger);
-    read_slots(r, SlotArea::Misc, MISC_SLOTS, &mut player.inventory.items)?;
-    read_slots(r, SlotArea::Armor, ARMOR_SLOTS, &mut player.inventory.armor)?;
-    read_slots(r, SlotArea::Clothes, CLOTHES_SLOTS, &mut player.inventory.clothes)?;
-    read_slots(r, SlotArea::Bauble, BAUBLE_SLOTS, &mut player.inventory.baubles)?;
-    // Мусорка — один слот отдельной секции: читаем во временный массив.
-    let mut trash = [None; 1];
-    read_slots(r, SlotArea::Trash, 1, &mut trash)?;
-    player.inventory.trash = trash[0];
-    Ok(Some(player))
 }
 
 /// Читает `count` слотов секции `area` в приёмник `slots`. Стеки проверяются
@@ -804,17 +795,17 @@ fn read_slots<const N: usize>(
             0 => *slot = None,
             1 => {
                 let kind = ItemKind::from_discriminant(r.read_u8()?)
-                    .ok_or(SaveError::BadData("вид предмета игрока"))?;
+                    .ok_or(SaveError::BadData("вид предмета ума"))?;
                 let stack_count = r.read_u32()?;
                 if stack_count == 0 || stack_count > kind.max_stack() {
-                    return Err(SaveError::BadData("размер стака игрока"));
+                    return Err(SaveError::BadData("размер стака ума"));
                 }
                 if !Inventory::accepts(kind, area, index) {
                     return Err(SaveError::BadData("предмет в чужом слоте"));
                 }
                 *slot = Some(ItemStack { kind, count: stack_count });
             }
-            _ => return Err(SaveError::BadData("тег слота игрока")),
+            _ => return Err(SaveError::BadData("тег слота ума")),
         }
     }
     Ok(())

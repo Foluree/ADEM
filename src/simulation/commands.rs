@@ -4,20 +4,19 @@
 
 use std::collections::VecDeque;
 
+use super::actions;
 use super::combat;
 use super::containers;
-use super::item_entity::THROW_DISTANCE_TILES;
 use super::crafts::CraftBook;
 use super::crops::CropKind;
 use super::dirty::DirtyTiles;
-use super::entities::EntityKind;
-use super::items::{ItemKind, ItemStack, MAX_STACK, MISC_SLOTS};
-use super::objects::{BuildingKind, WorldObject, build_cost};
-use super::player::{Player, WorldPos};
+use super::entities::{EntityKind, HumanMind};
+use super::items::{ItemKind, SlotRef, ItemStack, MAX_STACK, MISC_SLOTS};
+use super::objects::{BuildingKind, WorldObject};
 use super::scheduler::{Scheduler, TaskKind};
 use super::tile::TileType;
 use super::vegetation;
-use super::world::{TilePos, World, split_tile};
+use super::world::{TilePos, World, WorldPos, split_tile};
 
 /// Команда контроллера. Значения — данные, детерминированные; для
 /// повторяемости порядок применения = порядок постановки в очередь.
@@ -40,6 +39,10 @@ pub enum Command {
     /// Действие игрока: взаимодействие с тайлом (удар по существу, если
     /// оно под прицелом, иначе добыча).
     PlayerInteract { pos: TilePos },
+    /// Действие игрока: укус захваченного неразумного существа (волк) по
+    /// тайлу под курсором — ближайшее существо в радиусе попадания и
+    /// досягаемости укуса. Только бой: ломать и добывать волк не умеет.
+    PlayerBite { pos: TilePos },
     /// Действие игрока: собрать яблоки с яблони (ПКМ).
     PlayerHarvestApple { pos: TilePos },
     /// Действие игрока: положить предмет из руки на тайл.
@@ -71,6 +74,10 @@ pub enum Command {
     /// слота (семена, корнеплоды, вишня). Не сажаемый предмет в руке или
     /// непашня — команда игнорируется.
     PlayerSow { pos: TilePos },
+    /// Действие игрока: удар по постройке при зажатой ЛКМ. Команда уходит
+    /// каждый кадр зажатия; тики непрерывности и разрушение считает
+    /// `actions::break_building` (постройка рушится на 80-м тике зажатия).
+    PlayerBreakBuilding { pos: TilePos },
     /// Действие игрока/UI: перенос стека между слотами станции и misc
     /// игрока. Адреса: (0xFF, index) — misc игрока, (0..=N, index) — слот
     /// контейнера станции. `count = 0` — весь стак. Станции с сеткой
@@ -85,6 +92,13 @@ pub enum Command {
     /// Действие игрока: съесть предмет из выбранного слота хотбара
     /// (ПКМ с едой в руке). Не еда в руке — команда игнорируется.
     PlayerEat,
+    /// Инструмент «бога» (окно инспектора): перенос стека внутри
+    /// инвентаря существа. Правила слотов — `Inventory::transfer`
+    /// (слияние/обмен/мусорка).
+    EntityMoveItem { id: u64, from: SlotRef, to: SlotRef },
+    /// Инструмент «бога» (окно инспектора): выбросить стек из слота
+    /// существа на землю под ним (дроп-сущностью с разбросом).
+    EntityDropItem { id: u64, from: SlotRef },
 }
 
 /// Очередь команд FIFO. Применяется app-слоем каждый кадр; порядок
@@ -106,6 +120,11 @@ impl CommandQueue {
 
     /// Применяет все команды по порядку поступления и возвращает их число.
     ///
+    /// Команды `Player*` — действия контроллера: они исполняются сущностью
+    /// `actor` (захваченным существом, GAME_DESIGN 4.1). `actor = None`
+    /// (наблюдатель без захвата) — действия игрока пропускаются, команды
+    /// «бога» работают как всегда.
+    ///
     /// `dirty` наполняется позициями изменённых тайлов с разделением по
     /// каналу (рельеф / декор) — рендер по ним пересобирает меш блока или
     /// только дочерние спрайты. После каждого изменения запускаются
@@ -115,7 +134,7 @@ impl CommandQueue {
     pub fn apply_all(
         &mut self,
         world: &mut World,
-        mut player: Option<&mut Player>,
+        actor: Option<u64>,
         dirty: &mut DirtyTiles,
         sched: &mut Scheduler,
         tick: u64,
@@ -148,6 +167,9 @@ impl CommandQueue {
                         if object.is_some() && world.crop_at(pos).is_some() {
                             world.set_crop(pos, None);
                         }
+                        // Прогресс ломания привязан к постройке на тайле:
+                        // новая/убранная постройка начинается с нуля.
+                        world.building_breaks.remove(&pos);
                         world.set_object_with_container(pos, object);
                         dirty.decor(pos);
                         vegetation::after_tile_changed(world, sched, tick, pos);
@@ -176,61 +198,51 @@ impl CommandQueue {
                     world.entities.move_to(id, pos);
                 }
                 Command::PlayerInteract { pos } => {
-                    if let Some(player) = player.as_deref_mut() {
-                        // Под прицелом существо — удар (кулдаун и дальность
-                        // проверяет боевая система). Мимо существа — обычная
-                        // добыча: оружие не мешает собирать траву и камни.
-                        // Исключение — лук: им нельзя ничего ломать.
-                        let can_harvest = player.selected_item() != Some(ItemKind::Bow);
-                        // Добыча меняет либо объект (куст, валун), либо рельеф
-                        // (сбор травы превращает тайл в землю) — но не оба
-                        // сразу. Культура меняет только декор. Канал dirty
-                        // определяется по тому, что было на тайле до действия.
-                        let had_object = world.object_at(pos).is_some();
-                        let had_crop = world.crop_at(pos).is_some();
-                        if !combat::try_melee_attack(world, player, pos, tick)
-                            && can_harvest && player.interact(pos, world)
-                        {
-                            if had_object || had_crop {
-                                dirty.decor(pos);
-                            } else {
-                                dirty.terrain(pos);
-                            }
-                            // Пахота или уборка урожая: пашня может остаться
-                            // пустой — ставим месячную проверку.
-                            schedule_farmland_revert(world, sched, tick, pos);
-                            vegetation::after_tile_changed(world, sched, tick, pos);
+                    let Some(actor) = actor else { continue };
+                    // Под прицелом существо — удар (кулдаун и дальность
+                    // проверяет боевая система). Мимо существа — обычная
+                    // добыча: оружие не мешает собирать траву и камни.
+                    // Исключение — лук: им нельзя ничего ломать.
+                    let can_harvest =
+                        actions::selected_item(world, actor) != Some(ItemKind::Bow);
+                    // Добыча меняет либо объект (куст, валун), либо рельеф
+                    // (сбор травы превращает тайл в землю) — но не оба
+                    // сразу. Культура меняет только декор. Канал dirty
+                    // определяется по тому, что было на тайле до действия.
+                    let had_object = world.object_at(pos).is_some();
+                    let had_crop = world.crop_at(pos).is_some();
+                    if !combat::try_melee_attack(world, actor, pos, tick)
+                        && can_harvest && actions::interact(world, actor, pos)
+                    {
+                        if had_object || had_crop {
+                            dirty.decor(pos);
+                        } else {
+                            dirty.terrain(pos);
                         }
+                        // Пахота или уборка урожая: пашня может остаться
+                        // пустой — ставим месячную проверку.
+                        schedule_farmland_revert(world, sched, tick, pos);
+                        vegetation::after_tile_changed(world, sched, tick, pos);
                     }
                 }
+                Command::PlayerBite { pos } => {
+                    let Some(actor) = actor else { continue };
+                    // Укус — единственное действие ЛКМ неразумного существа:
+                    // только бой, никаких ломаний и добычи.
+                    combat::wolf_bite(world, actor, pos, tick);
+                }
                 Command::PlayerHarvestApple { pos } => {
-                    if let Some(player) = player.as_deref_mut() && player.harvest_apple(pos, world) {
+                    let Some(actor) = actor else { continue };
+                    if actions::harvest_apple(world, actor, pos) {
                         dirty.decor(pos);
                         vegetation::after_tile_changed(world, sched, tick, pos);
                     }
                 }
                 Command::PlayerDropItem { pos } => {
-                    if !in_bounds(world, pos) {
-                        // вне мира — пропускаем.
-                    } else if let Some(player) = player.as_deref_mut()
-                        // Выкладывать можно только в радиусе взаимодействия
-                        // (как для добычи): «телепорт» предметов на дальние
-                        // тайлы через курсор невозможен.
-                        && player.reachable(pos, world)
-                    {
-                        let slot_index = player.selected_slot.min(super::items::MISC_SLOTS - 1);
-                        let current = player.inventory.items[slot_index];
-                        if let Some(stack) = current && stack.count > 0 {
-                            // Снимаем весь стек из слота.
-                            player.inventory.items[slot_index] = None;
-                            if try_place_item(world, pos, stack) {
-                                dirty.decor(pos);
-                                vegetation::after_tile_changed(world, sched, tick, pos);
-                            } else {
-                                // Не поместилось: возвращаем стек в инвентарь.
-                                player.inventory.items[slot_index] = Some(stack);
-                            }
-                        }
+                    let Some(actor) = actor else { continue };
+                    if actions::drop_item(world, actor, pos) {
+                        dirty.decor(pos);
+                        vegetation::after_tile_changed(world, sched, tick, pos);
                     }
                 }
                 Command::PlayerDropStack { pos, stack } => {
@@ -244,95 +256,40 @@ impl CommandQueue {
                     }
                 }
                 Command::PlayerThrowItem { target } => {
-                    let Some(player) = player.as_deref_mut() else {
-                        continue;
-                    };
-                    let slot = player.selected_slot.min(super::items::MISC_SLOTS - 1);
-                    let Some(stack) = player.inventory.items[slot] else {
-                        continue;
-                    };
-                    // Бросается один предмет; слот опустевает полностью.
-                    player.inventory.items[slot] = (stack.count > 1)
-                        .then_some(ItemStack { count: stack.count - 1, ..stack });
-                    throw_items(
-                        world,
-                        player.pos,
-                        ItemStack { kind: stack.kind, count: 1 },
-                        target,
-                        tick,
-                    );
+                    let Some(actor) = actor else { continue };
+                    actions::throw_selected(world, actor, target, tick);
                 }
                 Command::PlayerThrowStack { target, slot } => {
-                    let Some(player) = player.as_deref_mut() else {
-                        continue;
-                    };
-                    let slot = usize::from(slot);
-                    if slot >= super::items::MISC_SLOTS {
-                        continue;
-                    }
-                    let Some(stack) = player.inventory.items[slot] else {
-                        continue;
-                    };
-                    player.inventory.items[slot] = None;
-                    throw_items(world, player.pos, stack, target, tick);
+                    let Some(actor) = actor else { continue };
+                    actions::throw_stack(world, actor, slot, target, tick);
                 }
                 Command::PlayerPickupItem { pos } => {
-                    if !in_bounds(world, pos) {
-                        // вне мира — пропускаем.
-                    } else if let Some(stack) = world.item_at(pos).copied()
-                        && let Some(player) = player.as_deref_mut()
-                        // Подобрать можно только в радиусе взаимодействия,
-                        // как и всё остальное: «телепорт» стека к игроку
-                        // с дальнего края экрана запрещён.
-                        && player.reachable(pos, world)
-                        && player.inventory.can_fit(stack.kind, stack.count)
-                    {
-                        player.inventory.add(stack.kind, stack.count);
-                        world.set_item(pos, None);
+                    let Some(actor) = actor else { continue };
+                    if actions::pickup_item(world, actor, pos) {
                         dirty.decor(pos);
                         vegetation::after_tile_changed(world, sched, tick, pos);
                     }
                 }
                 Command::PlayerBuild { pos, kind } => {
-                    let Some((item, count)) = build_cost(kind) else {
-                        // У постройки нет цены (строятся редактором) —
-                        // команда игнорируется.
-                        continue;
-                    };
-                    let Some(player) = player.as_deref_mut() else {
-                        continue;
-                    };
-                    if !player.reachable(pos, world) || !buildable_at(world, pos) {
-                        continue;
+                    let Some(actor) = actor else { continue };
+                    if actions::build(world, actor, pos, kind) {
+                        dirty.decor(pos);
+                        vegetation::after_tile_changed(world, sched, tick, pos);
                     }
-                    // Платим только после проверки места: постройка не может
-                    // «съесть» предметы и не появиться.
-                    if !player.inventory.take_items(item, count) {
-                        continue;
-                    }
-                    // Контейнер станции появляется вместе с постройкой.
-                    if world.crop_at(pos).is_some() {
-                        world.set_crop(pos, None);
-                    }
-                    world.set_object_with_container(pos, Some(WorldObject::building(kind)));
-                    dirty.decor(pos);
-                    vegetation::after_tile_changed(world, sched, tick, pos);
                 }
                 Command::PlayerSow { pos } => {
-                    let Some(player) = player.as_deref_mut() else {
-                        continue;
-                    };
+                    let Some(actor) = actor else { continue };
                     if !in_bounds(world, pos) {
                         continue;
                     }
                     // Вид культуры берём из предмета в руке до посева:
                     // после списания слот может опустеть.
                     let Some(crop_kind) =
-                        player.selected_item().and_then(CropKind::from_seed_item)
+                        actions::selected_item(world, actor).and_then(CropKind::from_seed_item)
                     else {
                         continue;
                     };
-                    if player.sow(pos, world) {
+                    if actions::sow(world, actor, pos) {
                         dirty.decor(pos);
                         // Цепочка роста: событие следующей стадии.
                         let (chunk, local_index) = split_tile(pos);
@@ -342,84 +299,124 @@ impl CommandQueue {
                         );
                     }
                 }
+                Command::PlayerBreakBuilding { pos } => {
+                    let Some(actor) = actor else { continue };
+                    if actions::break_building(world, actor, pos, tick) {
+                        dirty.decor(pos);
+                        vegetation::after_tile_changed(world, sched, tick, pos);
+                    }
+                }
                 Command::StationMoveItem { pos, from, to, count } => {
                     if !in_bounds(world, pos) {
                         continue;
                     }
-                    if station_move_item(world, player.as_deref_mut(), pos, from, to, count) {
+                    if station_move_item(world, actor, pos, from, to, count) {
                         // Слоты изменились: декор (состояние печи) и поджиг.
                         dirty.decor(pos);
                         containers::wake_station(world, sched, tick, book, pos);
                     }
                 }
                 Command::PlayerThrowSpear { target } => {
-                    let Some(player) = player.as_deref_mut() else {
-                        continue;
-                    };
-                    let slot = player.selected_slot.min(MISC_SLOTS - 1);
+                    let Some(actor) = actor else { continue };
+                    let Some(origin) = actions::pos_of(world, actor) else { continue };
+                    let slot = mind_of(world, actor)
+                        .and_then(|m| {
+                            let slot = m.selected_slot.min(MISC_SLOTS - 1);
+                            m.inventory.items[slot].map(|stack| (slot, stack))
+                        });
                     // Бросается копьё из руки: пустой слот или другой предмет
                     // — команда бессмысленна.
-                    match player.inventory.items[slot] {
-                        Some(stack) if stack.kind == ItemKind::Spear => {}
-                        _ => continue,
-                    }
+                    let Some((slot, _)) = slot.filter(|(_, stack)| stack.kind == ItemKind::Spear)
+                    else {
+                        continue;
+                    };
                     if !in_bounds(world, target) {
                         continue;
                     }
-                    player.inventory.items[slot] = None;
+                    if let Some(m) = mind_of(world, actor) {
+                        m.inventory.items[slot] = None;
+                    }
                     // Точка прицела за пределами дальности — цель ужимается
                     // к максимальной дальности по тому же направлению.
                     let target = clamp_target(
-                        player.pos,
+                        origin,
                         WorldPos::of_tile_center(target),
                         combat::SPEAR_THROW_RANGE_TILES,
                     );
-                    world.spawn_projectile(combat::ProjectileKind::ThrownSpear, player.pos, target);
+                    world.spawn_projectile(combat::ProjectileKind::ThrownSpear, origin, target, actor);
                 }
                 Command::PlayerShootBow { target } => {
-                    let Some(player) = player.as_deref_mut() else {
-                        continue;
-                    };
-                    if player.selected_item() != Some(ItemKind::Bow) {
+                    let Some(actor) = actor else { continue };
+                    let Some(origin) = actions::pos_of(world, actor) else { continue };
+                    if actions::selected_item(world, actor) != Some(ItemKind::Bow) {
                         continue;
                     }
                     if !in_bounds(world, target) {
                         continue;
                     }
                     // Кулдаун выстрела — общий с ближним боем.
-                    if tick < player.attack_ready_tick {
+                    if tick < mind_of(world, actor).map_or(u64::MAX, |m| m.attack_ready_tick) {
                         continue;
                     }
                     // Стрелы пока не расходуются (решение автора на время
                     // отладки): экономика боеприпасов появится вместе с
                     // производством. `take_items(Arrow, 1)` вернётся сюда.
-                    player.attack_ready_tick = tick + combat::BOW_COOLDOWN_TICKS;
+                    if let Some(m) = mind_of(world, actor) {
+                        m.attack_ready_tick = tick + combat::BOW_COOLDOWN_TICKS;
+                    }
                     let target = clamp_target(
-                        player.pos,
+                        origin,
                         WorldPos::of_tile_center(target),
                         combat::BOW_RANGE_TILES,
                     );
-                    world.spawn_projectile(combat::ProjectileKind::Arrow, player.pos, target);
+                    world.spawn_projectile(combat::ProjectileKind::Arrow, origin, target, actor);
                 }
                 Command::PlayerEat => {
-                    let Some(player) = player.as_deref_mut() else {
-                        continue;
-                    };
+                    let Some(actor) = actor else { continue };
                     // Кулдаун поедания: ранняя команда игнорируется целиком.
-                    if tick < player.eat_ready_tick {
+                    if tick < mind_of(world, actor).map_or(u64::MAX, |m| m.eat_ready_tick) {
                         continue;
                     }
                     // Еда только из выбранного слота: пусто или не еда — нет.
                     // Кулдаун тикает только от удачного поедания.
-                    if player.eat_selected() {
-                        player.eat_ready_tick = tick + super::hunger::EAT_COOLDOWN_TICKS;
+                    if actions::eat_selected(world, actor)
+                        && let Some(m) = mind_of(world, actor)
+                    {
+                        m.eat_ready_tick = tick + super::hunger::EAT_COOLDOWN_TICKS;
                     }
+                }
+                Command::EntityMoveItem { id, from, to } => {
+                    // Перенос внутри инвентаря существа: правила слотов
+                    // (слияние/обмен/мусорка) решает `Inventory::transfer`.
+                    if let Some(m) = world.entities.get_mut(id).and_then(|e| e.mind.as_mut()) {
+                        m.inventory.transfer(from, to);
+                    }
+                }
+                Command::EntityDropItem { id, from } => {
+                    // Позиция существа снимается до мутации инвентаря.
+                    let Some(pos) = world.entities.get(id).map(|e| e.pos) else {
+                        continue;
+                    };
+                    let Some(stack) = world
+                        .entities
+                        .get_mut(id)
+                        .and_then(|e| e.mind.as_mut())
+                        .and_then(|m| m.inventory.take(from))
+                    else {
+                        continue;
+                    };
+                    world.item_entities.drop_stack(world.seed, pos, stack, tick);
                 }
             }
             applied += 1;
         }
         applied
     }
+}
+
+/// Ум актора (мутабельно); `None` — захвата нет или существо неразумное.
+fn mind_of(world: &mut World, actor: u64) -> Option<&mut HumanMind> {
+    world.entities.get_mut(actor)?.mind.as_mut()
 }
 
 /// Лежит ли тайл внутри мира.
@@ -462,26 +459,6 @@ fn schedule_farmland_revert(world: &World, sched: &mut Scheduler, tick: u64, pos
     );
 }
 
-/// Бросок стека предметов в сторону тайла: предмет «пролетает» до
-/// `THROW_DISTANCE_TILES` (или до цели, если она ближе) и остаётся лежать
-/// дроп-сущностью с задержкой автоподбора. Позиция зажимается в мир.
-fn throw_items(world: &mut World, from: WorldPos, stack: ItemStack, target: TilePos, tick: u64) {
-    let aim = WorldPos::of_tile_center(target);
-    let (dx, dy) = (aim.x - from.x, aim.y - from.y);
-    let dist = (dx * dx + dy * dy).sqrt();
-    if dist < f32::EPSILON {
-        // Цель под ногами: направление неизвестно — бросок не имеет смысла.
-        return;
-    }
-    let fly = dist.min(THROW_DISTANCE_TILES);
-    let side = world.size.tiles() as f32;
-    let landing = WorldPos {
-        x: (from.x + dx / dist * fly).clamp(0.0, side),
-        y: (from.y + dy / dist * fly).clamp(0.0, side),
-    };
-    world.item_entities.throw(from, stack, tick, landing);
-}
-
 pub fn buildable_at(world: &World, pos: TilePos) -> bool {
     if !in_bounds(world, pos) {
         return false;
@@ -494,42 +471,55 @@ pub fn buildable_at(world: &World, pos: TilePos) -> bool {
         && world.crop_at(pos).is_none()
 }
 
-/// Перенос стека между слотами станции и misc игрока (команда
-/// `StationMoveItem`). Целевой слот занят тем же видом — доливает до
-/// предела стака, остаток возвращается в источник; другим предметом —
+/// Перенос стека между слотами станции и misc захваченного существа
+/// (команда `StationMoveItem`). Целевой слот занят тем же видом — доливает
+/// до предела стака, остаток возвращается в источник; другим предметом —
 /// меняет местами, если предмет источника допустим в целевом слоте и
 /// наоборот. `true` — содержимое изменилось.
+///
+/// Контейнер и инвентарь существа — разные поля `World`, поэтому заём
+/// берётся заново на каждую мутацию (`container_at_mut` / `get_mut`):
+/// долгоживущий заём контейнера блокировал бы доступ к существам.
 fn station_move_item(
     world: &mut World,
-    mut player: Option<&mut Player>,
+    actor: Option<u64>,
     pos: TilePos,
     from: (u8, u8),
     to: (u8, u8),
     count: u8,
 ) -> bool {
+    // Действия с misc возможны только у существа с «умом».
+    let Some(actor) = actor else {
+        return false;
+    };
     let Some(kind) = world.object_at(pos).map(|o| o.kind) else {
         return false;
     };
-    let Some(container) = containers::container_at_mut(world, pos) else {
+    let Some(container) = containers::container_at(world, pos) else {
         // Станции с контейнером нет (верстак/кузнечный стол — их сетка
         // живёт в UI), перенос мимо контейнера невозможен.
         return false;
     };
     // Снимок входов до мутаций: изменение входа сбрасывает идущую готовку.
     let inputs_before = containers::input_snapshot(kind, container);
+    // Заём `container` заканчивается на этом утверждении: дальше контейнер
+    // берётся заново на каждую мутацию, чтобы не блокировать существ. 
 
     // Читаем источник.
     let source = if from.0 == containers::SLOT_AREA_PLAYER_MISC {
-        let Some(player) = player.as_deref_mut() else {
-            return false;
-        };
         let slot = usize::from(from.1);
         if slot >= MISC_SLOTS {
             return false;
         }
-        player.inventory.items[slot]
+        let Some(m) = mind_of(world, actor) else {
+            return false;
+        };
+        m.inventory.items[slot]
     } else {
-        container.get(usize::from(from.0))
+        match containers::container_at(world, pos) {
+            Some(c) => c.get(usize::from(from.0)),
+            None => return false,
+        }
     };
     let Some(source) = source else {
         return false;
@@ -546,7 +536,7 @@ fn station_move_item(
     let moving = ItemStack { kind: source.kind, count: amount };
     let left_in_source = source.count - amount;
 
-    // Правило целевого слота. Кодировка адреса: misc игрока — (0xFF, индекс),
+    // Правило целевого слота. Кодировка адреса: misc актора — (0xFF, индекс),
     // слот контейнера — (индекс слота, 0).
     let target_is_player = to.0 == containers::SLOT_AREA_PLAYER_MISC;
     let target_slot = if target_is_player {
@@ -565,8 +555,11 @@ fn station_move_item(
     // Применяем: сначала снимаем источник (полностью, долив вернём).
     if from.0 == containers::SLOT_AREA_PLAYER_MISC {
         let slot = usize::from(from.1);
-        player.as_deref_mut().unwrap().inventory.items[slot] = None;
-    } else {
+        let Some(m) = mind_of(world, actor) else {
+            return false;
+        };
+        m.inventory.items[slot] = None;
+    } else if let Some(container) = containers::container_at_mut(world, pos) {
         container.take(usize::from(from.0));
     }
     let mut back_to_source = (left_in_source > 0).then_some(ItemStack {
@@ -576,8 +569,10 @@ fn station_move_item(
     let mut changed = true;
 
     if target_is_player {
-        let player = player.as_deref_mut().unwrap();
-        let slot = &mut player.inventory.items[target_slot];
+        let Some(m) = mind_of(world, actor) else {
+            return false;
+        };
+        let slot = &mut m.inventory.items[target_slot];
         match *slot {
             None => *slot = Some(moving),
             Some(mut existing) if existing.kind == moving.kind => {
@@ -603,6 +598,9 @@ fn station_move_item(
             }
         }
     } else {
+        let Some(container) = containers::container_at_mut(world, pos) else {
+            return false;
+        };
         let target_index = target_slot;
         match container.get(target_index) {
             None => {
@@ -629,7 +627,7 @@ fn station_move_item(
                 };
                 if source_ok && left_in_source == 0 {
                     // Слот занят: именно replace, а не put — put кладёт только
-                    // в пустой слот, и стек молча терялся (предмет игрока
+                    // в пустой слот, и стек молча терялся (предмет актора
                     // исчезал, а на его место приезжал предмет контейнера).
                     container.replace(target_index, moving);
                     back_to_source = Some(existing);
@@ -643,14 +641,19 @@ fn station_move_item(
 
     // Вход изменился (забрали/заменили) — прогресс жарки сбрасывается;
     // поджиг с новым предметом сделает wake_station вызывающей стороны.
-    containers::reset_cooking_if_inputs_changed(kind, container, &inputs_before);
+    if let Some(container) = containers::container_at_mut(world, pos) {
+        containers::reset_cooking_if_inputs_changed(kind, container, &inputs_before);
+    }
 
     // Возврат остатка в источник.
     if let Some(rest) = back_to_source {
         if from.0 == containers::SLOT_AREA_PLAYER_MISC {
             let slot = usize::from(from.1);
-            player.unwrap().inventory.items[slot] = Some(rest);
-        } else {
+            let Some(m) = mind_of(world, actor) else {
+                return false;
+            };
+            m.inventory.items[slot] = Some(rest);
+        } else if let Some(container) = containers::container_at_mut(world, pos) {
             container.put(usize::from(from.0), rest);
         }
     }
@@ -659,7 +662,7 @@ fn station_move_item(
 
 /// Кладёт стек предметов на тайл: в пустой — целиком, в стек того же вида —
 /// доливает. `false` — тайл вне мира или занят другим предметом/переполнен.
-fn try_place_item(world: &mut World, pos: TilePos, stack: ItemStack) -> bool {
+pub(crate) fn try_place_item(world: &mut World, pos: TilePos, stack: ItemStack) -> bool {
     if !in_bounds(world, pos) || stack.count == 0 || stack.count > MAX_STACK {
         return false;
     }

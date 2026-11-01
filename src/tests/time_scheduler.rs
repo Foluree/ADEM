@@ -158,14 +158,20 @@ fn simulation_speed_options_include_high_speeds() {
             .iter()
             .map(|speed| speed.label())
             .collect::<Vec<_>>(),
-        ["x7.5", "x10", "x12.5", "x15", "x20"]
+        [
+            "x7.5", "x10", "x12.5", "x15", "x20", "x25", "x30", "x35", "x40", "x45", "x50",
+            "x60", "x70", "x80", "x90", "x100"
+        ]
     );
     assert_eq!(
         high_speeds
             .iter()
             .map(|speed| speed.multiplier())
             .collect::<Vec<_>>(),
-        [7.5, 10.0, 12.5, 15.0, 20.0]
+        [
+            7.5, 10.0, 12.5, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 60.0, 70.0, 80.0,
+            90.0, 100.0
+        ]
     );
 }
 

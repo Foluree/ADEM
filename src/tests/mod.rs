@@ -3,6 +3,7 @@
 //! через `#[path]`, но их файлы также хранятся в этой папке.
 //! Включаются только в `cargo test` (через `#[cfg(test)] mod tests` в main.rs).
 
+mod ai;
 mod armor;
 mod build;
 mod clothes;

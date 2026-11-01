@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use bevy::prelude::*;
 
 use crate::app::settings::Settings;
-use crate::app::state::{ClockRes, GameMode, GameState, PlayerRes, SchedulerRes, TickAccumulator};
+use crate::app::state::{ClockRes, GameState, SchedulerRes, TickAccumulator};
 use crate::simulation::save::{self, SaveHeader};
-use crate::simulation::{GameClock, WorldPos};
+use crate::simulation::GameClock;
 use crate::ui::pause_menu::{
     PauseMenuRoot, PauseMenuView, SaveStatusText, SlotLabel, close_menu, set_status_text,
     slot_label,
@@ -80,7 +80,6 @@ fn handle_save_request(
     state: Res<GameState>,
     clock: Res<ClockRes>,
     sched: Res<SchedulerRes>,
-    player: Res<PlayerRes>,
     status: Query<Entity, With<SaveStatusText>>,
     mut texts: Query<&mut Text, Without<SlotLabel>>,
     mut slot_labels: Query<(&SlotLabel, &mut Text)>,
@@ -91,13 +90,8 @@ fn handle_save_request(
             set_status_text(&status, &mut texts, "Мир ещё не создан");
             continue;
         };
-        let bytes = save::save_game(
-            world,
-            &clock.0,
-            &sched.0,
-            player.0.as_ref(),
-            crate::app::GAME_VERSION,
-        );
+        let bytes =
+            save::save_game(world, &clock.0, &sched.0, crate::app::GAME_VERSION);
         let path = slot_path(slot);
         let result = fs::create_dir_all(saves_dir()).and_then(|_| fs::write(&path, &bytes));
         match result {
@@ -131,7 +125,6 @@ fn handle_load_request(
     mut clock: ResMut<ClockRes>,
     mut sched: ResMut<SchedulerRes>,
     mut acc: ResMut<TickAccumulator>,
-    mut player: ResMut<PlayerRes>,
     settings: Res<Settings>,
     status: Query<Entity, With<SaveStatusText>>,
     mut texts: Query<&mut Text, Without<SlotLabel>>,
@@ -164,23 +157,10 @@ fn handle_load_request(
         // Аккумулятор старого мира не переносится: тики начинаются с файла.
         acc.seconds = 0.0;
         state.pending_rerender = true;
-        // Игрок восстанавливается из сохранения целиком (позиция, hp, голод,
-        // инвентарь): существо в слоте — часть сохранённого состояния. Если
-        // в слоте игрока не было, существо исчезает; управляемый режим без
-        // существа невозможен — возвращаемся к наблюдателю.
-        player.0 = loaded.player;
-        // Мир в слоте мог быть меньше текущего: зажимаем игрока в границы
-        // (как при смене размера мира) и сбрасываем сегмент интерполяции.
-        if let Some(p) = player.0.as_mut() {
-            let max = size.tiles() as f32;
-            p.teleport_to(WorldPos {
-                x: p.pos.x.clamp(0.0, max),
-                y: p.pos.y.clamp(0.0, max),
-            });
-        }
-        if player.0.is_none() && state.mode == GameMode::Player {
-            state.mode = GameMode::Observer;
-        }
+        // Захваченное существо — часть мира, но после загрузки контроллер
+        // теряется: id могли переоткрыться в другом мире. Управление всегда
+        // начинается с наблюдателя — существо можно захватить заново по F1.
+        state.set_controlled(None);
         close_menu(&mut commands, &roots, &mut state, &mut view, &settings);
     }
 }

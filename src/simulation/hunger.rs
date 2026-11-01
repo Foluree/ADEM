@@ -26,6 +26,15 @@ const STARVE_DAMAGE_INTERVAL_TICKS: u32 = 50;
 /// Кулдаун поедания еды в тиках: следующая еда не раньше этого смещения.
 pub const EAT_COOLDOWN_TICKS: u64 = 50;
 
+/// Интервал пассивной регенерации, тиков: сытый организм раз в столько
+/// тиков тратит сытость на восстановление здоровья.
+const REGEN_INTERVAL_TICKS: u32 = 200;
+/// Порог сытости для регенерации: восстанавливаться может только сытость
+/// выше него.
+const REGEN_HUNGER_THRESHOLD: f32 = 80.0;
+/// Цена 1.0 HP в единицах сытости.
+const REGEN_HUNGER_COST: f32 = 2.0;
+
 /// Активность существа за тик — определяет расход сытости.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Activity {
@@ -46,26 +55,39 @@ fn drain_per_tick(activity: Activity) -> f32 {
     }
 }
 
-/// Состояние голода одного существа: текущая сытость и счётчик тиков
-/// непрерывного голода с последнего урона. Копия — потребности простые.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Состояние голода одного существа: текущая сытость, счётчик тиков
+/// непрерывного голода с последнего урона и счётчик до следующей
+/// пассивной регенерации. Копия — потребности простые.
+#[derive(Clone, Copy, Debug)]
 pub struct Hunger {
     /// Текущая сытость, всегда в [0, HUNGER_MAX].
     value: f32,
     /// Тики непрерывного голода (ниже порога) с последнего урона.
     starve_ticks: u32,
+    /// Тики до следующей попытки регенерации. Transient: в сейв не
+    /// пишется (после загрузки отсчёт начинается заново — погрешность
+    /// в несколько секунд несущественна).
+    regen_ticks: u32,
+}
+
+/// Равенство — только по сытости: счётчики тиков transient (в сейв не
+/// пишутся), сравнивать roundtrip сохранения по ним нельзя.
+impl PartialEq for Hunger {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
 }
 
 impl Hunger {
     /// Новый сытый голод.
     pub fn new() -> Self {
-        Self { value: HUNGER_MAX, starve_ticks: 0 }
+        Self { value: HUNGER_MAX, starve_ticks: 0, regen_ticks: 0 }
     }
 
     /// Голод с заданным начальным значением (восстановление сохранения).
     /// Значение зажимается в допустимый диапазон.
     pub fn with_value(value: f32) -> Self {
-        Self { value: value.clamp(0.0, HUNGER_MAX), starve_ticks: 0 }
+        Self { value: value.clamp(0.0, HUNGER_MAX), starve_ticks: 0, regen_ticks: 0 }
     }
 
     /// Текущая сытость.
@@ -94,5 +116,24 @@ impl Hunger {
     /// Счётчик урона сбросится сам на ближайшем тике выше порога.
     pub fn eat(&mut self, food_value: f32) {
         self.value = (self.value + food_value).min(HUNGER_MAX);
+    }
+
+    /// Пассивная регенерация сытого организма: при сытости выше порога и
+    /// неполном здоровье раз в `REGEN_INTERVAL_TICKS` тратит
+    /// `REGEN_HUNGER_COST` сытости на 1.0 HP (полное HP — скип).
+    /// Вызывается раз за тик существа тем же кодом, что и `tick`.
+    /// Возвращает `true`, если восстановил.
+    pub fn regen(&mut self, hp: &mut f32, max_hp: f32) -> bool {
+        self.regen_ticks += 1;
+        if self.regen_ticks < REGEN_INTERVAL_TICKS {
+            return false;
+        }
+        self.regen_ticks = 0;
+        if self.value <= REGEN_HUNGER_THRESHOLD || *hp >= max_hp {
+            return false;
+        }
+        self.value = (self.value - REGEN_HUNGER_COST).max(0.0);
+        *hp = (*hp + 1.0).min(max_hp);
+        true
     }
 }

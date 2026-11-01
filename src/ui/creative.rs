@@ -17,7 +17,7 @@ use bevy::ui::{Overflow, RelativeCursorPosition, ScrollPosition};
 use bevy::ui_widgets::{Activate, Button, TextInput};
 
 use crate::app::settings::{ControlAction, Settings};
-use crate::app::state::{GameState, MenuKind, PlayerRes};
+use crate::app::state::{GameState, MenuKind};
 use crate::simulation::items::{ItemKind, ItemStack, MISC_SLOTS};
 use crate::ui::UiFont;
 use crate::ui::cursor_over_node;
@@ -106,7 +106,6 @@ fn toggle_creative(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<GameState>,
-    player: Res<PlayerRes>,
     inventory: Res<InventoryUi>,
     settings: Res<Settings>,
     capture: Res<BindingCapture>,
@@ -141,8 +140,8 @@ fn toggle_creative(
         state.active_menu = None;
         return;
     }
-    // Без существа игрока меню бесполезно: выдавать предметы некому.
-    if player.0.is_none() {
+    // Без разумного существа меню бесполезно: выдавать предметы некому.
+    if state.controlled_mind().is_none() {
         return;
     }
 
@@ -339,8 +338,7 @@ fn apply_creative_search(
 /// фокус в поле поиска, цифры принадлежат вводу текста.
 fn creative_digit_pickup(
     keys: Res<ButtonInput<KeyCode>>,
-    state: Res<GameState>,
-    mut player: ResMut<PlayerRes>,
+    mut state: ResMut<GameState>,
     windows: Query<&Window>,
     tiles: Query<(&CreativeTile, &ComputedNode, &UiGlobalTransform)>,
     focus: Res<InputFocus>,
@@ -358,7 +356,7 @@ fn creative_digit_pickup(
     if digit >= MISC_SLOTS {
         return;
     }
-    let Some(p) = player.0.as_mut() else {
+    let Some(p) = state.controlled_mind_mut() else {
         return;
     };
     let Ok(window) = windows.single() else {
@@ -439,9 +437,8 @@ fn spawn_tile(
 /// глобальное событие, его шлют и все остальные кнопки UI.
 fn on_tile_activated(
     activate: On<Activate>,
-    state: Res<GameState>,
+    mut state: ResMut<GameState>,
     tiles: Query<&CreativeTile>,
-    mut player: ResMut<PlayerRes>,
 ) {
     if state.active_menu != Some(MenuKind::Creative) {
         return;
@@ -449,7 +446,7 @@ fn on_tile_activated(
     let Ok(tile) = tiles.get(activate.entity) else {
         return;
     };
-    let Some(p) = player.0.as_mut() else {
+    let Some(p) = state.controlled_mind_mut() else {
         return;
     };
     p.inventory.add(tile.kind, tile.kind.max_stack());

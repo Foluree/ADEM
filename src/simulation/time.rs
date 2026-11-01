@@ -134,6 +134,13 @@ pub fn month_of_tick(tick: u64) -> u32 {
     (tick * GAME_SECS_PER_TICK as u64 / SECS_PER_MONTH) as u32
 }
 
+/// Час суток по тику (для систем внутри симуляции, у которых нет доступа
+/// к часам — например, ИИ людей): тот же расчёт, что у
+/// `GameClock::hour_of_day`.
+pub fn hour_of_tick(tick: u64) -> u32 {
+    ((tick.wrapping_mul(GAME_SECS_PER_TICK as u64) % SECS_PER_DAY) / SECS_PER_HOUR) as u32
+}
+
 /// Тик следующей границы часа строго после `after_tick`
 /// (момент события `TimeOfDayChanged`).
 pub fn next_hour_tick(after_tick: u64) -> u64 {

@@ -10,7 +10,7 @@ use crate::simulation::world::{TilePos, World, WorldSize};
 #[test]
 fn wolf_spawns_with_hp_and_unique_id() {
     use crate::simulation::entities::EntityKind;
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     let mut world = World::new(WorldSize::new(256), 1);
     let first = world
@@ -34,7 +34,7 @@ fn wolf_spawns_with_hp_and_unique_id() {
 #[test]
 fn wolf_always_stands_between_walking_and_lying() {
     use crate::simulation::entities::{EntityKind, EntityState};
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     let mut world = World::new(WorldSize::new(256), 7);
     world
@@ -47,7 +47,7 @@ fn wolf_always_stands_between_walking_and_lying() {
     let mut seen_lying = false;
 
     for tick in 1..=30_000_u64 {
-        world.tick_entities(tick);
+        world.tick_entities(tick, None);
         let state = world.entities.entities[0].state;
         assert!(
             !matches!(
@@ -74,7 +74,7 @@ fn wolf_always_stands_between_walking_and_lying() {
 #[test]
 fn wolf_never_enters_deep_water() {
     use crate::simulation::entities::{EntityKind, EntityState};
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     let mut world = World::new(WorldSize::new(256), 3);
     for y in 0..256 {
@@ -86,7 +86,7 @@ fn wolf_never_enters_deep_water() {
 
     let mut seen_walking = false;
     for tick in 1..=5000_u64 {
-        world.tick_entities(tick);
+        world.tick_entities(tick, None);
         let wolf = &world.entities.entities[0];
         assert!(
             wolf.pos.x.floor() < 20.0,
@@ -102,7 +102,7 @@ fn wolf_never_enters_deep_water() {
 #[test]
 fn wolf_walk_animation_frame_changes_every_half_second() {
     use crate::simulation::entities::{EntityKind, EntityState};
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     let mut world = World::new(WorldSize::new(256), 1);
     world
@@ -123,7 +123,7 @@ fn wolf_walk_animation_frame_changes_every_half_second() {
 #[test]
 fn wolf_walks_toward_target_and_turns() {
     use crate::simulation::entities::{EntityKind, EntityState, Facing};
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     let mut world = World::new(WorldSize::new(256), 1);
     world
@@ -137,7 +137,7 @@ fn wolf_walks_toward_target_and_turns() {
         wolf.target = WorldPos { x: 90.5, y: 100.5 };
     }
 
-    world.tick_entities(1);
+    world.tick_entities(1, None);
     let wolf = &world.entities.entities[0];
     assert_eq!(wolf.facing, Facing::Left);
     assert!(
@@ -150,7 +150,7 @@ fn wolf_walks_toward_target_and_turns() {
         let wolf = &mut world.entities.entities[0];
         wolf.target = WorldPos { x: 110.5, y: 100.5 };
     }
-    world.tick_entities(2);
+    world.tick_entities(2, None);
     let wolf = &world.entities.entities[0];
     assert_eq!(wolf.facing, Facing::Right);
 }
@@ -183,7 +183,7 @@ fn spawn_entity_command_places_wolf_at_tile_center() {
 fn remove_entity_command_deletes_by_id() {
     use crate::simulation::commands::{Command, CommandQueue};
     use crate::simulation::entities::EntityKind;
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     let mut world = World::new(WorldSize::new(256), 1);
     let mut queue = CommandQueue::default();
@@ -208,7 +208,7 @@ fn remove_entity_command_deletes_by_id() {
 fn move_entity_command_places_and_stands() {
     use crate::simulation::commands::{Command, CommandQueue};
     use crate::simulation::entities::{EntityKind, EntityState};
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     let mut world = World::new(WorldSize::new(256), 1);
     let mut queue = CommandQueue::default();
@@ -233,7 +233,7 @@ fn move_entity_command_places_and_stands() {
 #[test]
 fn wolf_never_rests_in_water() {
     use crate::simulation::entities::{EntityKind, EntityState};
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     let mut world = World::new(WorldSize::new(256), 5);
     for y in 50..55 {
@@ -247,7 +247,7 @@ fn wolf_never_rests_in_water() {
 
     let mut left_water = false;
     for tick in 1..=3000_u64 {
-        world.tick_entities(tick);
+        world.tick_entities(tick, None);
         let wolf = &world.entities.entities[0];
         let tile = TilePos {
             x: wolf.pos.x.floor() as i32,
@@ -271,7 +271,7 @@ fn wolf_never_rests_in_water() {
 #[test]
 fn wolf_water_panic_retargets_nearest_land() {
     use crate::simulation::entities::{EntityKind, EntityState};
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     let mut world = World::new(WorldSize::new(256), 5);
     for y in 50..55 {
@@ -291,7 +291,7 @@ fn wolf_water_panic_retargets_nearest_land() {
         wolf.water_ticks = u16::MAX;
     }
 
-    world.tick_entities(1);
+    world.tick_entities(1, None);
     let wolf = &world.entities.entities[0];
     let target = TilePos {
         x: wolf.target.x.floor() as i32,
@@ -306,7 +306,7 @@ fn wolf_water_panic_retargets_nearest_land() {
 #[test]
 fn wolf_slows_down_on_mountain_and_in_shallow_water() {
     use crate::simulation::entities::{EntityKind, EntityState};
-    use crate::simulation::player::WorldPos;
+    use crate::simulation::world::WorldPos;
 
     // Гора: шаг 0.2 / MOUNTAIN_SLOWDOWN = 0.1 тайла за тик.
     let mut world = World::new(WorldSize::new(256), 1);
@@ -322,7 +322,7 @@ fn wolf_slows_down_on_mountain_and_in_shallow_water() {
         wolf.state_duration = 1000;
         wolf.target = WorldPos { x: 110.5, y: 100.5 };
     }
-    world.tick_entities(1);
+    world.tick_entities(1, None);
     let wolf = &world.entities.entities[0];
     assert!(
         (wolf.pos.x - 100.6).abs() < 1e-5,
@@ -344,7 +344,7 @@ fn wolf_slows_down_on_mountain_and_in_shallow_water() {
         wolf.state_duration = 1000;
         wolf.target = WorldPos { x: 110.5, y: 110.5 };
     }
-    world.tick_entities(1);
+    world.tick_entities(1, None);
     let wolf = &world.entities.entities[0];
     let expected = 100.5 + 0.2 / 3.0;
     assert!(

@@ -41,16 +41,17 @@ fn save_roundtrip_world() {
     // Немного поживём: существа должны попасть в файл в произвольных
     // состояниях, а не только в стартовом «стоит».
     for tick in 0..300 {
-        world.tick_entities(tick);
+        world.tick_entities(tick, None);
     }
-    // Боевые данные: снаряд в полёте и воткнутое копьё (формат v5).
+    // Боевые данные: снаряд в полёте (без стрелка) и воткнутое копьё.
     world.spawn_projectile(
         crate::simulation::ProjectileKind::Arrow,
-        crate::simulation::player::WorldPos { x: 50.5, y: 60.0 },
-        crate::simulation::player::WorldPos { x: 60.5, y: 60.0 },
+        crate::simulation::world::WorldPos { x: 50.5, y: 60.0 },
+        crate::simulation::world::WorldPos { x: 60.5, y: 60.0 },
+        0,
     );
     world.stuck_spears.push(crate::simulation::StuckSpear {
-        pos: crate::simulation::player::WorldPos { x: 70.5, y: 80.5 },
+        pos: crate::simulation::world::WorldPos { x: 70.5, y: 80.5 },
         heading: 1.0,
         pitch: 0.7,
     });
@@ -62,7 +63,7 @@ fn save_roundtrip_world() {
     scheduler.cancel(cancelled);
     scheduler.schedule_at(clock.tick + 3, crate::simulation::TaskKind::Marker(8));
 
-    let bytes = save_game(&world, &clock, &scheduler, None, "0.1.0");
+    let bytes = save_game(&world, &clock, &scheduler, "0.1.0");
     let loaded = load_game(&bytes).expect("сохранение должно разбираться");
 
     assert_eq!(loaded.seed, world.seed);
@@ -97,7 +98,7 @@ fn save_roundtrip_scheduler_continues() {
     scheduler.schedule_at(tick + 2, TaskKind::Marker(2));
     scheduler.schedule_at(tick + 10_000, TaskKind::Marker(3));
 
-    let bytes = save_game(&world, &GameClock { tick }, &scheduler, None, "0.1.0");
+    let bytes = save_game(&world, &GameClock { tick }, &scheduler, "0.1.0");
     let mut loaded = load_game(&bytes).expect("сохранение должно разбираться");
 
     let mut executed: Vec<TaskKind> = Vec::new();
@@ -126,7 +127,7 @@ fn save_rejects_task_chunk_outside_world() {
         TaskKind::GrassSpread { chunk: ChunkPos { x: 999, y: 999 }, local_index: 0 },
     );
 
-    let bytes = save_game(&world, &GameClock { tick }, &scheduler, None, "0.1.0");
+    let bytes = save_game(&world, &GameClock { tick }, &scheduler, "0.1.0");
     assert!(
         matches!(load_game(&bytes), Err(SaveError::BadData("чанк задачи вне мира"))),
         "чанк вне мира должен быть отклонён при загрузке"
@@ -140,7 +141,7 @@ fn save_header_reads_from_prefix() {
     use crate::simulation::time::GameClock;
 
     let world = generate_world(WorldSize::new(256), 11);
-    let bytes = save_game(&world, &GameClock { tick: 777 }, &crate::simulation::Scheduler::default(), None, "0.1.0");
+    let bytes = save_game(&world, &GameClock { tick: 777 }, &crate::simulation::Scheduler::default(), "0.1.0");
 
     // Префикс меньше тела: заголовок занимает лишь несколько десятков байт.
     let header = read_header(&bytes[..64]).expect("заголовок разбирается из префикса");
@@ -192,7 +193,7 @@ fn save_roundtrip_vegetation_tasks() {
     scheduler.schedule_at(tick + 20, TaskKind::BushGrowth { chunk: ChunkPos { x: 3, y: 4 } });
     scheduler.schedule_at(tick + 30, TaskKind::WaterErosion { chunk: ChunkPos { x: 5, y: 6 }, local_index: 9 });
 
-    let bytes = save_game(&world, &GameClock { tick }, &scheduler, None, "0.1.0");
+    let bytes = save_game(&world, &GameClock { tick }, &scheduler, "0.1.0");
     let loaded = load_game(&bytes).expect("сохранение должно разбираться");
     assert_eq!(scheduler.snapshot(), loaded.scheduler.snapshot());
 }
@@ -201,9 +202,9 @@ fn save_roundtrip_vegetation_tasks() {
 #[test]
 fn save_roundtrip_entity_hp_and_water_ticks() {
     use crate::simulation::entities::EntityKind;
-    use crate::simulation::player::WorldPos;
     use crate::simulation::save::{load_game, save_game};
     use crate::simulation::time::GameClock;
+    use crate::simulation::world::WorldPos;
 
     let mut world = crate::simulation::World::new(WorldSize::new(256), 1);
     world
@@ -219,7 +220,6 @@ fn save_roundtrip_entity_hp_and_water_ticks() {
         &world,
         &GameClock { tick: 0 },
         &crate::simulation::Scheduler::default(),
-        None,
         "0.1.0",
     );
     let loaded = load_game(&bytes).expect("сохранение должно разбираться");
@@ -228,64 +228,76 @@ fn save_roundtrip_entity_hp_and_water_ticks() {
     assert_eq!(wolf.water_ticks, 37);
 }
 
-/// Игрок переживает сохранение: позиция, hp, голод, инвентарь со всеми
-/// секциями (включая надетую кольчугу и мусорку). Кулдауны при загрузке
-/// сбрасываются, счётчик голодного урона начинается с нуля.
+/// Человек с «умом» переживает сохранение: позиция, hp, голод, выбранный
+/// слот хотбара, инвентарь со всеми секциями (включая надетую кольчугу и
+/// мусорку). Кулдауны и цель ИИ — transient: при загрузке сбрасываются.
+/// Повторное сохранение загруженного мира даёт те же байты.
 #[test]
-fn save_roundtrip_player() {
+fn save_roundtrip_human_mind() {
+    use crate::simulation::entities::{EntityKind, HumanGoal};
     use crate::simulation::hunger::Hunger;
     use crate::simulation::items::{Inventory, ItemKind, ItemStack, SlotArea, SlotRef};
-    use crate::simulation::player::{Player, WorldPos};
     use crate::simulation::save::{load_game, save_game};
     use crate::simulation::time::GameClock;
+    use crate::simulation::world::WorldPos;
 
-    let world = crate::simulation::World::new(WorldSize::new(256), 1);
-    let mut player = Player::new(WorldPos { x: 33.5, y: 44.5 });
-    player.hp = 87.5;
-    player.hunger = Hunger::with_value(42.0);
-    player.selected_slot = 3;
-    player.inventory.add(ItemKind::Apple, 7);
-    player.inventory.add(ItemKind::Stick, 2);
-    // Надетая кольчуга: каждый предмет в свой слот брони (секция отдельная,
-    // предметы в misc не мешают).
-    let armor = SlotRef { area: SlotArea::Armor, index: 0 };
-    player.inventory.put(
-        armor,
-        ItemStack { kind: ItemKind::HelmetChainmail, count: 1 },
-    );
-    player.inventory.put(
-        SlotRef { area: SlotArea::Armor, index: 1 },
-        ItemStack { kind: ItemKind::ChestplateChainmail, count: 1 },
-    );
-    player.inventory.put(
-        SlotRef { area: SlotArea::Armor, index: 3 },
-        ItemStack { kind: ItemKind::BootsChainmail, count: 1 },
-    );
-    // Мусорка с затёртым стеком.
-    player.inventory.trash = Some(ItemStack { kind: ItemKind::Rock, count: 5 });
-    // Кулдауны «горячие» на момент сохранения — в файл не пишутся.
-    player.attack_ready_tick = 1000;
-    player.eat_ready_tick = 2000;
+    let mut world = crate::simulation::World::new(WorldSize::new(256), 1);
+    let human = world
+        .entities
+        .spawn(EntityKind::Human, WorldPos { x: 33.5, y: 44.5 });
+    {
+        let entity = world.entities.get_mut(human).unwrap();
+        entity.hp = 87.5;
+        entity.hunger = Hunger::with_value(42.0);
+        let mind = entity.mind.as_mut().unwrap();
+        mind.selected_slot = 3;
+        mind.inventory.add(ItemKind::Apple, 7);
+        mind.inventory.add(ItemKind::Stick, 2);
+        // Надетая кольчуга: каждый предмет в свой слот брони (секция
+        // отдельная, предметы в misc не мешают).
+        mind.inventory.put(
+            SlotRef { area: SlotArea::Armor, index: 0 },
+            ItemStack { kind: ItemKind::HelmetChainmail, count: 1 },
+        );
+        mind.inventory.put(
+            SlotRef { area: SlotArea::Armor, index: 1 },
+            ItemStack { kind: ItemKind::ChestplateChainmail, count: 1 },
+        );
+        mind.inventory.put(
+            SlotRef { area: SlotArea::Armor, index: 3 },
+            ItemStack { kind: ItemKind::BootsChainmail, count: 1 },
+        );
+        // Мусорка с затёртым стеком.
+        mind.inventory.trash = Some(ItemStack { kind: ItemKind::Rock, count: 5 });
+        // Кулдауны и цель ИИ «горячие» на момент сохранения — в файл
+        // не пишутся.
+        mind.attack_ready_tick = 1000;
+        mind.eat_ready_tick = 2000;
+        mind.goal = Some(HumanGoal::Food(crate::simulation::TilePos { x: 1, y: 2 }));
+        mind.next_think_tick = 3000;
+    }
 
     let bytes = save_game(
         &world,
         &GameClock { tick: 0 },
         &crate::simulation::Scheduler::default(),
-        Some(&player),
         "0.1.0",
     );
     let loaded = load_game(&bytes).expect("сохранение должно разбираться");
-    let restored = loaded.player.expect("игрок должен сохраниться");
+    let entity = loaded.world.entities.get(human).expect("человек должен сохраниться");
+    assert_eq!(entity.pos.x, 33.5);
+    assert_eq!(entity.pos.y, 44.5);
+    assert_eq!(entity.prev_pos, entity.pos, "интерполяция начинается с места");
+    assert_eq!(entity.hp, 87.5);
+    let restored = entity.mind.as_ref().expect("ум человека должен сохраниться");
 
-    assert_eq!(restored.pos.x, 33.5);
-    assert_eq!(restored.pos.y, 44.5);
-    assert_eq!(restored.prev_pos, restored.pos, "интерполяция начинается с места");
-    assert_eq!(restored.hp, 87.5);
-    assert_eq!(restored.hunger, Hunger::with_value(42.0));
+    assert_eq!(entity.hunger, Hunger::with_value(42.0));
     assert_eq!(restored.selected_slot, 3);
-    // Кулдауны сброшены.
+    // Кулдауны и цель ИИ сброшены.
     assert_eq!(restored.attack_ready_tick, 0);
     assert_eq!(restored.eat_ready_tick, 0);
+    assert_eq!(restored.goal, None);
+    assert_eq!(restored.next_think_tick, 0);
 
     let inv: &Inventory = &restored.inventory;
     assert_eq!(inv.count_of(ItemKind::Apple), 7);
@@ -306,32 +318,40 @@ fn save_roundtrip_player() {
     // Секция одежды существует и пуста (предметов одежды пока нет).
     assert_eq!(restored.inventory.clothes, [None; 4]);
 
-    // Скрытый проверочный разбор: сохранение без игрока даёт None.
-    let bytes = save_game(
-        &world,
-        &GameClock { tick: 0 },
-        &crate::simulation::Scheduler::default(),
-        None,
+    // Roundtrip побайтово: transient-поля в файл не пишутся, поэтому
+    // повторное сохранение загруженного мира воспроизводит те же байты.
+    let again = save_game(
+        &loaded.world,
+        &GameClock { tick: loaded.tick },
+        &loaded.scheduler,
         "0.1.0",
     );
-    let loaded = load_game(&bytes).expect("сохранение должно разбираться");
-    assert!(loaded.player.is_none(), "без игрока поле пустое");
+    assert_eq!(bytes, again, "сохранение должно воспроизводиться побайтово");
 }
 
-/// Предмет не своего класса в слоте одежды не проходит загрузку: битый
-/// файл не должен надеть на игрока яблоко вместо одежды (формат v7).
+/// Волк сохраняется без «ума», человек — с ним: рассинхрон вида и данных
+/// не проходит загрузку (битый файл не может сделать волка разумным).
 #[test]
 fn save_rejects_wrong_item_in_clothes_slot() {
+    use crate::simulation::entities::EntityKind;
     use crate::simulation::items::ItemKind;
-    use crate::simulation::player::{Player, WorldPos};
     use crate::simulation::save::{SaveError, load_game, save_game};
     use crate::simulation::time::GameClock;
+    use crate::simulation::world::WorldPos;
 
-    let world = crate::simulation::World::new(crate::simulation::WorldSize::new(256), 1);
-    let mut player = Player::new(WorldPos { x: 0.5, y: 0.5 });
+    let mut world = crate::simulation::World::new(crate::simulation::WorldSize::new(256), 1);
+    let human = world.entities.spawn(EntityKind::Human, WorldPos { x: 0.5, y: 0.5 });
     // Прямая кладка в слот одежды минует `accepts` (UI так не умеет,
     // а битый файл — может).
-    player.inventory.clothes[0] = Some(crate::simulation::ItemStack {
+    world
+        .entities
+        .get_mut(human)
+        .unwrap()
+        .mind
+        .as_mut()
+        .unwrap()
+        .inventory
+        .clothes[0] = Some(crate::simulation::ItemStack {
         kind: ItemKind::Apple,
         count: 1,
     });
@@ -340,7 +360,6 @@ fn save_rejects_wrong_item_in_clothes_slot() {
         &world,
         &GameClock { tick: 0 },
         &crate::simulation::Scheduler::default(),
-        Some(&player),
         "0.1.0",
     );
     assert!(
@@ -387,7 +406,7 @@ fn save_roundtrip_crops_containers_and_item_entities() {
     // Планировщик должен быть на том же тике, что и часы (проверка load_game).
     let mut sched = crate::simulation::Scheduler::default();
     sched.run_tick(150, |_| {});
-    let bytes = save_game(&world, &GameClock { tick: 150 }, &sched, None, "0.1.0");
+    let bytes = save_game(&world, &GameClock { tick: 150 }, &sched, "0.1.0");
     let saved = load_game(&bytes).expect("roundtrip v2");
     let world = saved.world;
 
