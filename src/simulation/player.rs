@@ -6,8 +6,9 @@
 //! Правила движения и добычи — здесь, чтобы остались в симуляции и были
 //! покрыты тестами.
 
-use super::hunger::{Activity, Hunger, APPLE_FOOD_VALUE};
-use super::items::{Inventory, ItemKind, ItemStack, MISC_SLOTS};
+use super::crops::{Crop, CropKind};
+use super::hunger::{Activity, Hunger};
+use super::items::{Inventory, ItemKind, ItemStack, MISC_SLOTS, ToolClass};
 use super::movement;
 use super::objects::{ObjectKind, WorldObject};
 use super::tile::TileType;
@@ -101,15 +102,16 @@ impl Player {
     }
 
     /// Съедает одну единицу предмета из выбранного слота хотбара и
-    /// восстанавливает сытость. `false` — в руке не еда (пока еда только
-    /// яблоко). Есть можно и при полной сытости: излишек пропадает.
-    /// Кулдаун поедания проверяет команда `PlayerEat` (commands.rs).
+    /// восстанавливает сытость на его питательность (`ItemKind::food_value`).
+    /// `false` — в руке не еда. Есть можно и при полной сытости: излишек
+    /// пропадает. Кулдаун поедания проверяет команда `PlayerEat` (commands.rs).
     pub fn eat_selected(&mut self) -> bool {
         let slot = self.selected_slot.min(MISC_SLOTS - 1);
         let Some(stack) = self.inventory.items[slot] else {
             return false;
         };
-        if stack.kind != ItemKind::Apple {
+        let food = stack.kind.food_value();
+        if food <= 0.0 {
             return false;
         }
         if stack.count == 1 {
@@ -117,7 +119,7 @@ impl Player {
         } else {
             self.inventory.items[slot] = Some(ItemStack { count: stack.count - 1, ..stack });
         }
-        self.hunger.eat(APPLE_FOOD_VALUE);
+        self.hunger.eat(food);
         true
     }
 
@@ -209,7 +211,9 @@ impl Player {
     /// в инвентаре нет места.
     ///
     /// Порядок: объект на тайле (куст, валун) добывается как раньше;
-    /// пустой травяной тайл даёт пучок травы пустой рукой или ножом.
+    /// зрелая культура на пашне убирается; мотыга в руке пашет
+    /// траву/землю в пашню; пустой травяной тайл даёт пучок травы
+    /// пустой рукой или ножом.
     pub fn interact(&mut self, pos: TilePos, world: &mut World) -> bool {
         if !self.reachable(pos, world) {
             return false;
@@ -217,7 +221,90 @@ impl Player {
         if let Some(obj) = world.object_at(pos).copied() {
             return self.harvest_object(pos, obj, world);
         }
+        if world.crop_at(pos).is_some() {
+            return self.harvest_crop(pos, world);
+        }
+        if self.selected_item().is_some_and(|kind| kind.tool_class() == Some(ToolClass::Hoe)) {
+            return self.plow(pos, world);
+        }
         self.gather_grass(pos, world)
+    }
+
+    /// Уборка зрелой культуры: урожай в инвентарь, пашня остаётся.
+    /// Незрелая культура не убирается. `false` — культуры нет, она ещё
+    /// растёт или в инвентаре нет места (тогда культура не теряется).
+    fn harvest_crop(&mut self, pos: TilePos, world: &mut World) -> bool {
+        let Some(crop) = world.crop_at(pos).copied() else {
+            return false;
+        };
+        if !crop.is_mature() {
+            return false;
+        }
+        let yields = crop.kind.harvest_yield();
+        // Место проверяется до уборки: урожай не исчезает «в никуда».
+        for (kind, count) in yields {
+            if count > 0 && !self.inventory.can_fit(kind, count) {
+                return false;
+            }
+        }
+        for (kind, count) in yields {
+            if count > 0 {
+                self.inventory.add(kind, count);
+            }
+        }
+        world.set_crop(pos, None);
+        true
+    }
+
+    /// Посев культуры в пашню предметом из выбранного слота хотбара
+    /// (семена пшеницы/свёклы, корнеплоды, вишня). Списывает один предмет,
+    /// кладёт всходы. Задачу роста ставит команда `PlayerSow` — ей доступен
+    /// планировщик.
+    pub fn sow(&mut self, pos: TilePos, world: &mut World) -> bool {
+        let Some(crop_kind) = self.selected_item().and_then(CropKind::from_seed_item) else {
+            return false;
+        };
+        if !self.reachable(pos, world) {
+            return false;
+        }
+        // Пашня без объекта, культуры и лежащих предметов.
+        if world.terrain_kind(pos) != TileType::Farmland
+            || world.object_at(pos).is_some()
+            || world.crop_at(pos).is_some()
+            || world.item_at(pos).is_some()
+        {
+            return false;
+        }
+        let slot = self.selected_slot.min(MISC_SLOTS - 1);
+        let Some(stack) = self.inventory.items[slot] else {
+            return false;
+        };
+        if stack.count == 1 {
+            self.inventory.items[slot] = None;
+        } else {
+            self.inventory.items[slot] = Some(ItemStack { count: stack.count - 1, ..stack });
+        }
+        world.set_crop(pos, Some(Crop::planted(crop_kind)));
+        true
+    }
+
+    /// Пахота мотыгой: трава, лесная трава, земля или мох становятся
+    /// пашней. Тайл с объектом сюда не попадает (перехвачен `interact`).
+    /// Копание с редким шансом выкапывает странный клубень. `false` —
+    /// тайл не пахотный.
+    fn plow(&mut self, pos: TilePos, world: &mut World) -> bool {
+        if !matches!(
+            world.terrain_kind(pos),
+            TileType::Grass | TileType::ForestGrass | TileType::Dirt | TileType::Moss
+        ) {
+            return false;
+        }
+        world.set_terrain(pos, TileType::Farmland);
+        if dig_roll(world.seed, pos) < STRANGE_TUBER_CHANCE 
+                && self.inventory.can_fit(ItemKind::StrangeTuber, 1) {
+            self.inventory.add(ItemKind::StrangeTuber, 1);
+        }
+        true
     }
 
     /// Сбор яблок с яблони (ПКМ). За одно действие дерево отдаёт одно
@@ -252,10 +339,16 @@ impl Player {
         let Some((resource, amount)) = obj.harvest_yield() else {
             return false;
         };
-        // Добыча камня требует палку или камень в руке (выбранный слот хотбара).
+        // Добыча камня требует класс pickaxe (любая кирка) или по-старому
+        // палку/камень в руке (выбранный слот хотбара).
         if obj.kind == ObjectKind::Rock {
             let selected = self.inventory.items[self.selected_slot.min(MISC_SLOTS - 1)];
-            let ok = matches!(selected.map(|s| s.kind), Some(ItemKind::Stick) | Some(ItemKind::Rock));
+            let ok = matches!(
+                selected.map(|s| s.kind),
+                Some(ItemKind::Stick) | Some(ItemKind::Rock)
+            ) || selected
+                .and_then(|s| s.kind.tool_class())
+                .is_some_and(|class| class == ToolClass::Pickaxe);
             if !ok {
                 return false;
             }
@@ -342,4 +435,19 @@ impl Player {
         }
         Some(world.terrain_kind(TilePos { x: tx, y: ty }))
     }
+}
+
+/// Шанс найти странный клубень при вскапывании тайла мотыгой.
+const STRANGE_TUBER_CHANCE: f32 = 0.04;
+
+/// Детерминированный бросок [0, 1) от (seed, координаты тайла). Пахота
+/// случается с тайлом один раз, поэтому тик не нужен: бросок стабильный
+/// и воспроизводимый после загрузки сохранения.
+fn dig_roll(seed: u64, pos: TilePos) -> f32 {
+    let mut h = seed
+        ^ (pos.x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (pos.y as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = h.wrapping_mul(0xD6E8_FEB8_6659_7B93);
+    h ^= h >> 32;
+    (h >> 40) as f32 / (1u32 << 24) as f32
 }

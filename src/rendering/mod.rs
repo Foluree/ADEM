@@ -23,7 +23,7 @@ use crate::app::input::{PlayerInput, cursor_world_tile};
 use crate::app::state::{GameMode, GameState, PlayerRes, SimTick, TickAccumulator, interpolate_pos, player_render_pos};
 use crate::simulation::commands::buildable_at;
 use crate::simulation::objects::build_cost;
-use crate::simulation::{ChunkPos, EntityKind, Facing, ObjectKind, TerrainTiles, TilePos, TileType, World, CHUNK_SIZE, TILE_SIZE, WorldPos};
+use crate::simulation::{BuildingKind, ChunkPos, EntityKind, Facing, ObjectKind, TerrainTiles, TilePos, TileType, World, CHUNK_SIZE, TILE_SIZE, WorldPos};
 use crate::ui::UiFont;
 use crate::ui::construction::ConstructionUi;
 
@@ -54,7 +54,7 @@ const ATLAS_GUTTER_PX: u32 = 2;
 
 /// Сколько тайлов в атласе по горизонтали и вертикали.
 const ATLAS_COLUMNS: u32 = 4;
-const ATLAS_ROWS: u32 = 3;
+const ATLAS_ROWS: u32 = 4;
 
 /// Размер ячейки атласа с учётом повтора краёв.
 const ATLAS_CELL_PX: u32 = ATLAS_TILE_PX + ATLAS_GUTTER_PX * 2;
@@ -65,7 +65,7 @@ const ATLAS_HEIGHT: u32 = ATLAS_CELL_PX * ATLAS_ROWS;
 
 /// Количество непустых видов тайлов (индексы атласа). Варианты идут
 /// подряд за `Empty`, порядок совпадает с `TileType` без него.
-pub(crate) const TILE_KIND_COUNT: usize = 11;
+pub(crate) const TILE_KIND_COUNT: usize = 14;
 
 /// Сколько блоков строить за кадр при LOD 0 (дальше бюджет растёт).
 const BUILD_BLOCKS_BASE: usize = 4;
@@ -85,6 +85,7 @@ impl Plugin for RenderingPlugin {
             .init_resource::<TerrainRender>()
             .init_resource::<RenderMetrics>()
             .init_resource::<EntitySprites>()
+            .init_resource::<ItemEntitySprites>()
             .init_resource::<WorldSpriteAssets>()
             .init_resource::<HurtFlashes>()
             .init_resource::<lighting::CampfireLights>()
@@ -111,7 +112,7 @@ impl Plugin for RenderingPlugin {
             )
             .add_systems(
                 Update,
-                (update_player_sprite, update_entity_sprites)
+                (update_player_sprite, update_item_entity_sprites, update_entity_sprites)
                     .after(SimTick)
                     .after(crate::app::camera::update_camera_transforms),
             )
@@ -211,6 +212,14 @@ struct ItemCountLabel;
 struct EntitySprites {
     map: HashMap<u64, Entity>,
     textures: HashMap<u64, bevy::asset::AssetId<Image>>,
+}
+
+/// Соответствие «id item-сущности дропа → (спрайт, последняя позиция)».
+/// Лежащий дроп статичен, брошенный летит — позиция спрайта обновляется
+/// при изменении координат сущности.
+#[derive(Resource, Default)]
+struct ItemEntitySprites {
+    map: HashMap<u64, (Entity, [f32; 2])>,
 }
 
 /// Общий quad и материалы для world-space спрайтов с depth test.
@@ -324,7 +333,7 @@ fn ensure_ground_material(
     }));
 }
 
-/// Собирает атлас 4×3 из одиннадцати 32×32 тайлов с повтором краёв.
+/// Собирает атлас 4×4 из четырнадцати 32×32 тайлов с повтором краёв.
 /// Возвращает `None`, пока хотя бы одна исходная текстура не загружена.
 fn build_atlas_image(textures: &TileTextures, images: &Assets<Image>) -> Option<Image> {
     let mut data = vec![0_u8; (ATLAS_WIDTH * ATLAS_HEIGHT * 4) as usize];
@@ -811,6 +820,9 @@ fn refresh_block_decor(
     spawn_objects(
         &mut entity, meshes, materials, sprite_assets, images, world, block, origin, camera_rotation, textures,
     );
+    spawn_crops(
+        &mut entity, meshes, materials, sprite_assets, world, block, origin, textures,
+    );
     spawn_items(
         &mut entity, meshes, materials, sprite_assets, world, block, origin, camera_rotation, textures, &font.0,
     );
@@ -878,6 +890,72 @@ fn update_player_sprite(
             transform,
             PlayerSprite,
         ));
+    }
+}
+
+/// Синхронизирует спрайты item-сущностей дропа с `world.item_entities`:
+/// новый дроп — спрайт, подбор/исчезновение — снятие спрайта. Позиция
+/// статична (дроп не двигается),Billboard повёрнут к камере при спавне.
+fn update_item_entity_sprites(
+    mut commands: Commands,
+    state: Res<GameState>,
+    textures: Res<TileTextures>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut sprite_assets: ResMut<WorldSpriteAssets>,
+    mut sprites: ResMut<ItemEntitySprites>,
+    camera: Query<&Transform, (With<Camera2d>, Without<EntitySprite>)>,
+    sprite_transforms: Query<&mut Transform, With<EntitySprite>>,
+) {
+    let Some(world) = state.world.as_ref() else {
+        for (_, (entity, _)) in sprites.map.drain() {
+            commands.entity(entity).despawn();
+        }
+        return;
+    };
+    let Ok(camera_transform) = camera.single() else {
+        return;
+    };
+    let mut sprite_transforms: Query<&mut Transform, With<EntitySprite>> = sprite_transforms;
+    // Снятие спрайтов подобранных/исчезнувших предметов.
+    let stale: Vec<u64> = sprites
+        .map
+        .keys()
+        .copied()
+        .filter(|id| world.item_entity(*id).is_none())
+        .collect();
+    for id in stale {
+        if let Some((entity, _)) = sprites.map.remove(&id) {
+            commands.entity(entity).despawn();
+        }
+    }
+    let quad = world_sprite_quad(&mut meshes, &mut sprite_assets);
+    let camera_up = camera_transform.rotation * Vec3::Y;
+    let height = TILE_SIZE * 0.3;
+    for entity in &world.item_entities.items {
+        let pos_xy = [entity.pos.x, entity.pos.y];
+        if let Some(&(sprite, last_pos)) = sprites.map.get(&entity.id) {
+            // Лежащий предмет не двигается; летящий — обновляем позицию
+            // спрайта (интерполяция не нужна: шаг тика и так плавный).
+            if (last_pos[0] - entity.pos.x).abs() > 1e-4 || (last_pos[1] - entity.pos.y).abs() > 1e-4 {
+                if let Ok(mut transform) = sprite_transforms.get_mut(sprite) {
+                    transform.translation = world_position(world, Vec2::new(entity.pos.x, entity.pos.y)) + camera_up * height;
+                }
+                sprites.map.insert(entity.id, (sprite, pos_xy));
+            }
+            continue;
+        }
+        let pos = world_position(world, Vec2::new(entity.pos.x, entity.pos.y)) + camera_up * height;
+        let texture = textures.item_texture(entity.stack.kind);
+        let material = world_sprite_material(texture, false, &mut sprite_assets, &mut materials);
+        let size = Vec2::splat(TILE_SIZE * 0.5);
+        let mut transform = Transform::from_translation(pos)
+            .with_rotation(camera_transform.rotation);
+        transform.scale = Vec3::new(size.x, size.y, 1.0);
+        let sprite = commands
+            .spawn((Mesh3d(quad.clone()), MeshMaterial3d(material), transform, EntitySprite))
+            .id();
+        sprites.map.insert(entity.id, (sprite, pos_xy));
     }
 }
 
@@ -1122,6 +1200,9 @@ fn build_block(
     if lod <= 1 {
         spawn_objects(
             &mut entity, meshes, materials, sprite_assets, images, world, block, origin, camera_rotation, textures,
+        );
+        spawn_crops(
+            &mut entity, meshes, materials, sprite_assets, world, block, origin, textures,
         );
         spawn_items(
             &mut entity, meshes, materials, sprite_assets, world, block, origin, camera_rotation, textures, &font.0,
@@ -1574,27 +1655,20 @@ pub(crate) fn tile_atlas_index(kind: TileType) -> Option<u8> {
     }
 }
 
-/// Обратное преобразование индекса атласа в тип тайла (для запасного цвета).
+/// Обратное преобразование индекса атласа в тип тайла. Индексы идут
+/// подряд за `Empty` (`tile_atlas_index` = дискриминант − 1), поэтому
+/// обратное отображение выводится из `TileType::from_discriminant` —
+/// новый вид тайла не требует правки здесь.
 fn kind_for_atlas_index(index: u8) -> Option<TileType> {
-    Some(match index {
-        0 => TileType::Water,
-        1 => TileType::Sand,
-        2 => TileType::Dirt,
-        3 => TileType::Grass,
-        4 => TileType::ForestGrass,
-        5 => TileType::Stone,
-        6 => TileType::Clay,
-        7 => TileType::Farmland,
-        8 => TileType::DeepWater,
-        9 => TileType::Ocean,
-        10 => TileType::Mountain,
-        _ => return None,
-    })
+    TileType::from_discriminant(index + 1)
 }
 
-/// Спавнит объекты блока как дочерние camera-facing спрайты.
-/// Идёт по разреженному слою объектов четырёх чанков блока — стоимость
-/// пропорциональна числу объектов, а не тайлам блока.
+/// Спавнит объекты блока как дочерние спрайты/блоки. Обычные объекты —
+/// camera-facing спрайты; станции-«блоки» — изометрический набор квадов
+/// (верх + две видимые боковые грани −X/−Y); костёр — крест из двух
+/// вертикальных квадов вдоль середин сторон тайла; склад — плоский декаль
+/// на всю поверхность тайла. Идёт по разреженному слою объектов четырёх
+/// чанков блока — стоимость пропорциональна числу объектов, а не тайлам.
 fn spawn_objects(
     parent: &mut EntityCommands,
     meshes: &mut Assets<Mesh>,
@@ -1629,31 +1703,184 @@ fn spawn_objects(
                         x: cpx * CHUNK_SIZE as i32 + (idx % CHUNK_SIZE as u8) as i32,
                         y: cpy * CHUNK_SIZE as i32 + (idx / CHUNK_SIZE as u8) as i32,
                     };
-                    let handle = textures.object_texture(obj);
-                    let size = object_sprite_size_cached(obj.kind, handle, images, sprite_assets);
-                    // Спрайт центром по X над тайлом; низ прижат к нижней границе родного тайла (не ниже и не в воздухе).
                     let tile_world = world_position(
                         world,
                         Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),
                     );
                     let anchor = tile_world - origin;
-                    let height = size.y * 0.5;
-                    let camera_up = camera_rotation * Vec3::Y;
-                    let material =
-                        world_sprite_material(handle, false, sprite_assets, materials);
-                    let mut transform =
-                        Transform::from_translation(anchor + camera_up * height)
-                            .with_rotation(camera_rotation);
-                    transform.scale = Vec3::new(size.x, size.y, 1.0);
-                    parent.spawn((
-                        Mesh3d(quad.clone()),
-                        MeshMaterial3d(material),
-                        transform,
-                    ));
+                    match obj.kind {
+                        // Костёр — раньше станции-блоков: он станция, но
+                        // рисуется крестом из двух вертикальных квадов
+                        // вдоль осей X и Y тайла, а не изометрическим блоком.
+                        ObjectKind::Building(BuildingKind::Campfire) => {
+                            spawn_campfire_cross(
+                                parent, &quad, sprite_assets, materials, textures, anchor,
+                            );
+                        }
+                        // Склад: плоская текстура-декаль поверх тайла.
+                        ObjectKind::Building(BuildingKind::Storage) => {
+                            spawn_flat_decal(
+                                parent, &quad, sprite_assets, materials,
+                                textures.storage_flat(), anchor, 1.0,
+                            );
+                        }
+                        // Станции-блоки: верх + боковые грани с текстурами
+                        // top/front/side; горящая печь — front_on.
+                        ObjectKind::Building(kind) => {
+                            let lit = crate::simulation::containers::container_at(world, tile)
+                                .is_some_and(|c| c.is_lit());
+                            spawn_station_block(
+                                parent, &quad, sprite_assets, materials, textures, anchor, kind,
+                                lit,
+                            );
+                        }
+                        _ => {
+                            let handle = textures.object_texture(obj);
+                            let size =
+                                object_sprite_size_cached(obj.kind, handle, images, sprite_assets);
+                            // Спрайт центром по X над тайлом; низ прижат к нижней границе родного тайла (не ниже и не в воздухе).
+                            let height = size.y * 0.5;
+                            let camera_up = camera_rotation * Vec3::Y;
+                            let material =
+                                world_sprite_material(handle, false, sprite_assets, materials);
+                            let mut transform =
+                                Transform::from_translation(anchor + camera_up * height)
+                                    .with_rotation(camera_rotation);
+                            transform.scale = Vec3::new(size.x, size.y, 1.0);
+                            parent.spawn((
+                                Mesh3d(quad.clone()),
+                                MeshMaterial3d(material),
+                                transform,
+                            ));
+                        }
+                    }
                 }
             }
         }
     });
+}
+
+/// Высота блока станции, мировых единиц. Станции вдвое меньше тайла:
+/// стоят на нём, а не занимают его целиком.
+const STATION_BLOCK_HEIGHT: f32 = TILE_SIZE * 0.5;
+/// Ширина блока станции как доля ромба тайла.
+const STATION_BLOCK_SCALE: f32 = 0.5;
+
+/// Небольшой z-сдвиг декаля над рельефом против z-fighting.
+const DECAL_Z_OFFSET: f32 = 0.02;
+
+/// Изометрический блок станции: горизонтальный верхний квад + две видимые
+/// боковые грани (−X — «фронт», −Y — «бок»). Материалы кэшируются по
+/// текстурам; у печей фронтальная текстура меняется на `front_on`, когда
+/// контейнер горит (готовит/держит топливо).
+fn spawn_station_block(
+    parent: &mut ChildSpawnerCommands,
+    quad: &Handle<Mesh>,
+    sprite_assets: &mut WorldSpriteAssets,
+    materials: &mut Assets<StandardMaterial>,
+    textures: &TileTextures,
+    anchor: Vec3,
+    kind: BuildingKind,
+    lit: bool,
+) {
+    let station = textures.station_textures(kind);
+    let front = if lit {
+        station.front_on.as_ref().unwrap_or(&station.front)
+    } else {
+        &station.front
+    };
+    let edge = WORLD_TILE_SIZE * STATION_BLOCK_SCALE;
+    let half = edge * 0.5;
+    let height = STATION_BLOCK_HEIGHT;
+
+    // Верх: квад по умолчанию лежит в плоскости земли (нормаль +Z).
+    let top_material = world_sprite_material(&station.top, false, sprite_assets, materials);
+    parent.spawn((
+        Mesh3d(quad.clone()),
+        MeshMaterial3d(top_material),
+        Transform::from_translation(anchor + Vec3::Z * height)
+            .with_scale(Vec3::new(edge, edge, 1.0)),
+    ));
+    // Бок (−Y): стена, повёрнутая вокруг X на +90°: нормаль −Y, ширина
+    // текстуры вдоль мирового X, высота — вверх по Z.
+    let side_material = world_sprite_material(&station.side, false, sprite_assets, materials);
+    parent.spawn((
+        Mesh3d(quad.clone()),
+        MeshMaterial3d(side_material),
+        Transform::from_translation(anchor + Vec3::new(0.0, -half, height * 0.5))
+            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::new(edge, height, 1.0)),
+    ));
+    // Фронт (−X): та же стена, довернутая вокруг Z на −90° (нормаль −X,
+    // ширина текстуры вдоль мирового Y, высота по-прежнему вверх).
+    let front_material = world_sprite_material(front, false, sprite_assets, materials);
+    parent.spawn((
+        Mesh3d(quad.clone()),
+        MeshMaterial3d(front_material),
+        Transform::from_translation(anchor + Vec3::new(-half, 0.0, height * 0.5))
+            .with_rotation(
+                Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+            )
+            .with_scale(Vec3::new(edge, height, 1.0)),
+    ));
+}
+
+/// Крест костра: два вертикальных квада вдоль осей X и Y через центр тайла
+/// (из середин противоположных сторон), двойная сторона и маска-альфа
+/// материалов спрайтов дают правильный вид с фиксированной камеры.
+fn spawn_campfire_cross(
+    parent: &mut ChildSpawnerCommands,
+    quad: &Handle<Mesh>,
+    sprite_assets: &mut WorldSpriteAssets,
+    materials: &mut Assets<StandardMaterial>,
+    textures: &TileTextures,
+    anchor: Vec3,
+) {
+    let texture = textures.campfire_cross();
+    let material = world_sprite_material(texture, false, sprite_assets, materials);
+    let edge = WORLD_TILE_SIZE;
+    let height = TILE_SIZE * 0.6;
+    let center = anchor + Vec3::Z * height * 0.5;
+    // Квад 1: стена вдоль оси X (нормаль −Y, ширина по X, высота по Z).
+    parent.spawn((
+        Mesh3d(quad.clone()),
+        MeshMaterial3d(material.clone()),
+        Transform::from_translation(center)
+            .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::new(edge, height, 1.0)),
+    ));
+    // Квад 2: та же стена, довернутая вокруг Z на 90° — вдоль оси Y.
+    parent.spawn((
+        Mesh3d(quad.clone()),
+        MeshMaterial3d(material),
+        Transform::from_translation(center)
+            .with_rotation(
+                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+            )
+            .with_scale(Vec3::new(edge, height, 1.0)),
+    ));
+}
+
+/// Плоский декаль на поверхность тайла (культуры, склад): горизонтальный
+/// квад, заполняющий ромб тайла, с z-сдвигом против z-fighting. `scale`
+/// — доля тайла (1.0 — весь ромб).
+fn spawn_flat_decal(
+    parent: &mut ChildSpawnerCommands,
+    quad: &Handle<Mesh>,
+    sprite_assets: &mut WorldSpriteAssets,
+    materials: &mut Assets<StandardMaterial>,
+    texture: &Handle<Image>,
+    anchor: Vec3,
+    scale: f32,
+) {
+    let material = world_sprite_material(texture, false, sprite_assets, materials);
+    let edge = WORLD_TILE_SIZE * scale;
+    parent.spawn((
+        Mesh3d(quad.clone()),
+        MeshMaterial3d(material),
+        Transform::from_translation(anchor + Vec3::Z * DECAL_Z_OFFSET)
+            .with_scale(Vec3::new(edge, edge, 1.0)),
+    ));
 }
 
 /// Размер спрайта объекта из размеров текстуры. 64 px текстуры
@@ -1692,6 +1919,52 @@ fn object_sprite_size_cached(
             None => Vec2::splat(TILE_SIZE),
         },
     }
+}
+
+/// Спавнит культуры блока как плоские декалями на поверхности пашни.
+/// Идёт по разреженному слою культур четырёх чанков блока.
+fn spawn_crops(
+    parent: &mut EntityCommands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    sprite_assets: &mut WorldSpriteAssets,
+    world: &World,
+    block: BlockPos,
+    origin: Vec3,
+    textures: &TileTextures,
+) {
+    let bx0 = block.x * BLOCK_TILES;
+    let by0 = block.y * BLOCK_TILES;
+    let chunks_per_block = BLOCK_TILES / CHUNK_SIZE as i32;
+    let cps = world.chunks_per_side as i32;
+    let quad = world_sprite_quad(meshes, sprite_assets);
+
+    parent.with_children(|parent| {
+        for cy in 0..chunks_per_block {
+            for cx in 0..chunks_per_block {
+                let cpx = bx0.div_euclid(CHUNK_SIZE as i32) + cx;
+                let cpy = by0.div_euclid(CHUNK_SIZE as i32) + cy;
+                if cpx < 0 || cpy < 0 || cpx >= cps || cpy >= cps {
+                    continue;
+                }
+                let chunk = world.chunk(ChunkPos { x: cpx as u32, y: cpy as u32 });
+                for (&idx, crop) in &chunk.crops {
+                    let tile = TilePos {
+                        x: cpx * CHUNK_SIZE as i32 + (idx % CHUNK_SIZE as u8) as i32,
+                        y: cpy * CHUNK_SIZE as i32 + (idx / CHUNK_SIZE as u8) as i32,
+                    };
+                    let tile_world = world_position(
+                        world, Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),
+                    );
+                    spawn_flat_decal(
+                        parent, &quad, sprite_assets, materials,
+                        textures.crop_texture(crop.kind, crop.stage),
+                        tile_world - origin, 1.0,
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Спавнит предметы на тайлах блока (дроп) как дочерние спрайты.
@@ -1847,8 +2120,9 @@ fn update_build_hologram(
     let affordable = build_cost(kind).is_none_or(|(item, count)| p.inventory.count_of(item) >= count);
     let valid = affordable && buildable_at(world, tile) && p.reachable(tile, world);
 
-    let handle = textures.kind_texture(kind).clone();
-    let size = object_sprite_size_cached(kind, &handle, &images, &mut sprite_assets);
+    let object_kind = ObjectKind::Building(kind);
+    let handle = textures.kind_texture(object_kind).clone();
+    let size = object_sprite_size_cached(object_kind, &handle, &images, &mut sprite_assets);
     let tile_world = world_position(
         world,
         Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),

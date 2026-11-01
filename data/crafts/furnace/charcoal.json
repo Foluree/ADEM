@@ -1,0 +1,6 @@
+{
+  "id": "charcoal",
+  "shapeless": true,
+  "ingredients": [{ "item": "dust_wood_chips", "count": 2 }],
+  "result": { "item": "charcoal", "count": 1 }
+}

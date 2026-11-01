@@ -1,8 +1,11 @@
-//! Чанк — блок 16×16 тайлов. Три независимых слоя: рельеф, ресурсы, объекты.
+//! Чанк — блок 16×16 тайлов. Несколько независимых слоёв: рельеф, ресурсы,
+//! объекты, предметы на земле, культуры, контейнеры станций.
 //! Слои хранятся и сжимаются независимо (GAME_DESIGN 3.2, ARCHITECTURE 2.2).
 
 use std::collections::HashMap;
 
+use super::containers::Container;
+use super::crops::Crop;
 use super::items::ItemStack;
 use super::objects::WorldObject;
 use super::tile::{ResourceKind, TileType};
@@ -64,7 +67,7 @@ pub struct ResourceDeposit {
     pub amount: u16,
 }
 
-/// Чанк 16×16. Рельеф — плотный слой со сжатием; ресурсы и объекты —
+/// Чанк 16×16. Рельеф — плотный слой со сжатием; остальные слои —
 /// разреженные: они занимают малую долю тайлов, и плотный массив на каждый
 /// слой раздувал бы память на порядки (ARCHITECTURE 2.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,16 +79,23 @@ pub struct Chunk {
     pub objects: HashMap<u8, WorldObject>,
     /// Предметы, лежащие на тайлах (дроп). Разреженный слой, как ресурсы.
     pub items: HashMap<u8, ItemStack>,
+    /// Культуры на пашне по линейному индексу тайла (одна культура на тайл).
+    pub crops: HashMap<u8, Crop>,
+    /// Контейнеры станций и складов (печи, бочка, склад, костёр).
+    /// Существуют только у тайлов со станцией-объектом.
+    pub containers: HashMap<u8, Container>,
 }
 
 impl Chunk {
-    /// Пустой чанк: рельеф Empty, ресурсов и объектов нет.
+    /// Пустой чанк: рельеф Empty, остальных слоёв нет.
     pub fn empty() -> Self {
         Self {
             terrain: TerrainTiles::uniform(TileType::Empty),
             resources: HashMap::new(),
             objects: HashMap::new(),
             items: HashMap::new(),
+            crops: HashMap::new(),
+            containers: HashMap::new(),
         }
     }
 }

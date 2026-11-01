@@ -1,0 +1,6 @@
+{
+  "id": "campfire_meat_herbivore",
+  "shapeless": true,
+  "ingredients": [{ "item": "meat_herbivore_raw", "count": 1 }],
+  "result": { "item": "meat_herbivore_cooked", "count": 1 }
+}

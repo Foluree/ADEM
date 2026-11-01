@@ -1,0 +1,10 @@
+{
+  "id": "shears_copper",
+  "shapeless": true,
+  "ingredients": [
+    { "item": "ingot_copper", "count": 2 },
+    { "item": "stick", "count": 1 }
+  ],
+  "tools": ["hammer_stone"],
+  "result": { "item": "shears_copper", "count": 1 }
+}

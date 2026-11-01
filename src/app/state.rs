@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use crate::simulation::commands::CommandQueue;
 use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::entities::EntityKind;
-use crate::simulation::objects::ObjectKind;
+use crate::simulation::objects::{BuildingKind, ObjectKind};
 use crate::simulation::player::{Player, WorldPos};
 use crate::simulation::scheduler::Scheduler;
 use crate::simulation::tile::TileType;
@@ -122,20 +122,22 @@ impl ToolCategory {
 pub enum Tool {
     /// Тайл рельефа.
     Tile(TileType),
-    /// Объект над тайлом (включая постройки — см. `ToolCategory`).
+    /// Природный объект над тайлом (деревья, кусты, валуны).
     Object(ObjectKind),
+    /// Постройка (рукотворное сооружение).
+    Building(BuildingKind),
     /// Существо в тайле.
     Entity(EntityKind),
 }
 
 impl Tool {
     /// Категория инструмента: в каком подменю панели он живёт. Постройки
-    /// выделены в собственную категорию, остальные объекты — в Objects.
+    /// выделены в собственную категорию, объекты — в Objects.
     pub fn category(self) -> ToolCategory {
         match self {
             Tool::Tile(_) => ToolCategory::Tiles,
-            Tool::Object(kind) if kind.is_building() => ToolCategory::Buildings,
             Tool::Object(_) => ToolCategory::Objects,
+            Tool::Building(_) => ToolCategory::Buildings,
             Tool::Entity(_) => ToolCategory::Entities,
         }
     }

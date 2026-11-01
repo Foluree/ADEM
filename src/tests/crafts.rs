@@ -148,7 +148,9 @@ fn bulk_craft_respects_inventory_space() {
     assert_eq!(grid[0], None);
 }
 
-/// Все рецепты из `data/crafts` читаются без ошибок, ручная категория и результаты корректны.
+/// Все рецепты из `data/crafts` читаются без ошибок: корень — ручная
+/// категория, подпапки — категории станций, рецепты с инструментами
+/// (кузнечный стол) читаются.
 #[test]
 fn craft_book_loads_all_recipe_files() {
     use crate::simulation::crafts::{CraftBook, MANUAL_CATEGORY};
@@ -156,12 +158,18 @@ fn craft_book_loads_all_recipe_files() {
 
     let (book, errors) = CraftBook::load_dir("data/crafts");
     assert!(errors.is_empty(), "ошибки рецептов: {errors:?}");
-    assert_eq!(book.recipes.len(), 14);
+    // 14 ручных рецептов + рецепты станций (верстак, печи, костёр,
+    // кузнечный стол; у костра — 8 рецептов жарки еды).
+    assert_eq!(book.recipes.len(), 14 + 34);
 
-    let mut ids: Vec<&str> = book.recipes.iter().map(|recipe| recipe.id.as_str()).collect();
-    ids.sort_unstable();
+    let manual_ids: Vec<&str> = book
+        .recipes
+        .iter()
+        .filter(|recipe| recipe.category == MANUAL_CATEGORY)
+        .map(|recipe| recipe.id.as_str())
+        .collect();
     assert_eq!(
-        ids,
+        manual_ids,
         vec![
             "arrow",
             "axe",
@@ -179,12 +187,33 @@ fn craft_book_loads_all_recipe_files() {
             "stick_bundle_unpack",
         ]
     );
-    assert!(book.recipes.iter().all(|recipe| recipe.category == MANUAL_CATEGORY));
     assert!(
         book.recipes
             .iter()
             .any(|recipe| recipe.result.kind == ItemKind::FishingRod)
     );
+    // Станционные категории присутствуют, у кузнечного стола есть рецепты
+    // с требованием инструмента.
+    assert!(book
+        .recipes
+        .iter()
+        .any(|recipe| recipe.category == "furnace"));
+    assert!(book
+        .recipes
+        .iter()
+        .any(|recipe| recipe.category == "blast_furnace"));
+    assert!(book
+        .recipes
+        .iter()
+        .any(|recipe| recipe.category == "campfire"));
+    assert!(book
+        .recipes
+        .iter()
+        .any(|recipe| recipe.category == "crafting_table"));
+    assert!(book
+        .recipes
+        .iter()
+        .any(|recipe| recipe.category == "smithing_table" && !recipe.tools.is_empty()));
 }
 
 /// Связка палок: 8 палок → связка и обратно, оба рецепта ручные.

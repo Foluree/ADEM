@@ -1,0 +1,6 @@
+{
+  "id": "apple_baked",
+  "shapeless": true,
+  "ingredients": [{ "item": "apple", "count": 1 }],
+  "result": { "item": "apple_baked", "count": 1 }
+}

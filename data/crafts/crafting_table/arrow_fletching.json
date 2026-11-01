@@ -1,0 +1,9 @@
+{
+  "id": "arrow_fletching",
+  "shapeless": true,
+  "ingredients": [
+    { "item": "feather", "count": 2 },
+    { "item": "shard_bone", "count": 1 }
+  ],
+  "result": { "item": "arrow_fletching", "count": 2 }
+}

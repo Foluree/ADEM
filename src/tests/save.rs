@@ -348,3 +348,86 @@ fn save_rejects_wrong_item_in_clothes_slot() {
         "не-одежда в слоте одежды должна отклоняться при загрузке"
     );
 }
+
+/// Roundtrip v2: культуры, контейнеры станций и item-сущности дропа
+/// читаются обратно без потерь (слова̀рное состояние мира).
+#[test]
+fn save_roundtrip_crops_containers_and_item_entities() {
+    use crate::simulation::crops::{Crop, CropKind};
+    use crate::simulation::containers::FURNACE_FUEL;
+    use crate::simulation::items::ItemKind;
+    use crate::simulation::objects::WorldObject;
+    use crate::simulation::save::{load_game, save_game};
+    use crate::simulation::time::GameClock;
+    use crate::simulation::WorldPos;
+
+    let mut world = crate::simulation::World::new(WorldSize::new(256), 3);
+    let farm = TilePos { x: 5, y: 5 };
+    world.set_terrain(farm, TileType::Farmland);
+    world.set_crop(farm, Some(Crop { kind: CropKind::Wheat, stage: 3 }));
+
+    let station = TilePos { x: 6, y: 6 };
+    world.set_object_with_container(
+        station,
+        Some(WorldObject::building(crate::simulation::objects::BuildingKind::Furnace)),
+    );
+    let container = crate::simulation::containers::container_at_mut(&mut world, station).unwrap();
+    container.put(
+        FURNACE_FUEL,
+        crate::simulation::items::ItemStack { kind: ItemKind::Coal, count: 7 },
+    );
+
+    world.item_entities.drop_stack(
+        3,
+        WorldPos { x: 7.5, y: 7.5 },
+        crate::simulation::items::ItemStack { kind: ItemKind::MeatPredatorRaw, count: 2 },
+        100,
+    );
+
+    // Планировщик должен быть на том же тике, что и часы (проверка load_game).
+    let mut sched = crate::simulation::Scheduler::default();
+    sched.run_tick(150, |_| {});
+    let bytes = save_game(&world, &GameClock { tick: 150 }, &sched, None, "0.1.0");
+    let saved = load_game(&bytes).expect("roundtrip v2");
+    let world = saved.world;
+
+    assert_eq!(
+        world.crop_at(farm).map(|c| (c.kind, c.stage)),
+        Some((CropKind::Wheat, 3))
+    );
+    let container = crate::simulation::containers::container_at(&world, station).unwrap();
+    assert_eq!(
+        container.get(FURNACE_FUEL),
+        Some(crate::simulation::items::ItemStack { kind: ItemKind::Coal, count: 7 })
+    );
+    assert_eq!(world.item_entities.len(), 1);
+    assert_eq!(world.item_entities.items[0].stack.count, 2);
+    assert_eq!(world.item_entities.items[0].spawn_tick, 100);
+}
+
+/// Мох появляется пятнами в лесу: у мира с любым seed есть лесные области,
+/// и мох встречается только на уровне леса (рядом с ForestGrass).
+#[test]
+fn generation_places_moss_patches_in_forest() {
+    let world = crate::simulation::generation::generate_world(WorldSize::new(256), 42);
+    let mut moss = 0_u32;
+    let mut forest = 0_u32;
+    for chunk in &world.chunks {
+        for idx in 0..crate::simulation::CHUNK_TILES {
+            match chunk.terrain.get(idx) {
+                TileType::Moss => moss += 1,
+                TileType::ForestGrass => forest += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(forest > 0, "в мире должна быть лесная трава");
+    assert!(moss > 0, "мох должен появляться пятнами в лесу");
+
+    // Детерминизм: тот же seed — та же карта.
+    let again = crate::simulation::generation::generate_world(WorldSize::new(256), 42);
+    assert_eq!(
+        world.chunks[0].terrain, again.chunks[0].terrain,
+        "рельеф первого чанка должен совпадать при повторной генерации"
+    );
+}

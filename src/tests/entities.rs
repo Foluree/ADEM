@@ -1,6 +1,7 @@
 //! Тесты существ: спавн и HP волков, автомат состояний, анимация ходьбы,
 //! поведение в воде, команды Spawn/RemoveEntity.
 
+use crate::simulation::crafts::CraftBook;
 use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::tile::TileType;
 use crate::simulation::world::{TilePos, World, WorldSize};
@@ -166,7 +167,7 @@ fn spawn_entity_command_places_wolf_at_tile_center() {
 
     let mut dirty = DirtyTiles::default();
     let mut sched = crate::simulation::Scheduler::default();
-    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
+    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0, &CraftBook::default());
 
     assert_eq!(world.entities.entities.len(), 1);
     let wolf = &world.entities.entities[0];
@@ -192,7 +193,7 @@ fn remove_entity_command_deletes_by_id() {
 
     queue.push(Command::RemoveEntity { id: first });
     let mut dirty = DirtyTiles::default();
-    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
+    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0, &CraftBook::default());
 
     let ids: Vec<u64> = world.entities.iter().map(|entity| entity.id).collect();
     assert_eq!(ids, vec![second], "удалено должно быть только существо first");
@@ -217,7 +218,7 @@ fn move_entity_command_places_and_stands() {
     let target = WorldPos { x: 12.25, y: 9.75 };
     queue.push(Command::MoveEntity { id, pos: target });
     let mut dirty = DirtyTiles::default();
-    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
+    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0, &CraftBook::default());
 
     let wolf = &world.entities.entities[0];
     assert_eq!(wolf.pos, target);

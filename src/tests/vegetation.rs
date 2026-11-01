@@ -1,6 +1,7 @@
 //! Тесты растительности: самозапланированные цепочки — расползание травы,
 //! рост кустов, эрозия берегов, перезапуск от инструментов редактора.
 
+use crate::simulation::crafts::CraftBook;
 use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::world::{TilePos, World};
 
@@ -165,7 +166,7 @@ fn editor_placed_dirt_gets_overgrown() {
     queue.push(Command::SetTerrain { pos: TilePos { x: 11, y: 5 }, kind: TileType::Dirt });
 
     let mut dirty = DirtyTiles::default();
-    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
+    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0, &CraftBook::default());
 
     run_vegetation(&mut sched, &mut world, 20_000, &mut dirty);
     assert_eq!(

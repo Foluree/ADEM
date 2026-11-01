@@ -6,11 +6,14 @@ pub mod clothes;
 pub mod climate;
 pub mod combat;
 pub mod commands;
+pub mod containers;
 pub mod crafts;
+pub mod crops;
 pub mod dirty;
 pub mod entities;
 pub mod generation;
 pub mod hunger;
+pub mod item_entity;
 pub mod items;
 pub mod movement;
 pub mod needs;
@@ -37,19 +40,32 @@ pub use combat::{Projectile, ProjectileKind, StuckSpear};
 #[allow(unused_imports)]
 pub use commands::{Command, CommandQueue};
 #[allow(unused_imports)]
-pub use dirty::DirtyTiles;
+pub use containers::{
+    Container, BARREL_SLOTS, STORAGE_SLOTS, capacity as container_capacity,
+    can_put_into, container_at, container_at_mut, wake_station,
+    FURNACE_COOK_TICKS, BLAST_COOK_TICKS, CAMPFIRE_COOK_TICKS,
+    FURNACE_INPUT, FURNACE_FUEL, FURNACE_OUTPUT, FURNACE_WASTE,
+    BLAST_INPUT, BLAST_FUEL, BLAST_OUTPUT, BLAST_WASTE,
+    CAMPFIRE_INPUT, CAMPFIRE_OUTPUT, SLOT_AREA_PLAYER_MISC,
+};
 #[allow(unused_imports)]
 pub use crafts::{CraftBook, CraftRecipe, ShapedPattern, GRID_SLOTS, MANUAL_CATEGORY};
 #[allow(unused_imports)]
+pub use crops::{Crop, CropKind, CROP_KIND_COUNT, MAX_CROP_STAGES};
+#[allow(unused_imports)]
+pub use dirty::DirtyTiles;
+#[allow(unused_imports)]
 pub use entities::{EntityKind, EntityState, EntityStore, Facing, SimEntity};
 #[allow(unused_imports)]
-pub use hunger::{Activity, Hunger, APPLE_FOOD_VALUE, EAT_COOLDOWN_TICKS, HUNGER_MAX};
+pub use hunger::{Activity, Hunger, EAT_COOLDOWN_TICKS, HUNGER_MAX};
 #[allow(unused_imports)]
-pub use items::{Inventory, ItemKind, ItemStack, ITEM_KIND_COUNT, MISC_SLOTS};
+pub use item_entity::{ItemEntities, ItemEntity};
+#[allow(unused_imports)]
+pub use items::{Inventory, ItemKind, ItemStack, ITEM_KIND_COUNT, MISC_SLOTS, ToolClass};
 #[allow(unused_imports)]
 pub use needs::{Need, NeedKind};
 #[allow(unused_imports)]
-pub use objects::{ObjectKind, ObjectStage, WorldObject};
+pub use objects::{BuildingKind, ObjectKind, ObjectStage, WorldObject};
 #[allow(unused_imports)]
 pub use player::{Player, WorldPos};
 #[allow(unused_imports)]

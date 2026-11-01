@@ -72,7 +72,6 @@
     { "id": "potato", "name": "Картофель" },
     { "id": "potato_baked", "name": "Печёный картофель" },
     { "id": "strange_tuber", "name": "Странный клубень" },
-    { "id": "strawberries", "name": "Клубника" },
     { "id": "raw_copper", "name": "Медная руда" },
     { "id": "raw_gold", "name": "Золотая руда" },
     { "id": "raw_silver", "name": "Серебряная руда" },
@@ -84,6 +83,12 @@
     { "id": "saw_copper", "name": "Медная пила" },
     { "id": "shears_copper", "name": "Медные ножницы" },
     { "id": "shovel_copper", "name": "Медная лопата" },
-    { "id": "sickle_copper", "name": "Медный серп" }
+    { "id": "sickle_copper", "name": "Медный серп" },
+    { "id": "seeds_beetroot", "name": "Семена свёклы" },
+    { "id": "beetroot", "name": "Свёкла" },
+    { "id": "beetroot_roasted", "name": "Печёная свёкла" },
+    { "id": "cherry", "name": "Вишня" },
+    { "id": "coal", "name": "Уголь" },
+    { "id": "charcoal", "name": "Древесный уголь" }
   ]
 }

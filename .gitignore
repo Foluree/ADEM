@@ -10,6 +10,7 @@ tools/*/target
 *.rar
 *.exe
 
+/.zcode
 temp.txt
 exe
 /backups

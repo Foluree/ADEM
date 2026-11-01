@@ -40,12 +40,13 @@ too_many_arguments = "allow"
 
 [profile.dev]
 opt-level = 1
-debug = 0
+debug = 1
 
 
 [profile.dev.package."*"]
 opt-level = 1
-debug = 0
+debug = 1
+
 
 [profile.release]
 debug = 0

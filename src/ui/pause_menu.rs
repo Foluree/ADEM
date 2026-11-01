@@ -265,16 +265,22 @@ fn handle_escape(
     mut state: ResMut<GameState>,
     mut view: ResMut<PauseMenuView>,
     mut inventory: ResMut<InventoryUi>,
+    mut station: ResMut<crate::ui::station::StationUi>,
     mut construction: ResMut<ConstructionUi>,
     capture: Res<BindingCapture>,
     focus: Res<InputFocus>,
     text_inputs: Query<(), With<TextInput>>,
     fonts: Res<MenuFonts>,
     settings: Res<Settings>,
-    roots: Query<Entity, With<PauseMenuRoot>>,
-    modal_roots: Query<Entity, With<crate::ui::menus::MenuRoot>>,
-    inventory_roots: Query<Entity, With<InventoryRoot>>,
-    construction_roots: Query<Entity, With<ConstructionRoot>>,
+    // Корни всех модальных окон одним параметром-кортежем: у систем Bevy
+    // предел в 16 параметров, а закрытие окон трогает каждый из них.
+    (roots, modal_roots, inventory_roots, station_roots, construction_roots): (
+        Query<Entity, With<PauseMenuRoot>>,
+        Query<Entity, With<crate::ui::menus::MenuRoot>>,
+        Query<Entity, With<InventoryRoot>>,
+        Query<Entity, With<crate::ui::station::StationRoot>>,
+        Query<Entity, With<ConstructionRoot>>,
+    ),
 ) {
     if text_input_focused(&focus, &text_inputs) || capture.0.is_some() {
         return;
@@ -292,6 +298,17 @@ fn handle_escape(
             commands.entity(e).despawn();
         }
         state.active_menu = None;
+        return;
+    }
+
+    // Окно станции — второй слой: ESC закрывает его, а не открывает меню
+    // (содержимое сетки вернёт close_station_window).
+    if station.open {
+        station.open = false;
+        station.selected = None;
+        for e in &station_roots {
+            commands.entity(e).despawn();
+        }
         return;
     }
 

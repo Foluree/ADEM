@@ -54,6 +54,11 @@ const EDGE_FALLOFF_MAX: f32 = 320.0;
 /// уходит под океан, но прибрежная полоса не «вдавливается» до нуля.
 const EDGE_FALLOFF_FLOOR: f32 = 0.2;
 
+/// Масштаб шума мха, тайлов: мелкий масштаб даёт пятна-области, а не крап.
+const MOSS_SCALE: f32 = 20.0;
+/// Порог мшистости: доля лесной травы, зарастающей мхом.
+const MOSS_THRESHOLD: f32 = 0.62;
+
 /// Соседи тайла по 8 направлениям в фиксированном порядке: при равных
 /// высотах побеждает первый — путь спуска детерминирован.
 const NEIGHBORS_8: [(i32, i32); 8] = [
@@ -176,6 +181,14 @@ fn ridge_at(x: i32, y: i32, seed: u64) -> f32 {
     ridge_noise(fx, fy, seed ^ 0x1D6E_5EED, 4)
 }
 
+/// Мшистость тайла в [0, 1]: отдельный шум мелкого масштаба — пятна мха
+/// в лесу получаются областями, а не россыпью одиночных тайлов.
+fn moss_at(x: i32, y: i32, seed: u64) -> f32 {
+    let fx = x as f32 / MOSS_SCALE;
+    let fy = y as f32 / MOSS_SCALE;
+    fbm(fx + 211.0, fy + 137.0, seed ^ 0x0DD5_1DEA, 3)
+}
+
 /// Вид тайла по высоте, гребневости и влажности.
 /// Вода — три глубины по высоте; берег — песок; горы и камень — по
 /// гребневости на возвышенностях (камень ещё и на голом высокогорье);
@@ -230,6 +243,12 @@ pub fn generate_world(size: WorldSize, seed: u64) -> World {
                     world.set_terrain(pos, TileType::Clay);
                     world.set_resource(pos, ResourceKind::Clay, 30 + rng.random_range(0..50));
                 }
+                TileType::ForestGrass
+                    if moss_at(x, y, seed) > MOSS_THRESHOLD =>
+                {
+                    // Мох пятнами в лесу: тайл остаётся на уровне лесной травы.
+                    world.set_terrain(pos, TileType::Moss);
+                }
                 _ => {}
             }
         }
@@ -248,7 +267,8 @@ pub fn generate_world(size: WorldSize, seed: u64) -> World {
         for x in 0..n {
             let pos = TilePos { x, y };
             match world.terrain_kind(pos) {
-                TileType::ForestGrass => {
+                // Мох — лесная подстилка: растительность та же, что на лесной траве.
+                TileType::ForestGrass | TileType::Moss => {
                     let r = rng.random::<f32>();
                     if r < 0.18 {
                         world.set_object(pos, Some(WorldObject::tree()));

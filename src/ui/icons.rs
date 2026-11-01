@@ -10,8 +10,8 @@ use bevy::prelude::*;
 use crate::simulation::items::BodySlot;
 use crate::simulation::{EntityKind, ItemKind, ObjectKind, TileType, ITEM_KIND_COUNT};
 
-/// Число видов тайлов с иконками (Water..Mountain; Empty в UI не нужен).
-const TILE_ICON_COUNT: usize = 11;
+/// Число видов тайлов с иконками (Water..Podzol; Empty в UI не нужен).
+const TILE_ICON_COUNT: usize = 14;
 
 /// Число специализаций брони разумного существа с текстурой пустого слота.
 const EMPTY_ARMOR_SLOT_COUNT: usize = 4;
@@ -21,8 +21,8 @@ const EMPTY_ARMOR_SLOT_COUNT: usize = 4;
 #[derive(Resource)]
 pub struct UiIcons {
     tiles: [Handle<Image>; TILE_ICON_COUNT],
-    /// По дискриминанту `ObjectKind` (включая постройки).
-    objects: [Handle<Image>; 5],
+    /// По дискриминанту `ObjectKind` (включая постройки и станции).
+    objects: [Handle<Image>; 11],
     items: [Handle<Image>; ITEM_KIND_COUNT],
     entities: [Handle<Image>; 1],
     /// Текстуры пустых слотов брони в порядке `ARMOR_LAYOUT`
@@ -62,13 +62,22 @@ impl UiIcons {
                 nearest("textures/tiles/deep_water.png"),
                 nearest("textures/tiles/ocean.png"),
                 nearest("textures/tiles/mountain.png"),
+                nearest("textures/tiles/moss.png"),
+                nearest("textures/tiles/mud.png"),
+                nearest("textures/tiles/podzol.png"),
             ],
             objects: [
                 nearest("textures/objects/tree.png"),
                 nearest("textures/objects/bush.png"),
                 nearest("textures/objects/rock.png"),
                 nearest("textures/objects/apple_tree.png"),
-                nearest("textures/buildings/campfire.png"),
+                nearest("textures/buildings/campfire_cross.png"),
+                nearest("textures/buildings/crafting_table_top.png"),
+                nearest("textures/buildings/furnace_front.png"),
+                nearest("textures/buildings/barrel_side.png"),
+                nearest("textures/buildings/blast_furnace_front.png"),
+                nearest("textures/buildings/storage.png"),
+                nearest("textures/buildings/smithing_table_front.png"),
             ],
             items: [
                 nearest("textures/items/stick.png"),
@@ -143,7 +152,6 @@ impl UiIcons {
                 nearest("textures/items/food/potato.png"),
                 nearest("textures/items/food/potato_baked.png"),
                 nearest("textures/items/food/strange_tuber.png"),
-                nearest("textures/items/food/strawberries.png"),
                 nearest("textures/items/raw_ore/raw_copper.png"),
                 nearest("textures/items/raw_ore/raw_gold.png"),
                 nearest("textures/items/raw_ore/raw_silver.png"),
@@ -156,6 +164,12 @@ impl UiIcons {
                 nearest("textures/items/tools/shears_copper.png"),
                 nearest("textures/items/tools/shovel_copper.png"),
                 nearest("textures/items/tools/sickle_copper.png"),
+                nearest("textures/items/seeds/seeds_beetroot.png"),
+                nearest("textures/items/food/beetroot.png"),
+                nearest("textures/items/food/beetroot_roasted.png"),
+                nearest("textures/items/food/cherry.png"),
+                nearest("textures/items/coal.png"),
+                nearest("textures/items/charcoal.png"),
             ],
             entities: [nearest("textures/entities/wolf/wolf_standing.png")],
             empty_armor_slots: [
@@ -175,9 +189,10 @@ impl UiIcons {
         &self.tiles[(kind as u8 - 1) as usize]
     }
 
-    /// Иконка объекта.
+    /// Иконка объекта. Массив проиндексирован дискриминантом `ObjectKind`:
+    /// природные виды 0–3, постройки 4–10 (`Building(k)` → 4 + k).
     pub fn object(&self, kind: ObjectKind) -> &Handle<Image> {
-        &self.objects[kind as usize]
+        &self.objects[kind.discriminant() as usize]
     }
 
     /// Иконка предмета.

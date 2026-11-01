@@ -1,0 +1,10 @@
+{
+  "id": "sickle_copper",
+  "shapeless": true,
+  "ingredients": [
+    { "item": "ingot_copper", "count": 2 },
+    { "item": "stick", "count": 1 }
+  ],
+  "tools": ["hammer_stone"],
+  "result": { "item": "sickle_copper", "count": 1 }
+}

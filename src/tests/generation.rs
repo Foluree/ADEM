@@ -12,7 +12,7 @@ fn count_objects(world: &World) -> [u32; ObjectKind::ALL.len()] {
     let mut counts = [0_u32; ObjectKind::ALL.len()];
     for chunk in &world.chunks {
         for obj in chunk.objects.values() {
-            counts[obj.kind as usize] += 1;
+            counts[obj.kind.discriminant() as usize] += 1;
         }
     }
     counts
@@ -53,7 +53,7 @@ fn generation_has_variety() {
     assert!(has_water, "нет воды на карте");
     assert!(has_land, "нет суши на карте");
     assert!(
-        count_objects(&w)[ObjectKind::Tree as usize] > 0,
+        count_objects(&w)[ObjectKind::Tree.discriminant() as usize] > 0,
         "нет деревьев на карте"
     );
 }
@@ -63,10 +63,10 @@ fn generation_has_variety() {
 fn generation_places_all_object_kinds() {
     let w = generate_world(WorldSize::new(256), 999);
     let counts = count_objects(&w);
-    assert!(counts[ObjectKind::Tree as usize] > 0, "нет деревьев");
-    assert!(counts[ObjectKind::Bush as usize] > 0, "нет кустов");
-    assert!(counts[ObjectKind::Rock as usize] > 0, "нет валунов");
-    assert!(counts[ObjectKind::AppleTree as usize] > 0, "нет яблонь");
+    assert!(counts[ObjectKind::Tree.discriminant() as usize] > 0, "нет деревьев");
+    assert!(counts[ObjectKind::Bush.discriminant() as usize] > 0, "нет кустов");
+    assert!(counts[ObjectKind::Rock.discriminant() as usize] > 0, "нет валунов");
+    assert!(counts[ObjectKind::AppleTree.discriminant() as usize] > 0, "нет яблонь");
 }
 
 /// Генерация содержит все три глубины воды и горы (не вырождается).

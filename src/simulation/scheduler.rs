@@ -43,6 +43,13 @@ pub enum TaskKind {
     BushGrowth { chunk: ChunkPos },
     /// Эрозия: тайл воды подтачивает эродируемых соседей.
     WaterErosion { chunk: ChunkPos, local_index: u8 },
+    /// Стадия культуры на пашне: чанк и линейный индекс тайла в чанке.
+    CropGrowth { chunk: ChunkPos, local_index: u8 },
+    /// Рабочий цикл станции (печь, плавильня, костёр): событие готовки
+    /// или прогорания топлива.
+    StationTick { chunk: ChunkPos, local_index: u8 },
+    /// Проверка пустой пашни (месяц без культуры — возврат в землю).
+    FarmlandRevert { chunk: ChunkPos, local_index: u8 },
     /// Порог потребности достигнут; owner — id существа (появится вместе с существами).
     NeedThreshold { owner: u64, need: NeedKind },
     /// Маркер для тестов планировщика.
@@ -105,6 +112,9 @@ impl Scheduler {
                     | TaskKind::GrassSpread { .. }
                     | TaskKind::BushGrowth { .. }
                     | TaskKind::WaterErosion { .. }
+                    | TaskKind::CropGrowth { .. }
+                    | TaskKind::StationTick { .. }
+                    | TaskKind::FarmlandRevert { .. }
                     | TaskKind::NeedThreshold { .. }
             )
         }

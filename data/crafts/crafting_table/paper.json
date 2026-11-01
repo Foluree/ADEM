@@ -1,0 +1,8 @@
+{
+  "id": "paper",
+  "shapeless": true,
+  "ingredients": [
+    { "item": "paper_pulp", "count": 2 }
+  ],
+  "result": { "item": "paper", "count": 3 }
+}

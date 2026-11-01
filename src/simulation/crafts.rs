@@ -1,4 +1,4 @@
-//! Рецепты крафта из `data/crafts/*.json` и сопоставление с сеткой 3×3.
+//! Рецепты крафта из `data/crafts/**/*.json` и сопоставление с сеткой 3×3.
 //!
 //! Рецепт бывает двух видов (гибрид по решению автора):
 //! - `shaped` (по умолчанию) — важны форма и взаимное расположение
@@ -7,8 +7,15 @@
 //! - `shapeless` — важны только виды и количества, порядок не важен.
 //!
 //! JSON держится в данных, а не в коде: строки предметов — стабильные
-//! идентификаторы `ItemKind::id()`. Категория `manual` — крафт в ручной
-//! сетке 3×3; рецепты других станций появятся позже.
+//! идентификаторы `ItemKind::id()`. Категория рецепта определяется местом
+//! файла: корень каталога — ручной крафт (`manual`), подпапка — станция
+//! с именем папки (`furnace/`, `crafting_table/`, …). Так верстак наследует
+//! ручные рецепты без копирования (тот же файл), а свои добавляет в своей
+//! папке.
+//!
+//! Рецепт может требовать инструменты (кузнечный стол): поле `tools`
+//! перечисляет предметы, которые должны лежать в слотах инструментов.
+//! Инструменты не расходуются — это требование «чем работаешь».
 
 use std::fs;
 use std::path::PathBuf;
@@ -17,7 +24,8 @@ use serde::Deserialize;
 
 use super::items::{Inventory, ItemKind, ItemStack};
 
-/// Категория ручного крафта в сетке 3×3.
+/// Категория ручного крафта в сетке 3×3 (и верстака — сетка наследует
+/// ручные рецепты).
 pub const MANUAL_CATEGORY: &str = "manual";
 
 /// Число ячеек сетки крафта.
@@ -44,6 +52,9 @@ pub struct CraftRecipe {
     pub ingredients: Vec<(ItemKind, u32)>,
     /// Что получается.
     pub result: ItemStack,
+    /// Требуемые инструменты (кузнечный стол): должны лежать в слотах
+    /// инструментов, не расходуются. Пусто — инструменты не нужны.
+    pub tools: Vec<ItemKind>,
 }
 
 /// Обрезанная по занятым клеткам форма рецепта.
@@ -63,41 +74,15 @@ pub struct CraftBook {
 }
 
 impl CraftBook {
-    /// Читает все `*.json` из каталога. Файлы обходятся в лексикографическом
-    /// порядке, поэтому набор рецептов детерминирован. Ошибки отдельных
-    /// файлов не роняют игру: они возвращаются списком для лога.
+    /// Читает все `*.json` из каталога и его подпапок. Категория рецепта —
+    /// по месту файла: корень — `manual`, подпапка X — `X` (станция).
+    /// Файлы и подпапки обходятся в лексикографическом порядке, поэтому
+    /// набор рецептов детерминирован. Ошибки отдельных файлов не роняют
+    /// игру: они возвращаются списком для лога.
     pub fn load_dir(dir: &str) -> (Self, Vec<String>) {
         let mut book = Self::default();
         let mut errors = Vec::new();
-
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) => {
-                errors.push(format!("{dir}: {error}"));
-                return (book, errors);
-            }
-        };
-
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-            .collect();
-        paths.sort();
-
-        for path in paths {
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(error) => {
-                    errors.push(format!("{}: {error}", path.display()));
-                    continue;
-                }
-            };
-            match parse_recipe(&text) {
-                Ok(recipe) => book.recipes.push(recipe),
-                Err(error) => errors.push(format!("{}: {error}", path.display())),
-            }
-        }
+        load_recipes_recursive(std::path::Path::new(dir), MANUAL_CATEGORY, &mut book, &mut errors);
         (book, errors)
     }
 
@@ -107,9 +92,76 @@ impl CraftBook {
         &self,
         grid: &[Option<ItemStack>; GRID_SLOTS],
     ) -> Option<&CraftRecipe> {
-        self.recipes
-            .iter()
-            .find(|recipe| recipe.category == MANUAL_CATEGORY && recipe.matches(grid))
+        self.matching_recipe_for(&[MANUAL_CATEGORY], grid, &[])
+    }
+
+    /// Рецепт первой подходящей категории из `categories` (порядок важен:
+    /// наследование — manual раньше crafting_table). `held_tools` — виды
+    /// предметов в слотах инструментов станции (кузнечный стол).
+    pub fn matching_recipe_for(
+        &self,
+        categories: &[&str],
+        grid: &[Option<ItemStack>; GRID_SLOTS],
+        held_tools: &[ItemKind],
+    ) -> Option<&CraftRecipe> {
+        self.recipes.iter().find(|recipe| {
+            categories.contains(&recipe.category.as_str())
+                && recipe.tools_satisfied(held_tools)
+                && recipe.matches(grid)
+        })
+    }
+}
+
+/// Рекурсивный обход каталога рецептов: файлы текущей папки — с категорией
+/// `category`, подпапки — со своей категорией по имени. Порядок стабильный.
+fn load_recipes_recursive(
+    dir: &std::path::Path,
+    category: &str,
+    book: &mut CraftBook,
+    errors: &mut Vec<String>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push(format!("{}: {error}", dir.display()));
+            return;
+        }
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if path.extension().is_some_and(|ext| ext == "json") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    subdirs.sort();
+
+    for path in files {
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                errors.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        match parse_recipe(&text) {
+            Ok(mut recipe) => {
+                recipe.category = category.to_string();
+                book.recipes.push(recipe);
+            }
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+    for subdir in subdirs {
+        // Имя подпапки = категория станции (furnace/, crafting_table/…).
+        let Some(name) = subdir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        load_recipes_recursive(&subdir, name, book, errors);
     }
 }
 
@@ -121,6 +173,14 @@ impl CraftRecipe {
         } else {
             self.matches_shaped(grid)
         }
+    }
+
+    /// Лежат ли все требуемые инструменты в слотах инструментов (набор,
+    /// порядок не важен). Инструменты не расходуются.
+    pub fn tools_satisfied(&self, held_tools: &[ItemKind]) -> bool {
+        self.tools
+            .iter()
+            .all(|tool| held_tools.contains(tool))
     }
     /// Снимает ингредиенты с сетки после успешного крафта. Для формы —
     /// по одному предмету из каждой занятой клетки; для бесформенного —
@@ -375,6 +435,8 @@ struct RawRecipe {
     grid: Vec<Vec<Option<String>>>,
     #[serde(default)]
     ingredients: Vec<RawIngredient>,
+    #[serde(default)]
+    tools: Vec<String>,
     result: RawResult,
 }
 
@@ -409,6 +471,16 @@ pub fn parse_recipe(json: &str) -> Result<CraftRecipe, String> {
     if raw.result.count == 0 {
         return Err("количество результата должно быть больше нуля".to_string());
     }
+    // Требуемые инструменты: известные предметы, не больше слотов стола.
+    if raw.tools.len() > 4 {
+        return Err("больше четырёх требуемых инструментов".to_string());
+    }
+    let mut tools = Vec::with_capacity(raw.tools.len());
+    for tool in &raw.tools {
+        let kind = ItemKind::from_id(tool)
+            .ok_or_else(|| format!("неизвестный инструмент: {tool}"))?;
+        tools.push(kind);
+    }
 
     if raw.shapeless {
         if raw.ingredients.is_empty() {
@@ -430,6 +502,7 @@ pub fn parse_recipe(json: &str) -> Result<CraftRecipe, String> {
             pattern: None,
             ingredients,
             result: ItemStack { kind: result_kind, count: raw.result.count },
+            tools,
         });
     }
 
@@ -441,6 +514,7 @@ pub fn parse_recipe(json: &str) -> Result<CraftRecipe, String> {
         pattern: Some(pattern),
         ingredients: Vec::new(),
         result: ItemStack { kind: result_kind, count: raw.result.count },
+        tools,
     })
 }
 

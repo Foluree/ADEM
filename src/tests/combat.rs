@@ -89,8 +89,8 @@ fn spear_throw_flies_sticks_and_is_picked_up() {
     player.inventory.items[0] = None;
     let spear = world.projectiles.iter().find(|p| p.id == id).unwrap();
     let duration = spear.duration_ticks;
-    for _ in 0..duration {
-        world.tick_projectiles();
+    for tick in 0..duration {
+        world.tick_projectiles(tick);
     }
     // Полёт закончился: снаряд исчез, копьё воткнулось в цели.
     assert!(world.projectiles.iter().all(|p| p.id != id));
@@ -116,8 +116,8 @@ fn arrow_hits_wolf_and_vanishes() {
         WorldPos { x: 120.5, y: 100.0 },
     );
 
-    for _ in 0..40 {
-        world.tick_projectiles();
+    for tick in 0..40 {
+        world.tick_projectiles(tick);
         if world.entities.iter().all(|e| e.id != id) {
             break;
         }
@@ -126,8 +126,8 @@ fn arrow_hits_wolf_and_vanishes() {
     let hp = world.entities.iter().find(|e| e.id == id).map(|e| e.hp);
     assert_eq!(hp, Some(70.0));
     // Стрела долетела и пропала.
-    for _ in 0..40 {
-        world.tick_projectiles();
+    for tick in 40..80 {
+        world.tick_projectiles(tick);
     }
     assert!(world.projectiles.is_empty());
 }

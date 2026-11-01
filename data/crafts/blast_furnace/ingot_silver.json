@@ -1,0 +1,6 @@
+{
+  "id": "ingot_silver",
+  "shapeless": true,
+  "ingredients": [{ "item": "raw_silver", "count": 1 }],
+  "result": { "item": "ingot_silver", "count": 1 }
+}

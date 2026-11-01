@@ -16,10 +16,12 @@ use crate::app::state::{
     WindowFocusState,
 };
 use crate::simulation::commands::Command;
+use crate::simulation::crops::CropKind;
 use crate::simulation::items::ItemKind;
 use crate::simulation::objects::{ObjectKind, WorldObject};
 use crate::simulation::player::{Player, WorldPos};
-use crate::simulation::{TILE_SIZE, TilePos, World};
+use crate::simulation::{TILE_SIZE, TilePos, TileType, World};
+use crate::ui::UiFont;
 use crate::rendering::isometric::{
     WORLD_TILE_SIZE, ground_position_from_viewport, terrain_tile_from_viewport, world_position,
 };
@@ -120,6 +122,7 @@ impl Plugin for InputPlugin {
                     player_pickup_input,
                     editor_delete_input,
                     editor_entity_drag,
+                    player_throw_input,
                 )
                     .after(crate::app::camera::update_camera_transforms),
             );
@@ -259,6 +262,10 @@ pub(crate) fn world_click_input(
             Tool::Object(kind) => Command::SetObject {
                 pos: tile,
                 object: Some(placed_object(kind)),
+            },
+            Tool::Building(kind) => Command::SetObject {
+                pos: tile,
+                object: Some(WorldObject::building(kind)),
             },
             Tool::Entity(kind) => Command::SpawnEntity { kind, pos: tile },
         };
@@ -422,6 +429,60 @@ fn player_drop_input(
     queue.0.push(Command::PlayerDropItem { pos: tile });
 }
 
+/// Клавиша «Бросить предмет»: один предмет из выбранного слота летит в
+/// сторону тайла под курсором (дальность ограничена симуляцией). Вне
+/// режима игрока, на паузе, при наборе текста и над UI не срабатывает.
+fn player_throw_input(
+    mut queue: ResMut<CommandQueueRes>,
+    keys: Res<ButtonInput<KeyCode>>,
+    settings: Res<Settings>,
+    state: Res<GameState>,
+    player: Res<PlayerRes>,
+    windows: Query<&Window>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
+    blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
+    focus: Res<InputFocus>,
+    text_inputs: Query<(), With<TextInput>>,
+    capture: Res<BindingCapture>,
+) {
+    if state.mode != GameMode::Player || state.paused {
+        return;
+    }
+    if capture.0.is_some() || text_input_focused(&focus, &text_inputs) {
+        return;
+    }
+    if !keys.just_pressed(settings.controls.key(ControlAction::ThrowItem)) {
+        return;
+    }
+    if player.0.is_none() || state.world.is_none() {
+        return;
+    }
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    if cursor_over_ui(window, &blockers) {
+        return;
+    }
+    let Some(tile) = cursor_world_tile(window, &cameras, state.world.as_ref()) else {
+        return;
+    };
+    // Shift/Ctrl + бросок — вылетает весь слот (до стака), без — один предмет.
+    let whole_slot = keys.any_pressed([
+        KeyCode::ShiftLeft,
+        KeyCode::ShiftRight,
+        KeyCode::ControlLeft,
+        KeyCode::ControlRight,
+    ]);
+    if whole_slot
+        && let Some(p) = player.0.as_ref()
+    {
+        let slot = p.selected_slot.min(crate::simulation::MISC_SLOTS - 1) as u8;
+        queue.0.push(Command::PlayerThrowStack { target: tile, slot });
+        return;
+    }
+    queue.0.push(Command::PlayerThrowItem { target: tile });
+}
+
 /// ПКМ по лежащей стопке предметов — подобрать её; по яблоне с плодами —
 /// собрать плоды. Зажатие действует как ЛКМ-добыча: первое действие по
 /// нажатию, затем повтор каждые `INTERACT_REPEAT_SECS` по тайлу под
@@ -438,6 +499,10 @@ fn player_pickup_input(
     construction: Res<crate::ui::construction::ConstructionUi>,
     mut queue: ResMut<CommandQueueRes>,
     player: Res<PlayerRes>,
+    mut station: ResMut<crate::ui::station::StationUi>,
+    mut commands: Commands,
+    font: Res<UiFont>,
+    station_roots: Query<Entity, With<crate::ui::station::StationRoot>>,
     mut hold: Local<HarvestHold>,
     cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     blockers: Query<(&ComputedNode, &UiGlobalTransform, &Visibility), With<BlocksWorldInput>>,
@@ -458,8 +523,29 @@ fn player_pickup_input(
         return;
     }
     // Еда в руке — ПКМ ест по нажатию (зажатие без повторов: кулдаун
-    // поедания всё равно отбрасывал бы команды).
-    if player.0.as_ref().is_some_and(|p| p.selected_item() == Some(ItemKind::Apple)) {
+    // поедания всё равно отбрасывал бы команды). НО сажаемый предмет
+    // (семена, корнеплоды — тоже еда) по подходящей пашне сажается,
+    // а не съедается: проверка как в `rmb_action`/`Player::sow`.
+    let sow_ready = match (player.0.as_ref(), state.world.as_ref()) {
+        (Some(p), Some(world)) => {
+            p.selected_item()
+                .and_then(CropKind::from_seed_item)
+                .is_some()
+                && cursor_world_tile(window, &cameras, Some(world)).is_some_and(|tile| {
+                    world.terrain_kind(tile) == TileType::Farmland
+                        && world.object_at(tile).is_none()
+                        && world.crop_at(tile).is_none()
+                        && world.item_at(tile).is_none()
+                })
+        }
+        _ => false,
+    };
+    if !sow_ready
+        && player
+            .0
+            .as_ref()
+            .is_some_and(|p| p.selected_item().is_some_and(|kind| kind.food_value() > 0.0))
+    {
         if mouse.just_pressed(MouseButton::Right) {
             queue.0.push(Command::PlayerEat);
         }
@@ -473,26 +559,51 @@ fn player_pickup_input(
         return;
     }
     if mouse.just_pressed(MouseButton::Right) {
-        rmb_action(&mut queue, &state, &windows, &cameras);
+        rmb_action(
+            &mut queue,
+            &state,
+            &windows,
+            &cameras,
+            &mut station,
+            &mut commands,
+            &font,
+            &player,
+            &station_roots,
+        );
         hold.cooldown = INTERACT_REPEAT_SECS;
         return;
     }
     hold.cooldown -= time.delta_secs();
     if hold.cooldown <= 0.0 {
-        rmb_action(&mut queue, &state, &windows, &cameras);
+        rmb_action(
+            &mut queue,
+            &state,
+            &windows,
+            &cameras,
+            &mut station,
+            &mut commands,
+            &font,
+            &player,
+            &station_roots,
+        );
         hold.cooldown =
             INTERACT_REPEAT_SECS - (-hold.cooldown).rem_euclid(INTERACT_REPEAT_SECS);
     }
 }
 
-/// Одно действие ПКМ в режиме игрока: подобрать стопку предметов с тайла
-/// под курсором или собрать плоды с яблони. Тайл читается заново на
-/// каждый повтор — зажатие собирает и с соседних яблонь при проведении.
+/// Одно действие ПКМ в режиме игрока: открыть GUI станции, посеять
+/// культуру в пашню, подобрать стопку предметов с тайла или собрать
+/// плоды с яблони. Тайл читается заново на каждый повтор.
 fn rmb_action(
     queue: &mut CommandQueueRes,
     state: &GameState,
     windows: &Query<&Window>,
     cameras: &Query<(&Camera, &Transform), With<Camera2d>>,
+    station: &mut crate::ui::station::StationUi,
+    commands: &mut Commands,
+    font: &UiFont,
+    player: &PlayerRes,
+    station_roots: &Query<Entity, With<crate::ui::station::StationRoot>>,
 ) {
     let Some(world) = state.world.as_ref() else {
         return;
@@ -500,13 +611,38 @@ fn rmb_action(
     let Ok(window) = windows.single() else {
         return;
     };
-    if let Some(tile) = cursor_world_tile(window, cameras, Some(world)) {
-        if world.item_at(tile).is_some() {
-            queue.0.push(Command::PlayerPickupItem { pos: tile });
-        } else if world.object_at(tile).is_some_and(|obj| obj.apple_yield().is_some()) {
-            // ПКМ по яблоне — собрать плоды (ЛКМ по ней ничего не делает).
-            queue.0.push(Command::PlayerHarvestApple { pos: tile });
-        }
+    let Some(tile) = cursor_world_tile(window, cameras, Some(world)) else {
+        return;
+    };
+    // Станция под курсором — открыть её GUI (приоритет над всем остальным),
+    // только если она в радиусе взаимодействия с тайлами.
+    if let Some(kind) = world
+        .object_at(tile)
+        .map(|obj| obj.kind)
+        .filter(|kind| kind.is_station())
+        .filter(|_| player.0.as_ref().is_some_and(|p| p.reachable(tile, world)))
+    {
+        crate::ui::station::toggle_station(commands, station, station_roots, font, tile, kind);
+        return;
+    }
+    // Сажаемый предмет в руке и пашня без объекта — посев.
+    if player
+        .0
+        .as_ref()
+        .is_some_and(|p| p.selected_item().and_then(CropKind::from_seed_item).is_some())
+        && world.terrain_kind(tile) == TileType::Farmland
+        && world.object_at(tile).is_none()
+        && world.crop_at(tile).is_none()
+        && world.item_at(tile).is_none()
+    {
+        queue.0.push(Command::PlayerSow { pos: tile });
+        return;
+    }
+    if world.item_at(tile).is_some() {
+        queue.0.push(Command::PlayerPickupItem { pos: tile });
+    } else if world.object_at(tile).is_some_and(|obj| obj.apple_yield().is_some()) {
+        // ПКМ по яблоне — собрать плоды (ЛКМ по ней ничего не делает).
+        queue.0.push(Command::PlayerHarvestApple { pos: tile });
     }
 }
 
@@ -518,7 +654,7 @@ fn placed_object(kind: ObjectKind) -> WorldObject {
         ObjectKind::Bush => WorldObject::bush(),
         ObjectKind::Rock => WorldObject::rock(10),
         ObjectKind::AppleTree => WorldObject::apple_tree(),
-        ObjectKind::Campfire => WorldObject::campfire(),
+        ObjectKind::Building(kind) => WorldObject::building(kind),
     }
 }
 

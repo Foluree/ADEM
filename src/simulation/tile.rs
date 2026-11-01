@@ -22,6 +22,12 @@ pub enum TileType {
     Ocean,
     /// Гора: высокий рельеф над камнем.
     Mountain,
+    /// Мох: пятнами в лесу на уровне лесной травы.
+    Moss,
+    /// Грязь: задел под будущие биомы, пока не генерируется.
+    Mud,
+    /// Подзол: задел под будущие биомы, пока не генерируется.
+    Podzol,
 }
 
 impl TileType {
@@ -40,6 +46,9 @@ impl TileType {
             9 => Some(Self::DeepWater),
             10 => Some(Self::Ocean),
             11 => Some(Self::Mountain),
+            12 => Some(Self::Moss),
+            13 => Some(Self::Mud),
+            14 => Some(Self::Podzol),
             _ => None,
         }
     }
@@ -60,6 +69,9 @@ impl TileType {
             TileType::DeepWater => [0.10, 0.24, 0.50, 1.0],
             TileType::Ocean => [0.05, 0.15, 0.38, 1.0],
             TileType::Mountain => [0.36, 0.35, 0.34, 1.0],
+            TileType::Moss => [0.24, 0.45, 0.20, 1.0],
+            TileType::Mud => [0.31, 0.25, 0.18, 1.0],
+            TileType::Podzol => [0.44, 0.32, 0.18, 1.0],
         }
     }
 

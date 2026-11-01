@@ -181,6 +181,9 @@ pub enum ControlAction {
     /// «Назад» из категории редактора к базовым кнопкам панели
     /// (по умолчанию Q).
     EditorBack,
+    /// Бросить один предмет из выбранного слота по направлению курсора
+    /// (по умолчанию G).
+    ThrowItem,
     /// Меню строительства (по умолчанию C).
     ConstructionMenu,
     /// Движение вверх (по умолчанию W): существо в игре, камера — в редакторе.
@@ -197,13 +200,14 @@ pub enum ControlAction {
 
 impl ControlAction {
     /// Все действия в порядке меню «Управление».
-    pub const ALL: [ControlAction; 12] = [
+    pub const ALL: [ControlAction; 13] = [
         ControlAction::Pause,
         ControlAction::TechMenu,
         ControlAction::SocialMenu,
         ControlAction::CreativeMenu,
         ControlAction::Inventory,
         ControlAction::EditorBack,
+        ControlAction::ThrowItem,
         ControlAction::ConstructionMenu,
         ControlAction::MoveUp,
         ControlAction::MoveDown,
@@ -221,6 +225,7 @@ impl ControlAction {
             ControlAction::CreativeMenu => "Творческое меню",
             ControlAction::Inventory => "Инвентарь",
             ControlAction::EditorBack => "Назад (редактор)",
+            ControlAction::ThrowItem => "Бросить предмет",
             ControlAction::ConstructionMenu => "Меню строительства",
             ControlAction::MoveUp => "Вверх",
             ControlAction::MoveDown => "Вниз",
@@ -239,6 +244,7 @@ impl ControlAction {
             ControlAction::CreativeMenu => KeyCode::KeyI,
             ControlAction::Inventory => KeyCode::Tab,
             ControlAction::EditorBack => KeyCode::KeyQ,
+            ControlAction::ThrowItem => KeyCode::KeyG,
             ControlAction::ConstructionMenu => KeyCode::KeyC,
             ControlAction::MoveUp => KeyCode::KeyW,
             ControlAction::MoveDown => KeyCode::KeyS,
@@ -277,6 +283,8 @@ pub struct Controls {
     pub move_right: String,
     #[serde(default = "d_key_drop_item")]
     pub drop_item: String,
+    #[serde(default = "d_key_throw_item")]
+    pub throw_item: String,
 }
 
 fn d_key_pause() -> String {
@@ -315,6 +323,9 @@ fn d_key_move_right() -> String {
 fn d_key_drop_item() -> String {
     keycode_name(KeyCode::KeyV).to_string()
 }
+fn d_key_throw_item() -> String {
+    keycode_name(KeyCode::KeyG).to_string()
+}
 
 impl Default for Controls {
     fn default() -> Self {
@@ -331,6 +342,7 @@ impl Default for Controls {
             move_left: d_key_move_left(),
             move_right: d_key_move_right(),
             drop_item: d_key_drop_item(),
+            throw_item: d_key_throw_item(),
         }
     }
 }
@@ -352,6 +364,7 @@ impl Controls {
             ControlAction::MoveLeft => &self.move_left,
             ControlAction::MoveRight => &self.move_right,
             ControlAction::DropItem => &self.drop_item,
+            ControlAction::ThrowItem => &self.throw_item,
         };
         parse_keycode(name).unwrap_or_else(|| action.default_key())
     }
@@ -371,6 +384,7 @@ impl Controls {
             ControlAction::MoveLeft => self.move_left = name,
             ControlAction::MoveRight => self.move_right = name,
             ControlAction::DropItem => self.drop_item = name,
+            ControlAction::ThrowItem => self.throw_item = name,
         }
     }
 }

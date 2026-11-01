@@ -7,7 +7,7 @@
 use super::tile::ResourceKind;
 
 /// Число видов предметов (иконки UI, текстуры, массивы отображения).
-pub const ITEM_KIND_COUNT: usize = 85;
+pub const ITEM_KIND_COUNT: usize = 90;
 
 /// Вид предмета. Значения — стабильные идентификаторы (repr(u8));
 /// новые виды добавляются только в конец, чтобы не сдвигать существующие.
@@ -158,8 +158,6 @@ pub enum ItemKind {
     PotatoBaked,
     /// Странный клубень (задел: добыча лопатой из травы/земли).
     StrangeTuber,
-    /// Клубника.
-    Strawberries,
     /// Медная руда.
     RawCopper,
     /// Золотая руда.
@@ -184,6 +182,18 @@ pub enum ItemKind {
     ShovelCopper,
     /// Медный серп.
     SickleCopper,
+    /// Семена свёклы.
+    BeetrootSeeds,
+    /// Свёкла.
+    Beetroot,
+    /// Печёная свёкла (готовка в печи).
+    BeetrootRoasted,
+    /// Вишня (горсть ягод).
+    Cherry,
+    /// Уголь (топливо плавильной печи).
+    Coal,
+    /// Древесный уголь (топливо печи).
+    Charcoal,
 }
 
 impl ItemKind {
@@ -261,7 +271,6 @@ impl ItemKind {
         ItemKind::Potato,
         ItemKind::PotatoBaked,
         ItemKind::StrangeTuber,
-        ItemKind::Strawberries,
         ItemKind::RawCopper,
         ItemKind::RawGold,
         ItemKind::RawSilver,
@@ -274,6 +283,12 @@ impl ItemKind {
         ItemKind::ShearsCopper,
         ItemKind::ShovelCopper,
         ItemKind::SickleCopper,
+        ItemKind::BeetrootSeeds,
+        ItemKind::Beetroot,
+        ItemKind::BeetrootRoasted,
+        ItemKind::Cherry,
+        ItemKind::Coal,
+        ItemKind::Charcoal,
     ];
 
     /// Вид предмета по стабильному значению u8 (сохранения).
@@ -352,19 +367,24 @@ impl ItemKind {
             69 => Some(Self::Potato),
             70 => Some(Self::PotatoBaked),
             71 => Some(Self::StrangeTuber),
-            72 => Some(Self::Strawberries),
-            73 => Some(Self::RawCopper),
-            74 => Some(Self::RawGold),
-            75 => Some(Self::RawSilver),
-            76 => Some(Self::RawTin),
-            77 => Some(Self::AxeCopper),
-            78 => Some(Self::HammerCopper),
-            79 => Some(Self::HoeCopper),
-            80 => Some(Self::PickaxeCopper),
-            81 => Some(Self::SawCopper),
-            82 => Some(Self::ShearsCopper),
-            83 => Some(Self::ShovelCopper),
-            84 => Some(Self::SickleCopper),
+            72 => Some(Self::RawCopper),
+            73 => Some(Self::RawGold),
+            74 => Some(Self::RawSilver),
+            75 => Some(Self::RawTin),
+            76 => Some(Self::AxeCopper),
+            77 => Some(Self::HammerCopper),
+            78 => Some(Self::HoeCopper),
+            79 => Some(Self::PickaxeCopper),
+            80 => Some(Self::SawCopper),
+            81 => Some(Self::ShearsCopper),
+            82 => Some(Self::ShovelCopper),
+            83 => Some(Self::SickleCopper),
+            84 => Some(Self::BeetrootSeeds),
+            85 => Some(Self::Beetroot),
+            86 => Some(Self::BeetrootRoasted),
+            87 => Some(Self::Cherry),
+            88 => Some(Self::Coal),
+            89 => Some(Self::Charcoal),
             _ => None,
         }
     }
@@ -444,7 +464,6 @@ impl ItemKind {
             ItemKind::Potato => "potato",
             ItemKind::PotatoBaked => "potato_baked",
             ItemKind::StrangeTuber => "strange_tuber",
-            ItemKind::Strawberries => "strawberries",
             ItemKind::RawCopper => "raw_copper",
             ItemKind::RawGold => "raw_gold",
             ItemKind::RawSilver => "raw_silver",
@@ -457,6 +476,12 @@ impl ItemKind {
             ItemKind::ShearsCopper => "shears_copper",
             ItemKind::ShovelCopper => "shovel_copper",
             ItemKind::SickleCopper => "sickle_copper",
+            ItemKind::BeetrootSeeds => "seeds_beetroot",
+            ItemKind::Beetroot => "beetroot",
+            ItemKind::BeetrootRoasted => "beetroot_roasted",
+            ItemKind::Cherry => "cherry",
+            ItemKind::Coal => "coal",
+            ItemKind::Charcoal => "charcoal",
         }
     }
 
@@ -549,7 +574,6 @@ impl ItemKind {
             | ItemKind::Potato
             | ItemKind::PotatoBaked
             | ItemKind::StrangeTuber
-            | ItemKind::Strawberries
             | ItemKind::RawCopper
             | ItemKind::RawGold
             | ItemKind::RawSilver
@@ -561,7 +585,13 @@ impl ItemKind {
             | ItemKind::SawCopper
             | ItemKind::ShearsCopper
             | ItemKind::ShovelCopper
-            | ItemKind::SickleCopper => ItemClass::Misc,
+            | ItemKind::SickleCopper
+            | ItemKind::BeetrootSeeds
+            | ItemKind::Beetroot
+            | ItemKind::BeetrootRoasted
+            | ItemKind::Cherry
+            | ItemKind::Coal
+            | ItemKind::Charcoal => ItemClass::Misc,
             ItemKind::HelmetChainmail => ItemClass::Armor(BodySlot::Head),
             ItemKind::ChestplateChainmail => ItemClass::Armor(BodySlot::Chest),
             ItemKind::LeggingsChainmail => ItemClass::Armor(BodySlot::Legs),
@@ -655,11 +685,16 @@ impl ItemKind {
             | ItemKind::Potato
             | ItemKind::PotatoBaked
             | ItemKind::StrangeTuber
-            | ItemKind::Strawberries
             | ItemKind::RawCopper
             | ItemKind::RawGold
             | ItemKind::RawSilver
-            | ItemKind::RawTin => MAX_STACK,
+            | ItemKind::RawTin
+            | ItemKind::BeetrootSeeds
+            | ItemKind::Beetroot
+            | ItemKind::BeetrootRoasted
+            | ItemKind::Cherry
+            | ItemKind::Coal
+            | ItemKind::Charcoal => MAX_STACK,
         }
     }
 
@@ -689,6 +724,88 @@ impl ItemKind {
             _ => None,
         }
     }
+
+    /// Класс инструмента/оружия: обобщённая проверка «умеет ли предмет
+    /// это действие» (любая кирка добывает камень, любая мотыга пашет —
+    /// идея из Minecraft). `None` — предмет не инструмент. Match без
+    /// wildcard: новый инструмент не компилируется, пока класс не решён.
+    pub fn tool_class(self) -> Option<ToolClass> {
+        match self {
+            ItemKind::Pickaxe | ItemKind::PickaxeCopper => Some(ToolClass::Pickaxe),
+            ItemKind::Axe | ItemKind::AxeCopper => Some(ToolClass::Axe),
+            ItemKind::Shovel | ItemKind::ShovelCopper => Some(ToolClass::Shovel),
+            ItemKind::Hoe | ItemKind::HoeCopper => Some(ToolClass::Hoe),
+            ItemKind::Spear => Some(ToolClass::Spear),
+            ItemKind::Knife => Some(ToolClass::Knife),
+            ItemKind::HammerStone | ItemKind::HammerCopper => Some(ToolClass::Hammer),
+            ItemKind::SawCopper => Some(ToolClass::Saw),
+            ItemKind::SickleCopper => Some(ToolClass::Sickle),
+            ItemKind::ShearsCopper => Some(ToolClass::Shears),
+            // Класс Sword зарезервирован: мечей в игре пока нет.
+            _ => None,
+        }
+    }
+
+    /// Время горения предмета как топлива в тиках печи; 0 — не топливо.
+    /// Плавильная печь принимает только уголь (см. `containers.rs`).
+    pub fn burn_time(self) -> u32 {
+        match self {
+            ItemKind::Stick => 100,
+            ItemKind::StickBundle => 400,
+            ItemKind::DustWoodChips => 50,
+            ItemKind::DustCharcoal => 400,
+            ItemKind::Charcoal => 1200,
+            ItemKind::Coal => 1600,
+            _ => 0,
+        }
+    }
+
+    /// Питательность еды в единицах сытости (`Hunger::eat`); 0 —
+    /// несъедобное. Значения согласованны: сырая еда дешевле готовой,
+    /// ягоды — лёгкая еда, мясо — сытная.
+    pub fn food_value(self) -> f32 {
+        match self {
+            ItemKind::Apple => 10.0,
+            ItemKind::AppleBaked => 14.0,
+            ItemKind::Cherry => 3.0,
+            ItemKind::Carrot => 4.0,
+            ItemKind::CarrotBaked => 7.0,
+            ItemKind::Potato => 4.0,
+            ItemKind::PotatoBaked => 8.0,
+            ItemKind::Beetroot => 4.0,
+            ItemKind::BeetrootRoasted => 7.0,
+            ItemKind::Egg => 4.0,
+            ItemKind::EggRoasted => 7.0,
+            ItemKind::WheatSeeds => 2.0,
+            ItemKind::Lard => 10.0,
+            ItemKind::StrangeTuber => 6.0,
+            ItemKind::MeatBirdRaw => 6.0,
+            ItemKind::MeatBirdCooked => 12.0,
+            ItemKind::MeatHerbivoreRaw => 7.0,
+            ItemKind::MeatHerbivoreCooked => 14.0,
+            ItemKind::MeatPredatorRaw => 5.0,
+            ItemKind::MeatPredatorCooked => 10.0,
+            _ => 0.0,
+        }
+    }
+}
+
+/// Класс инструмента/оружия — обобщённое поведение вместо проверки десятков
+/// отдельных видов (любая кирка добывает камень, любая мотыга пашет землю).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // Sword — задел: мечей в игре пока нет
+pub enum ToolClass {
+    Pickaxe,
+    Axe,
+    Shovel,
+    Hoe,
+    Sword,
+    Knife,
+    Hammer,
+    Spear,
+    Saw,
+    Sickle,
+    Shears,
 }
 
 /// Базовый радиус атаки в тайлах — расстояние от существа до цели.

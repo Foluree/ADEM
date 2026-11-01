@@ -1,6 +1,7 @@
 //! Тесты игрока и его окружения: движение, инвентарь, добыча и сбор,
 //! очередь команд симуляции.
 
+use crate::simulation::crafts::CraftBook;
 use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::objects::{ObjectKind, WorldObject};
 use crate::simulation::tile::TileType;
@@ -524,7 +525,7 @@ fn command_player_eat_consumes_apple() {
     queue.push(Command::PlayerEat);
     queue.push(Command::PlayerEat);
     let mut dirty = DirtyTiles::default();
-    queue.apply_all(&mut world, Some(&mut p), &mut dirty, &mut sched, 0);
+    queue.apply_all(&mut world, Some(&mut p), &mut dirty, &mut sched, 0, &CraftBook::default());
 
     assert_eq!(p.inventory.count_of(ItemKind::Apple), 2, "второй укус отброшен кулдауном");
     assert!((p.hunger.value() - 60.0).abs() < 1e-4, "hunger = {}", p.hunger.value());
@@ -532,10 +533,10 @@ fn command_player_eat_consumes_apple() {
     // На тике 49 ещё рано (команда применена, но отброшена кулдауном),
     // на тике 50 — можно: снова кладём команду в очередь.
     queue.push(Command::PlayerEat);
-    queue.apply_all(&mut world, Some(&mut p), &mut dirty, &mut sched, 49);
+    queue.apply_all(&mut world, Some(&mut p), &mut dirty, &mut sched, 49, &CraftBook::default());
     assert_eq!(p.inventory.count_of(ItemKind::Apple), 2);
     queue.push(Command::PlayerEat);
-    queue.apply_all(&mut world, Some(&mut p), &mut dirty, &mut sched, 50);
+    queue.apply_all(&mut world, Some(&mut p), &mut dirty, &mut sched, 50, &CraftBook::default());
     assert_eq!(p.inventory.count_of(ItemKind::Apple), 1);
 
     // Не еда в руке: команда ничего не меняет.
@@ -545,7 +546,7 @@ fn command_player_eat_consumes_apple() {
     });
     let hunger_before = p.hunger.value();
     queue.push(Command::PlayerEat);
-    queue.apply_all(&mut world, Some(&mut p), &mut dirty, &mut sched, 500);
+    queue.apply_all(&mut world, Some(&mut p), &mut dirty, &mut sched, 500, &CraftBook::default());
     assert_eq!(p.hunger.value(), hunger_before);
     assert_eq!(p.inventory.count_of(ItemKind::Rock), 1);
 }
@@ -724,7 +725,7 @@ fn commands_apply_fifo_and_report_dirty() {
     queue.push(Command::SetTerrain { pos: TilePos { x: -1, y: 0 }, kind: TileType::Sand });
 
     let mut dirty = DirtyTiles::default();
-    let applied = queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
+    let applied = queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0, &CraftBook::default());
     assert_eq!(applied, 3);
     assert_eq!(world.terrain_kind(a), TileType::Sand);
     assert!(world.object_at(b).is_some());
@@ -761,7 +762,7 @@ fn command_drop_stack_finds_free_tile() {
     });
 
     let mut dirty = DirtyTiles::default();
-    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
+    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0, &CraftBook::default());
 
     // Палки долились в центральную стопку.
     assert_eq!(world.item_at(center).map(|s| (s.kind, s.count)), Some((ItemKind::Stick, 15)));
@@ -801,7 +802,7 @@ fn command_drop_stack_searches_until_free_tile() {
         stack: ItemStack { kind: ItemKind::Stick, count: 2 },
     });
     let mut dirty = DirtyTiles::default();
-    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0);
+    queue.apply_all(&mut world, None, &mut dirty, &mut sched, 0, &CraftBook::default());
 
     // Первый свободный тайл — на кольце радиуса 3, обход начинается
     // с угла (dx, dy) = (-3, -3).

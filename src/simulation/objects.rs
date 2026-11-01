@@ -1,11 +1,22 @@
-//! Объекты над тайлами: дерево, куст, валун, яблоня и постройки (костёр).
-//! Один объект на тайл; хранятся разреженно в слое чанка, а не как
-//! Bevy-сущности — сущности рендер создаёт только для видимых объектов.
+//! Объекты над тайлами. Один объект на тайл; хранятся разреженно в слое
+//! чанка, а не как Bevy-сущности — сущности рендер создаёт только для
+//! видимых объектов.
+//!
+//! Два класса видов:
+//! - **Объекты** (`ObjectKind`) — всё, что выросло/возникло само: деревья,
+//!   кусты, валуны, яблони. Генерируются проходом генерации.
+//! - **Постройки** (`BuildingKind`) — рукотворные сооружения: костёр,
+//!   верстак, печи, бочка, склад, кузнечный стол. Не генерируются,
+//!   строятся игроком (меню строительства) или редактором.
+//!
+//! `WorldObject` хранит вид как `ObjectKind`: вариант `Building` несёт
+//! конкретную постройку, поэтому слой чанка и сохранения остаются одним
+//! слоем с одной кодировкой дискриминантов.
 
 use super::items::ItemKind;
 use super::tile::ResourceKind;
 
-/// Вид объекта.
+/// Вид объекта над тайлом: природный объект или постройка.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum ObjectKind {
@@ -13,28 +24,71 @@ pub enum ObjectKind {
     Bush,
     Rock,
     AppleTree,
-    /// Постройка: костёр (строится игроком, пока горит вечно).
+    /// Постройка (рукотворное сооружение) — см. `BuildingKind`.
+    Building(BuildingKind),
+}
+
+/// Постройка: рукотворное сооружение. Не генерируется, ставится игроком
+/// или редактором. Новые виды — только в конец (стабильные дискриминанты).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum BuildingKind {
+    /// Костёр (строится игроком, пока горит вечно).
     Campfire,
+    /// Рабочая станция: верстак (сетка 3×3, крафты manual + свои).
+    CraftingTable,
+    /// Рабочая станция: печь (готовка на топливе, 100 тиков).
+    Furnace,
+    /// Рабочая станция: бочка (24 слота хранения).
+    Barrel,
+    /// Рабочая станция: плавильная печь (руда → слитки, 200 тиков).
+    BlastFurnace,
+    /// Склад: плоская постройка-декаль, 16 слотов хранения.
+    Storage,
+    /// Рабочая станция: кузнечный стол (сетка 3×3 + 4 слота инструментов).
+    SmithingTable,
 }
 
 impl ObjectKind {
-    /// Все виды объектов в стабильном порядке (генерация, UI редактора).
+    /// Природные объекты в стабильном порядке (генерация, UI редактора).
     /// Новые виды добавляются в конец — стабильные значения не сдвигаются.
-    pub const ALL: [ObjectKind; 5] = [
+    pub const ALL: [ObjectKind; 4] = [
         ObjectKind::Tree,
         ObjectKind::Bush,
         ObjectKind::Rock,
         ObjectKind::AppleTree,
-        ObjectKind::Campfire,
     ];
-
-    /// Виды-постройки: не генерируются, строятся через меню строительства
-    /// (в редакторе — бесплатной установкой из категории Buildings).
-    pub const BUILDINGS: [ObjectKind; 1] = [ObjectKind::Campfire];
 
     /// Является ли вид постройкой (у кнопок редактора, меню строительства).
     pub fn is_building(self) -> bool {
-        Self::BUILDINGS.contains(&self)
+        matches!(self, ObjectKind::Building(_))
+    }
+
+    /// Постройка под видом, если это постройка.
+    pub fn building_kind(self) -> Option<BuildingKind> {
+        match self {
+            ObjectKind::Building(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
+    /// Рабочая станция ли вид: открывается по ПКМ, имеет контейнер
+    /// (или сетку крафта) со своей механикой. Пока все постройки —
+    /// станции; решение за видом постройки (`BuildingKind::is_station`).
+    pub fn is_station(self) -> bool {
+        self.building_kind().is_some_and(BuildingKind::is_station)
+    }
+
+    /// Стабильное значение u8 (сохранения): природные виды 0–3, постройки
+    /// 4 + дискриминант вида постройки.
+    pub fn discriminant(self) -> u8 {
+        match self {
+            ObjectKind::Tree => 0,
+            ObjectKind::Bush => 1,
+            ObjectKind::Rock => 2,
+            ObjectKind::AppleTree => 3,
+            ObjectKind::Building(kind) => 4 + kind as u8,
+        }
     }
 
     /// Вид объекта по стабильному значению u8 (сохранения).
@@ -44,7 +98,49 @@ impl ObjectKind {
             1 => Some(Self::Bush),
             2 => Some(Self::Rock),
             3 => Some(Self::AppleTree),
-            4 => Some(Self::Campfire),
+            4..=10 => BuildingKind::from_discriminant(value - 4).map(Self::Building),
+            _ => None,
+        }
+    }
+}
+
+impl BuildingKind {
+    /// Все постройки в стабильном порядке (меню строительства, редактор).
+    pub const ALL: [BuildingKind; 7] = [
+        BuildingKind::Campfire,
+        BuildingKind::CraftingTable,
+        BuildingKind::Furnace,
+        BuildingKind::Barrel,
+        BuildingKind::BlastFurnace,
+        BuildingKind::Storage,
+        BuildingKind::SmithingTable,
+    ];
+
+    /// Рабочая станция ли постройка: открывается по ПКМ, имеет контейнер
+    /// (или сетку крафта). Сейчас станции все постройки; match без
+    /// wildcard заставит решить это для каждой новой постройки.
+    pub fn is_station(self) -> bool {
+        match self {
+            BuildingKind::Campfire
+            | BuildingKind::CraftingTable
+            | BuildingKind::Furnace
+            | BuildingKind::Barrel
+            | BuildingKind::BlastFurnace
+            | BuildingKind::Storage
+            | BuildingKind::SmithingTable => true,
+        }
+    }
+
+    /// Вид постройки по стабильному значению u8 (сохранения).
+    pub fn from_discriminant(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Campfire),
+            1 => Some(Self::CraftingTable),
+            2 => Some(Self::Furnace),
+            3 => Some(Self::Barrel),
+            4 => Some(Self::BlastFurnace),
+            5 => Some(Self::Storage),
+            6 => Some(Self::SmithingTable),
             _ => None,
         }
     }
@@ -106,16 +202,12 @@ impl WorldObject {
         Self::apple_tree_with_fruit(6)
     }
 
-    /// Костёр — первая постройка. Пока горит вечно (без топлива).
-    pub fn campfire() -> Self {
-        Self { kind: ObjectKind::Campfire, stage: ObjectStage::Mature, charge: 0 }
-    }
-
-    /// Объект для постройки по виду. `None` — вид не является постройкой.
-    pub fn building(kind: ObjectKind) -> Option<Self> {
-        match kind {
-            ObjectKind::Campfire => Some(Self::campfire()),
-            _ => None,
+    /// Объект для постройки по виду постройки.
+    pub fn building(kind: BuildingKind) -> Self {
+        Self {
+            kind: ObjectKind::Building(kind),
+            stage: ObjectStage::Mature,
+            charge: 0,
         }
     }
 
@@ -146,13 +238,15 @@ impl WorldObject {
     }
 }
 
-/// Стоимость строительства постройки: предмет и количество. `None` — вид
-/// не является постройкой. Цены построек собраны здесь, чтобы симуляция
-/// (команда строительства) и UI (голограмма, меню) читали одни и те же
-/// данные.
-pub fn build_cost(kind: ObjectKind) -> Option<(ItemKind, u32)> {
+/// Стоимость строительства постройки: предмет и количество. `None` — цена
+/// не задана (постройка ставится редактором и в меню строительства не
+/// показывается). Цены построек собраны здесь, чтобы симуляция (команда
+/// строительства) и UI (голограмма, меню) читали одни и те же данные.
+pub fn build_cost(kind: BuildingKind) -> Option<(ItemKind, u32)> {
     match kind {
-        ObjectKind::Campfire => Some((ItemKind::Stick, 16)),
+        BuildingKind::Campfire => Some((ItemKind::Stick, 16)),
+        // Крафтов рабочих станций пока нет: строятся редактором, в меню
+        // строительства не показываются (цена не задана).
         _ => None,
     }
 }

@@ -52,6 +52,10 @@ const THRUST_SPRITE_TILES: f32 = 0.8;
 const THROWN_SPEAR_SPRITE_TILES: f32 = 0.9;
 /// Размер текстуры лука относительно тайла (вдвое меньше прежнего показа).
 const BOW_SPRITE_TILES: f32 = 0.5;
+
+/// Подъём оружия «в руках» (копьё, лук) над центром игрока, тайлов:
+/// у центра спрайт рисуется в ногах.
+const WEAPON_HAND_LIFT: f32 = 5.0;
 /// Насколько эффект оружия сдвинут к камере, чтобы перекрыть спрайт игрока.
 /// Цвет следа: серо-белый, полупрозрачный (альфа 0.5 в начале взмаха).
 const SWING_COLOR: Color = Color::srgba(0.85, 0.85, 0.9, 0.5);
@@ -178,13 +182,17 @@ fn spawn_weapon_fx(
                     ),
                 };
                 let rotation = aim_angle - SPRITE_ANGLE_OFFSET + extra_rotation;
+                // Оружие хранит поднятый origin: все дальнейшие кадры
+                // анимации (выпад, удержание лука) идут от него же.
+                let weapon_origin =
+                    origin + camera_rotation * (Vec3::Z * FX_Z_LIFT + Vec3::Y * WEAPON_HAND_LIFT);
                 commands.spawn((
                     Sprite {
                         image: kind_texture.clone(),
                         custom_size: Some(Vec2::splat(TILE_SIZE * size)),
                         ..default()
                     },
-                    Transform::from_translation(origin + camera_rotation * Vec3::Z * FX_Z_LIFT)
+                    Transform::from_translation(weapon_origin)
                         .with_rotation(camera_rotation * Quat::from_rotation_z(rotation)),
                     WeaponFxEffect {
                         age: 0.0,
@@ -193,7 +201,7 @@ fn spawn_weapon_fx(
                             _ => BOW_SHOT_FX_TICKS / TICKS_PER_SEC as f32,
                         },
                         kind: fx_msg.kind,
-                        origin,
+                        origin: weapon_origin,
                         aim_angle,
                         start_angle: aim_angle,
                     },
@@ -253,9 +261,9 @@ fn update_weapon_fx(
                 // ориентацию после первого кадра анимации.
                 let offset = (std::f32::consts::PI * progress).sin() * THRUST_REACH_PX;
                 let (sin, cos) = effect.aim_angle.sin_cos();
+                // origin уже поднят (см. WEAPON_HAND_LIFT при спавне).
                 let position = effect.origin
-                    + camera_rotation * Vec3::new(cos * offset, sin * offset, 0.0)
-                    + camera_rotation * Vec3::Z * FX_Z_LIFT;
+                    + camera_rotation * Vec3::new(cos * offset, sin * offset, 0.0);
                 commands.entity(entity).insert(
                     Transform::from_translation(position).with_rotation(
                         camera_rotation
@@ -276,7 +284,7 @@ fn update_weapon_fx(
                     continue;
                 };
                 let position = world_position(world, Vec2::new(p.x, p.y))
-                    + camera_rotation * Vec3::Z * FX_Z_LIFT;
+                    + camera_rotation * (Vec3::Z * FX_Z_LIFT + Vec3::Y * WEAPON_HAND_LIFT);
                 commands.entity(entity).insert(
                     Transform::from_translation(position).with_rotation(
                         camera_rotation
@@ -308,7 +316,7 @@ struct ProjectileSprites {
 const ARROW_LINE_PX: f32 = 10.0;
 /// Толщина линии стрелы на ЭКРАНЕ в пикселях — не масштабируется зумом:
 /// мировая толщина пересчитывается из масштаба камеры каждый кадр.
-const ARROW_LINE_SCREEN_PX: f32 = 0.25;
+const ARROW_LINE_SCREEN_PX: f32 = 0.5;
 /// Какую долю высоты полёта показывать как мировую высоту снаряда.
 const HEIGHT_LIFT: f32 = 0.75;
 
@@ -407,7 +415,14 @@ fn update_projectile_sprites(
     for projectile in &world.projectiles {
         let pos = projectile.pos();
         let mut world_pos = world_position(world, Vec2::new(pos.x, pos.y));
-        world_pos.z += projectile.height() * WORLD_TILE_SIZE * HEIGHT_LIFT;
+        // Снаряды, выпускаемые «из рук» (стрела, брошенное копьё), стартуют
+        // с высоты рук: подъём затухает к посадке, точка падения — земля.
+        let hand_lift = match projectile.kind {
+            ProjectileKind::Arrow | ProjectileKind::ThrownSpear => {
+                WEAPON_HAND_LIFT * (1.0 - projectile.t)
+            }
+        };
+        world_pos.z += (projectile.height() + hand_lift) * WORLD_TILE_SIZE * HEIGHT_LIFT;
         let Ok(viewport_pos) = camera.world_to_viewport(&camera_global, world_pos) else {
             continue;
         };

@@ -17,7 +17,8 @@ pub(crate) fn tile_elevation(kind: TileType) -> f32 {
         | TileType::Ocean
         | TileType::Sand => 0.0,
         TileType::Dirt | TileType::Grass | TileType::Farmland | TileType::Clay => 1.0,
-        TileType::ForestGrass => 2.0,
+        TileType::Mud | TileType::Podzol => 1.0,
+        TileType::ForestGrass | TileType::Moss => 1.5,
         TileType::Stone => 3.0,
         TileType::Mountain => 8.0,
     };
@@ -75,7 +76,10 @@ fn intersect_terrain(origin: Vec3, direction: Vec3, world: &World) -> Option<Ter
         return None;
     }
     let mut nearest: Option<(f32, Vec3, TilePos)> = None;
-    for level in [0.0, 1.0, 2.0, 3.0, 8.0] {
+    // Уровни высот тайлов (`tile_elevation` до умножения на HEIGHT_STEP);
+    // лесная трава и мох — полууровень 1.5. Новый вид рельефа с другой
+    // высотой требует добавления сюда.
+    for level in [0.0, 1.0, 1.5, 2.0, 3.0, 8.0] {
         let height = level * HEIGHT_STEP;
         let distance = (height - origin.z) / direction.z;
         if distance < 0.0 {

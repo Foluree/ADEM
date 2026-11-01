@@ -1,0 +1,6 @@
+{
+  "id": "campfire_meat_predator",
+  "shapeless": true,
+  "ingredients": [{ "item": "meat_predator_raw", "count": 1 }],
+  "result": { "item": "meat_predator_cooked", "count": 1 }
+}

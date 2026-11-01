@@ -12,10 +12,12 @@ use bevy::picking::Pickable;
 use bevy::prelude::*;
 
 use crate::app::state::{GameMode, GameState, MenuKind, PlayerRes};
+use crate::simulation::containers;
 use crate::simulation::items::{ItemKind, SlotRef};
 use crate::ui::cursor_over_node;
 use crate::ui::UiFont;
 use crate::ui::creative::CreativeTile;
+use crate::ui::station::{SlotIndex, StationPlayerSlot, StationSlot, StationUi};
 use crate::ui::inventory::{CraftBookRes, CraftResultSlot, CraftingUi, InventoryUi, InventoryWindowSlot};
 use crate::ui::inventory::{CraftSlot, InvSlot};
 use crate::ui::style;
@@ -104,6 +106,7 @@ fn update_tooltip(
     craft: Res<CraftingUi>,
     book: Res<CraftBookRes>,
     player: Res<PlayerRes>,
+    station: Res<StationUi>,
     names: Res<ItemNames>,
     font: Res<UiFont>,
     inv_slots: Query<(
@@ -114,7 +117,13 @@ fn update_tooltip(
     )>,
     craft_slots: Query<(&CraftSlot, &ComputedNode, &UiGlobalTransform)>,
     result_slots: Query<(&ComputedNode, &UiGlobalTransform), With<CraftResultSlot>>,
-    creative_tiles: Query<(&CreativeTile, &ComputedNode, &UiGlobalTransform)>,
+    // Слоты всех окон одним параметром-кортежем: у систем Bevy предел в
+    // 16 параметров.
+    (creative_tiles, station_slots, station_player_slots): (
+        Query<(&CreativeTile, &ComputedNode, &UiGlobalTransform)>,
+        Query<(&StationSlot, &ComputedNode, &UiGlobalTransform)>,
+        Query<(&StationPlayerSlot, &SlotIndex, &ComputedNode, &UiGlobalTransform)>,
+    ),
     mut tooltips: Query<(Entity, &mut Node, Option<&Children>), With<TooltipNode>>,
     mut texts: Query<&mut Text>,
 ) {
@@ -145,11 +154,14 @@ fn update_tooltip(
         &craft,
         &book,
         &player,
+        &station,
         &names,
         &inv_slots,
         &craft_slots,
         &result_slots,
         &creative_tiles,
+        &station_slots,
+        &station_player_slots,
     );
 
     let Some(name) = name else {
@@ -215,6 +227,7 @@ fn update_tooltip(
 }
 
 /// Название предмета в слоте под курсором, если такой есть.
+#[allow(clippy::too_many_arguments)]
 fn hovered_item_name(
     window: &Window,
     cursor: Vec2,
@@ -223,6 +236,7 @@ fn hovered_item_name(
     craft: &CraftingUi,
     book: &CraftBookRes,
     player: &PlayerRes,
+    station: &StationUi,
     names: &ItemNames,
     inv_slots: &Query<(
         &InvSlot,
@@ -233,8 +247,15 @@ fn hovered_item_name(
     craft_slots: &Query<(&CraftSlot, &ComputedNode, &UiGlobalTransform)>,
     result_slots: &Query<(&ComputedNode, &UiGlobalTransform), With<CraftResultSlot>>,
     creative_tiles: &Query<(&CreativeTile, &ComputedNode, &UiGlobalTransform)>,
+    station_slots: &Query<(&StationSlot, &ComputedNode, &UiGlobalTransform)>,
+    station_player_slots: &Query<(
+        &StationPlayerSlot,
+        &SlotIndex,
+        &ComputedNode,
+        &UiGlobalTransform,
+    )>,
 ) -> Option<String> {
-    if inv.drag.is_some() {
+    if inv.drag.is_some() || station.drag.is_some() {
         return None;
     }
     let under_cursor = |computed: &ComputedNode, transform: &UiGlobalTransform| -> bool {
@@ -249,6 +270,37 @@ fn hovered_item_name(
         return Some(names.name(tile.kind));
     }
     if state.active_menu.is_some() {
+        return None;
+    }
+
+    // Окно станции: пустой слот показывает роль («Топливо», «Только уголь»),
+    // занятый — название предмета, как остальные слоты.
+    if station.open {
+        if let Some(kind) = station.kind
+            && let Some((slot, ..)) = station_slots
+                .iter()
+                .find(|(_, computed, transform)| under_cursor(computed, transform))
+        {
+            let stack = state
+                .world
+                .as_ref()
+                .and_then(|world| containers::container_at(world, station.pos?))
+                .and_then(|container| container.get(slot.index));
+            return Some(match stack {
+                Some(stack) => names.name(stack.kind),
+                None => containers::slot_hint(kind, slot.index)?.to_string(),
+            });
+        }
+        if let Some((_, index, ..)) = station_player_slots
+            .iter()
+            .find(|(_, _, computed, transform)| under_cursor(computed, transform))
+            && let Some(stack) = player
+                .0
+                .as_ref()
+                .and_then(|p| p.inventory.items.get(index.0).copied().flatten())
+        {
+            return Some(names.name(stack.kind));
+        }
         return None;
     }
 

@@ -1,0 +1,6 @@
+{
+  "id": "ingot_tin",
+  "shapeless": true,
+  "ingredients": [{ "item": "raw_tin", "count": 1 }],
+  "result": { "item": "ingot_tin", "count": 1 }
+}

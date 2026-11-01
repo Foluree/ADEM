@@ -1,0 +1,10 @@
+{
+  "id": "axe_copper",
+  "grid": [
+    ["ingot_copper", "ingot_copper", null],
+    ["ingot_copper", "stick", null],
+    [null, "stick", null]
+  ],
+  "tools": ["hammer_stone"],
+  "result": { "item": "axe_copper", "count": 1 }
+}

@@ -19,7 +19,7 @@ use bevy::sprite_render::{AlphaMode2d, Material2d};
 
 use crate::app::state::{ClockRes, GameState};
 use crate::rendering::isometric::{WORLD_TILE_SIZE, world_position};
-use crate::simulation::{ChunkPos, ObjectKind, TilePos, World, CHUNK_SIZE};
+use crate::simulation::{BuildingKind, ChunkPos, ObjectKind, TilePos, World, CHUNK_SIZE};
 
 /// Светлота мира глухой ночью как доля дневной освещённости.
 pub(crate) const NIGHT_DAYLIGHT: f32 = 0.08;
@@ -144,7 +144,7 @@ pub(crate) fn update_campfire_positions(
     {
         let has_fire = matches!(
             world.object_at(*tile),
-            Some(obj) if matches!(obj.kind, ObjectKind::Campfire)
+            Some(obj) if matches!(obj.kind, ObjectKind::Building(BuildingKind::Campfire))
         );
         changed |= has_fire && lights.positions.insert(*tile)
             || !has_fire && lights.positions.remove(tile);
@@ -161,7 +161,7 @@ fn scan_campfires(world: &World) -> HashSet<TilePos> {
         for cpx in 0..world.chunks_per_side {
             let chunk = world.chunk(ChunkPos { x: cpx, y: cpy });
             for (&idx, obj) in &chunk.objects {
-                if matches!(obj.kind, ObjectKind::Campfire) {
+                if matches!(obj.kind, ObjectKind::Building(BuildingKind::Campfire)) {
                     found.insert(TilePos {
                         x: (cpx * CHUNK_SIZE as u32) as i32 + (idx % CHUNK_SIZE as u8) as i32,
                         y: (cpy * CHUNK_SIZE as u32) as i32 + (idx / CHUNK_SIZE as u8) as i32,

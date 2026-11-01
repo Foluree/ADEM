@@ -1,0 +1,9 @@
+{
+  "id": "hammer_stone",
+  "grid": [
+    ["rock", "rock", null],
+    ["stick", "stick", null],
+    [null, "cordage", null]
+  ],
+  "result": { "item": "hammer_stone", "count": 1 }
+}

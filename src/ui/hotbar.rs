@@ -148,6 +148,7 @@ fn handle_hotbar_selection(
     settings: Res<Settings>,
     state: Res<GameState>,
     inv: Res<InventoryUi>,
+    station: Res<crate::ui::station::StationUi>,
     mut player: ResMut<PlayerRes>,
     focus: Res<InputFocus>,
     text_inputs: Query<(), With<TextInput>>,
@@ -159,11 +160,12 @@ fn handle_hotbar_selection(
     if capture.0.is_some() || text_input_focused(&focus, &text_inputs) {
         return;
     }
-    // Пока открыто окно инвентаря, горячие клавиши хотбара не действуют:
-    // иначе выбор слота прыгал бы под руками у сетки крафта.
-    if inv.open {
-        return;
-    }
+    // Пока открыто окно инвентаря или станции, цифры 1–8 принадлежат GUI
+    // (перекладывание предметов по номеру слота), а не выбору слота
+    // хотбара — иначе выбор прыгал бы под руками. Q/E работают всегда.
+    let gui_open = inv.open
+        || station.open
+        || state.active_menu == Some(crate::app::state::MenuKind::Creative);
     let inventory_key = settings.controls.key(ControlAction::Inventory);
     let Some(p) = player.0.as_mut() else {
         return;
@@ -184,7 +186,7 @@ fn handle_hotbar_selection(
         // Клавиша открытия инвентаря может совпадать с горячей клавишей
         // хотбара (по умолчанию это не так, но бинд настраивается): в этом
         // кадре она принадлежит инвентарю.
-        if keys.just_pressed(code) && code != inventory_key {
+        if keys.just_pressed(code) && code != inventory_key && !gui_open {
             p.selected_slot = digit;
         }
     }

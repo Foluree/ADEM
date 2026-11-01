@@ -17,8 +17,11 @@ use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::ui_widgets::{Activate, Button, TextInput};
 
+use crate::app::input::cursor_world_tile;
 use crate::app::settings::{ControlAction, Settings};
-use crate::app::state::{CommandQueueRes, GameMode, GameState, PlayerRes, WindowFocusState};
+use crate::app::state::{
+    CommandQueueRes, GameMode, GameState, MenuKind, PlayerRes, WindowFocusState,
+};
 use crate::simulation::commands::Command;
 use crate::simulation::crafts::{CraftBook, GRID_SLOTS};
 use crate::simulation::items::{
@@ -63,11 +66,11 @@ impl Plugin for InventoryPlugin {
 // --- Раскладка инвентаря: правится здесь ---
 
 /// Сторона слота.
-const SLOT_SIZE: f32 = 44.0;
+pub(crate) const SLOT_SIZE: f32 = 44.0;
 /// Зазор между слотами и рядами.
-const SLOT_GAP: f32 = 6.0;
+pub(crate) const SLOT_GAP: f32 = 6.0;
 /// Квадрат иконки внутри слота (пропорции вписывает fit_icons панели).
-const ICON_BOX: f32 = 30.0;
+pub(crate) const ICON_BOX: f32 = 30.0;
 /// Слотов в одном ряду секции.
 const SLOTS_PER_ROW: usize = 8;
 
@@ -97,6 +100,11 @@ pub struct InventoryUi {
     pub(crate) drag: Option<DragState>,
 }
 
+/// Панель окна инвентаря (не фуллскрин-обёртка): хит-тест «курсор над
+/// окном» для выброса перетаскиваемого стека за пределами GUI.
+#[derive(Component)]
+pub(crate) struct InventoryPanel;
+
 /// Идущее перетаскивание: слот-источник, снятый с него стек и призрак-
 /// иконка под курсором. При закрытии окна состояние очищается, призрак
 /// удаляется явно (он живёт поверх UI, а не внутри корня окна). Виден
@@ -109,11 +117,12 @@ pub(crate) struct DragState {
 }
 
 /// Полуразмер призрака-иконки, px (иконка вписана в квадрат `GHOST_HALF * 2`).
-const GHOST_HALF: f32 = 16.0;
+pub(crate) const GHOST_HALF: f32 = 16.0;
 
 /// Маркер призрака-иконки перетаскиваемого стека (следует за курсором).
+/// Общий с окном станций: одинаковая механика «стек под курсором».
 #[derive(Component)]
-struct DragGhost;
+pub(crate) struct DragGhost;
 
 /// Сетка крафта 3x3: слоты и выбранный источник в ней.
 #[derive(Resource, Default, Debug)]
@@ -201,11 +210,26 @@ fn toggle_inventory(
     text_inputs: Query<(), With<TextInput>>,
     font: Res<UiFont>,
     roots: Query<Entity, With<InventoryRoot>>,
+    mut station: ResMut<crate::ui::station::StationUi>,
+    station_roots: Query<Entity, With<crate::ui::station::StationRoot>>,
 ) {
     if text_input_focused(&focus, &text_inputs) || capture.0.is_some() || state.active_menu.is_some() {
         return;
     }
     if !keys.just_pressed(settings.controls.key(ControlAction::Inventory)) || player.0.is_none() {
+        return;
+    }
+
+    // Открытое окно станции перехватывает бинд инвентаря: Tab закрывает
+    // его и НЕ открывает инвентарь (содержимое сетки вернёт
+    // close_station_window). Повторный Tab при закрытой станции откроет
+    // инвентарь как обычно.
+    if station.open {
+        station.open = false;
+        station.selected = None;
+        for e in &station_roots {
+            commands.entity(e).despawn();
+        }
         return;
     }
 
@@ -259,6 +283,7 @@ fn spawn_inventory(commands: &mut Commands, font: &UiFont) {
                     BackgroundColor(style::background()),
                     BorderColor::from(style::border()),
                     BlocksWorldInput,
+                    InventoryPanel,
                 ))
                 .with_children(|panel| {
                     panel.spawn((
@@ -910,9 +935,13 @@ fn inventory_drag(
     state: Res<GameState>,
     mut inv: ResMut<InventoryUi>,
     mut player: ResMut<PlayerRes>,
+    mut queue: ResMut<CommandQueueRes>,
     icons: Res<UiIcons>,
     windows: Query<&Window>,
+    cameras: Query<(&Camera, &Transform), With<Camera2d>>,
     slots: Query<(&InvSlot, &ComputedNode, &UiGlobalTransform)>,
+    panels: Query<(&ComputedNode, &UiGlobalTransform), With<InventoryPanel>>,
+    creative_panels: Query<(&ComputedNode, &UiGlobalTransform), With<crate::ui::creative::CreativePanel>>,
     mut ghosts: Query<(Entity, &mut Node), With<DragGhost>>,
 ) {
     let Ok(window) = windows.single() else {
@@ -927,8 +956,11 @@ fn inventory_drag(
         return;
     }
     // Окно инвентаря открыто — его слоты и хотбар; иначе перетаскивание
-    // доступно только по видимому в режиме игрока хотбару.
-    let hotbar_only = !inv.open && state.mode == GameMode::Player && state.active_menu.is_none();
+    // доступно по видимому хотбару, в том числе при открытом творческом
+    // меню (бросок стека на плитки удаляет его, как в Minecraft).
+    let creative_open = state.active_menu == Some(MenuKind::Creative);
+    let hotbar_only =
+        !inv.open && state.mode == GameMode::Player && (state.active_menu.is_none() || creative_open);
     if !inv.open && !hotbar_only {
         // Режим сменился/открылось меню посреди перетаскивания — стек
         // возвращается в исходный слот, а не остаётся «в руке» навсегда.
@@ -1003,11 +1035,66 @@ fn inventory_drag(
         node.left = Val::Px(cursor.x - GHOST_HALF);
         node.top = Val::Px(cursor.y - GHOST_HALF);
     }
-    // Отпускание ЛКМ: перенос в слот под курсором либо возврат на место.
+    // Отпускание ЛКМ: перенос в слот под курсором; над панелью творческого
+    // меню — удаление стека; за пределами открытого окна — выброс в мир в
+    // сторону курсора; иначе возврат на место.
     if mouse.just_released(MouseButton::Left) {
         let hovered = hovered_slot(window, &slots, cursor);
         let target = hovered.map(|s| SlotRef { area: s.area, index: s.index });
-        finish_drag(&mut commands, &mut inv, &mut player, target);
+        let over_panel = panels
+            .iter()
+            .any(|(computed, transform)| cursor_over_node(window, computed, transform, cursor));
+        let over_creative = creative_panels
+            .iter()
+            .any(|(computed, transform)| cursor_over_node(window, computed, transform, cursor));
+        if let Some(t) = target {
+            finish_drag(&mut commands, &mut inv, &mut player, Some(t));
+        } else if creative_open && over_creative {
+            delete_drag(&mut commands, &mut inv);
+        } else if inv.open
+            && !over_panel
+            && let Some(tile) = cursor_world_tile(window, &cameras, state.world.as_ref())
+        {
+            throw_drag(&mut commands, &mut inv, &mut player, &mut queue, tile);
+        } else {
+            finish_drag(&mut commands, &mut inv, &mut player, None);
+        }
+    }
+}
+
+/// Удаляет перетащенный стек (отпускание над панелью творческого меню):
+/// стек не возвращается в слот и исчезает, как в Minecraft.
+fn delete_drag(commands: &mut Commands, inv: &mut InventoryUi) {
+    let Some(drag) = inv.drag.take() else {
+        return;
+    };
+    commands.entity(drag.ghost).despawn();
+}
+
+/// Бросает перетащенный стек в мир в сторону курсора: стек возвращается
+/// в исходный слот, а команда `PlayerThrowStack` списывает его оттуда и
+/// бросает (симуляция сама считает дальность и задержку подбора).
+/// Бросить можно только предмет из misc; остальное возвращается на место.
+fn throw_drag(
+    commands: &mut Commands,
+    inv: &mut InventoryUi,
+    player: &mut PlayerRes,
+    queue: &mut CommandQueueRes,
+    target: TilePos,
+) {
+    let Some(drag) = inv.drag.take() else {
+        return;
+    };
+    commands.entity(drag.ghost).despawn();
+    let throw_slot = (drag.from.area == SlotArea::Misc).then_some(drag.from.index);
+    if let Some(p) = player.0.as_mut() {
+        p.inventory.put(drag.from, drag.stack);
+    }
+    if let Some(slot) = throw_slot {
+        queue.0.push(Command::PlayerThrowStack {
+            target,
+            slot: slot as u8,
+        });
     }
 }
 

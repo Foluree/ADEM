@@ -1,0 +1,6 @@
+{
+  "id": "egg_roasted",
+  "shapeless": true,
+  "ingredients": [{ "item": "egg", "count": 1 }],
+  "result": { "item": "egg_roasted", "count": 1 }
+}

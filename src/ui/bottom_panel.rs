@@ -22,7 +22,7 @@ use crate::app::state::{
 };
 use crate::simulation::entities::EntityKind;
 use crate::simulation::generation::generate_world;
-use crate::simulation::objects::ObjectKind;
+use crate::simulation::objects::{BuildingKind, ObjectKind};
 use crate::simulation::player::WorldPos;
 use crate::simulation::scheduler::Scheduler;
 use crate::simulation::tile::TileType;
@@ -78,7 +78,7 @@ const PANEL_PADDING_X: f32 = 12.0;
 const ICON_BOX: f32 = 46.0;
 
 /// Размещаемые тайлы в порядке кнопок (Empty не ставится).
-const PLACEABLE_TILES: [TileType; 11] = [
+const PLACEABLE_TILES: [TileType; 14] = [
     TileType::Water,
     TileType::DeepWater,
     TileType::Ocean,
@@ -90,21 +90,19 @@ const PLACEABLE_TILES: [TileType; 11] = [
     TileType::Mountain,
     TileType::Clay,
     TileType::Farmland,
+    TileType::Moss,
+    TileType::Mud,
+    TileType::Podzol,
 ];
 
-/// Кнопки инструментов категории, по порядку в сетке. Постройки в
-/// категории Objects не показываются — у них своя категория Buildings.
+/// Кнопки инструментов категории, по порядку в сетке. Постройки —
+/// только в категории Buildings, объекты — в Objects.
 fn tools_of(category: ToolCategory) -> Vec<Tool> {
     match category {
         ToolCategory::Tiles => PLACEABLE_TILES.iter().map(|t| Tool::Tile(*t)).collect(),
-        ToolCategory::Objects => ObjectKind::ALL
-            .iter()
-            .copied()
-            .filter(|kind| !kind.is_building())
-            .map(Tool::Object)
-            .collect(),
+        ToolCategory::Objects => ObjectKind::ALL.iter().copied().map(Tool::Object).collect(),
         ToolCategory::Buildings => {
-            ObjectKind::BUILDINGS.iter().copied().map(Tool::Object).collect()
+            BuildingKind::ALL.iter().copied().map(Tool::Building).collect()
         }
         ToolCategory::Entities => EntityKind::ALL.iter().map(|k| Tool::Entity(*k)).collect(),
     }
@@ -115,7 +113,7 @@ fn category_icon(category: ToolCategory, icons: &UiIcons) -> Handle<Image> {
     match category {
         ToolCategory::Tiles => icons.tile(TileType::Grass),
         ToolCategory::Objects => icons.object(ObjectKind::Tree),
-        ToolCategory::Buildings => icons.object(ObjectKind::Campfire),
+        ToolCategory::Buildings => icons.object(ObjectKind::Building(BuildingKind::Campfire)),
         ToolCategory::Entities => icons.entity(EntityKind::Wolf),
     }
     .clone()
@@ -261,6 +259,7 @@ fn menu_items(menu: PanelMenu, icons: &UiIcons) -> Vec<PanelItem> {
                 content: ButtonContent::Icon(match tool {
                     Tool::Tile(kind) => icons.tile(kind),
                     Tool::Object(kind) => icons.object(kind),
+                    Tool::Building(kind) => icons.object(ObjectKind::Building(kind)),
                     Tool::Entity(kind) => icons.entity(kind),
                 }
                 .clone()),

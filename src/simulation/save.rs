@@ -19,6 +19,10 @@
 //!       ресурсы:  u16 count + [index u8, kind u8, amount u16] по индексам
 //!       объекты:  u16 count + [index u8, kind u8, stage u8, charge u16]
 //!       предметы: u16 count + [index u8, kind u8, count u32] по индексам
+//!       культуры: u16 count + [index u8, kind u8, stage u8] по индексам
+//!       контейнеры: u16 count + [index u8, kind u8, cook u8+u64,
+//!                     burn u8+u64, fuel u8, u16 slots + слоты]
+//!       слот контейнера: tag u8: 0 = пусто | 1 = kind u8 + count u32
 //!   существа:
 //!     next_id u64
 //!     count   u32 + [id u64, kind u8, x f32, y f32, prev_x f32, prev_y f32,
@@ -33,6 +37,9 @@
 //!                    t f32, duration u64, arc f32, damage f32]
 //!   воткнутые копья:
 //!     count   u32 + [x f32, y f32, heading f32, pitch f32]
+//!   item-сущности (дроп):
+//!     count   u32 + [id u64, x f32, y f32, kind u8, count u32,
+//!                    spawn_tick u64, pickup_after_tick u64] по возрастанию id
 //!   планировщик:
 //!     current_tick     u64 (должен совпадать с tick из заголовка)
 //!     next_id          u64
@@ -81,8 +88,9 @@ use super::world::{ChunkPos, World, WorldSize};
 /// предметов на земле и поле `land_search_failed_at` существ. Версия 5:
 /// снаряды в полёте и воткнутые копья (боевая система). Версия 6: игрок
 /// (позиция, hp, голод, инвентарь со всеми секциями и мусоркой).
-/// Версия 1: основа.
-pub const SAVE_FORMAT_VERSION: u32 = 1;
+/// Версия 1: основа. Версия 2: слои культур и контейнеров станций,
+/// item-сущности дропа, задачи CropGrowth/StationTick.
+pub const SAVE_FORMAT_VERSION: u32 = 2;
 
 /// Магия в начале файла.
 const MAGIC: [u8; 4] = *b"ADEM";
@@ -177,6 +185,8 @@ pub fn save_game(
         write_sparse_u16(&mut w, &chunk.resources, |d| (d.kind as u8, d.amount));
         write_sparse_objects(&mut w, &chunk.objects);
         write_sparse_items(&mut w, &chunk.items);
+        write_sparse_crops(&mut w, &chunk.crops);
+        write_sparse_containers(&mut w, &chunk.containers);
     }
 
     // Существа.
@@ -203,6 +213,18 @@ pub fn save_game(
         write_f32(&mut w, spear.pos.y);
         write_f32(&mut w, spear.heading);
         write_f32(&mut w, spear.pitch);
+    }
+
+    // Item-сущности дропа (по возрастанию id — детерминизм).
+    write_u32(&mut w, world.item_entities.items.len() as u32);
+    for entity in &world.item_entities.items {
+        write_u64(&mut w, entity.id);
+        write_f32(&mut w, entity.pos.x);
+        write_f32(&mut w, entity.pos.y);
+        w.push(entity.stack.kind as u8);
+        write_u32(&mut w, entity.stack.count);
+        write_u64(&mut w, entity.spawn_tick);
+        write_u64(&mut w, entity.pickup_after_tick);
     }
 
     // Планировщик.
@@ -309,7 +331,19 @@ pub fn load_game(bytes: &[u8]) -> Result<SavedGame, SaveError> {
         let resources = read_sparse_u16(&mut r, ResourceKind::from_discriminant)?;
         let objects = read_sparse_objects(&mut r)?;
         let items = read_sparse_items(&mut r)?;
-        chunks.push(super::chunk::Chunk { terrain, resources, objects, items });
+        let crops = read_sparse_crops(&mut r)?;
+        let containers = read_sparse_containers(&mut r)?;
+        // Контейнер существует только у тайла станции и по размеру совпадает
+        // с ёмкостью её вида; разъехавшиеся слои — повреждение.
+        for (idx, container) in &containers {
+            let Some(obj) = objects.get(idx) else {
+                return Err(SaveError::BadData("контейнер без станции"));
+            };
+            if super::containers::capacity(obj.kind) != Some(container.slots.len()) {
+                return Err(SaveError::BadData("ёмкость контейнера"));
+            }
+        }
+        chunks.push(super::chunk::Chunk { terrain, resources, objects, items, crops, containers });
     }
 
     // Существа.
@@ -339,6 +373,9 @@ pub fn load_game(bytes: &[u8]) -> Result<SavedGame, SaveError> {
     for _ in 0..spears_len {
         stuck_spears.push(read_stuck_spear(&mut r)?);
     }
+
+    // Item-сущности дропа.
+    let item_entities = read_item_entities(&mut r, side)?;
 
     // Планировщик.
     let sched_tick = r.read_u64()?;
@@ -399,6 +436,7 @@ pub fn load_game(bytes: &[u8]) -> Result<SavedGame, SaveError> {
             projectiles,
             stuck_spears,
             next_projectile_id,
+            item_entities,
         },
         scheduler,
         player,
@@ -459,7 +497,7 @@ fn write_sparse_objects(
     for idx in indices {
         let obj = &map[&idx];
         w.push(idx);
-        w.push(obj.kind as u8);
+        w.push(obj.kind.discriminant());
         w.push(obj.stage as u8);
         write_u16(w, obj.charge);
     }
@@ -782,6 +820,206 @@ fn read_slots<const N: usize>(
     Ok(())
 }
 
+// ---------- Культуры и контейнеры ----------
+
+/// Пишет разреженный слой культур (по возрастанию индексов).
+fn write_sparse_crops(w: &mut Vec<u8>, map: &std::collections::HashMap<u8, super::crops::Crop>) {
+    let count = map.len();
+    debug_assert!(count <= u16::MAX as usize);
+    write_u16(w, count as u16);
+    let mut indices: Vec<u8> = map.keys().copied().collect();
+    indices.sort_unstable();
+    for idx in indices {
+        let crop = &map[&idx];
+        w.push(idx);
+        w.push(crop.kind as u8);
+        w.push(crop.stage);
+    }
+}
+
+/// Читает разреженный слой культур; стадия не может превышать последнюю.
+fn read_sparse_crops(
+    r: &mut Reader<'_>,
+) -> Result<std::collections::HashMap<u8, super::crops::Crop>, SaveError> {
+    let count = r.read_u16()? as usize;
+    let mut map = std::collections::HashMap::with_capacity(count);
+    for _ in 0..count {
+        let idx = r.read_u8()?;
+        let kind = super::crops::CropKind::from_discriminant(r.read_u8()?)
+            .ok_or(SaveError::BadData("вид культуры"))?;
+        let stage = r.read_u8()?;
+        if stage as usize >= kind.stage_count() {
+            return Err(SaveError::BadData("стадия культуры"));
+        }
+        if map.insert(idx, super::crops::Crop { kind, stage }).is_some() {
+            return Err(SaveError::BadData("дубликат индекса культуры"));
+        }
+    }
+    Ok(map)
+}
+
+/// Пишет разреженный слой контейнеров станций (по возрастанию индексов).
+fn write_sparse_containers(
+    w: &mut Vec<u8>,
+    map: &std::collections::HashMap<u8, super::containers::Container>,
+) {
+    let count = map.len();
+    debug_assert!(count <= u16::MAX as usize);
+    write_u16(w, count as u16);
+    let mut indices: Vec<u8> = map.keys().copied().collect();
+    indices.sort_unstable();
+    for idx in indices {
+        let container = &map[&idx];
+        w.push(idx);
+        // Вид станции не пишем: он восстановим из слоя объектов, но для
+        // независимой проверки валидности слотов пишем явно.
+        w.push(0xFF); // резервный тег формата
+        match container.cook_finish_tick {
+            None => w.push(0),
+            Some(tick) => {
+                w.push(1);
+                write_u64(w, tick);
+            }
+        }
+        match container.burn_out_tick {
+            None => w.push(0),
+            Some(tick) => {
+                w.push(1);
+                write_u64(w, tick);
+            }
+        }
+        match container.burning_fuel {
+            None => w.push(0xFF),
+            Some(kind) => w.push(kind as u8),
+        }
+        debug_assert!(container.slots.len() <= u16::MAX as usize);
+        write_u16(w, container.slots.len() as u16);
+        for slot in &container.slots {
+            match slot {
+                None => w.push(0),
+                Some(stack) => {
+                    w.push(1);
+                    w.push(stack.kind as u8);
+                    write_u32(w, stack.count);
+                }
+            }
+        }
+    }
+}
+
+/// Читает разреженный слой контейнеров станций: ёмкость — по виду станции,
+/// стеки — в пределах стаков, сроки — конечные неотрицательные.
+fn read_sparse_containers(
+    r: &mut Reader<'_>,
+) -> Result<std::collections::HashMap<u8, super::containers::Container>, SaveError> {
+    let count = r.read_u16()? as usize;
+    let mut map = std::collections::HashMap::with_capacity(count);
+    for _ in 0..count {
+        let idx = r.read_u8()?;
+        let _reserved = r.read_u8()?;
+        let cook_finish_tick = match r.read_u8()? {
+            0 => None,
+            1 => Some(r.read_u64()?),
+            _ => return Err(SaveError::BadData("тег срока готовки")),
+        };
+        let burn_out_tick = match r.read_u8()? {
+            0 => None,
+            1 => Some(r.read_u64()?),
+            _ => return Err(SaveError::BadData("тег срока топлива")),
+        };
+        let burning_fuel = match r.read_u8()? {
+            0xFF => None,
+            raw => Some(
+                ItemKind::from_discriminant(raw)
+                    .ok_or(SaveError::BadData("вид горящего топлива"))?,
+            ),
+        };
+        let slots_len = r.read_u16()? as usize;
+        if slots_len > 256 {
+            return Err(SaveError::BadData("слишком много слотов контейнера"));
+        }
+        let mut slots: Vec<Option<ItemStack>> = Vec::with_capacity(slots_len);
+        for _ in 0..slots_len {
+            match r.read_u8()? {
+                0 => slots.push(None),
+                1 => {
+                    let kind = ItemKind::from_discriminant(r.read_u8()?)
+                        .ok_or(SaveError::BadData("вид предмета в контейнере"))?;
+                    let stack_count = r.read_u32()?;
+                    if stack_count == 0 || stack_count > kind.max_stack() {
+                        return Err(SaveError::BadData("размер стака контейнера"));
+                    }
+                    slots.push(Some(ItemStack { kind, count: stack_count }));
+                }
+                _ => return Err(SaveError::BadData("тег слота контейнера")),
+            }
+        }
+        if map
+            .insert(
+                idx,
+                super::containers::Container {
+                    slots,
+                    cook_finish_tick,
+                    burn_out_tick,
+                    burning_fuel,
+                },
+            )
+            .is_some()
+        {
+            return Err(SaveError::BadData("дубликат индекса контейнера"));
+        }
+    }
+    Ok(map)
+}
+
+// ---------- Item-сущности дропа ----------
+
+/// Читает item-сущности: id по возрастанию, координаты в мире, стеки
+/// в пределах стаков, тики согласованы (подбор не раньше дропа).
+fn read_item_entities(r: &mut Reader<'_>, side: u32) -> Result<super::item_entity::ItemEntities, SaveError> {
+    let count = r.read_u32()?;
+    if count > 1_000_000 {
+        return Err(SaveError::BadData("слишком много item-сущностей"));
+    }
+    let mut store = super::item_entity::ItemEntities::default();
+    let mut previous_id = 0_u64;
+    for _ in 0..count {
+        let id = r.read_u64()?;
+        let x = r.read_f32()?;
+        let y = r.read_f32()?;
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x > side as f32 || y > side as f32
+        {
+            return Err(SaveError::BadData("координаты item-сущности"));
+        }
+        let kind = ItemKind::from_discriminant(r.read_u8()?)
+            .ok_or(SaveError::BadData("вид предмета item-сущности"))?;
+        let stack_count = r.read_u32()?;
+        if stack_count == 0 || stack_count > kind.max_stack() {
+            return Err(SaveError::BadData("стак item-сущности"));
+        }
+        let spawn_tick = r.read_u64()?;
+        let pickup_after_tick = r.read_u64()?;
+        if pickup_after_tick < spawn_tick {
+            return Err(SaveError::BadData("сроки подбора item-сущности"));
+        }
+        if id == 0 || id <= previous_id {
+            return Err(SaveError::BadData("id item-сущности"));
+        }
+        previous_id = id;
+        store.items.push(super::item_entity::ItemEntity {
+            id,
+            pos: WorldPos { x, y },
+            stack: ItemStack { kind, count: stack_count },
+            spawn_tick,
+            pickup_after_tick,
+            // Полёт — транзиентное состояние: предмет сохраняется лежащим.
+            fly: None,
+        });
+    }
+    store.restore_next_id(previous_id + 1);
+    Ok(store)
+}
+
 // ---------- Виды задач ----------
 
 /// Кодирует вид задачи. Дискриминанты формата — часть соглашения
@@ -822,6 +1060,24 @@ fn write_task_kind(w: &mut Vec<u8>, kind: &TaskKind) {
             write_u32(w, chunk.y);
             w.push(*local_index);
         }
+        TaskKind::CropGrowth { chunk, local_index } => {
+            w.push(8);
+            write_u32(w, chunk.x);
+            write_u32(w, chunk.y);
+            w.push(*local_index);
+        }
+        TaskKind::StationTick { chunk, local_index } => {
+            w.push(9);
+            write_u32(w, chunk.x);
+            write_u32(w, chunk.y);
+            w.push(*local_index);
+        }
+        TaskKind::FarmlandRevert { chunk, local_index } => {
+            w.push(10);
+            write_u32(w, chunk.x);
+            write_u32(w, chunk.y);
+            w.push(*local_index);
+        }
     }
 }
 
@@ -855,6 +1111,18 @@ fn read_task_kind(r: &mut Reader<'_>, chunks_per_side: u32) -> Result<TaskKind, 
         7 => {
             let (chunk, local_index) = read_chunk_task(r, chunks_per_side)?;
             TaskKind::WaterErosion { chunk, local_index }
+        }
+        8 => {
+            let (chunk, local_index) = read_chunk_task(r, chunks_per_side)?;
+            TaskKind::CropGrowth { chunk, local_index }
+        }
+        9 => {
+            let (chunk, local_index) = read_chunk_task(r, chunks_per_side)?;
+            TaskKind::StationTick { chunk, local_index }
+        }
+        10 => {
+            let (chunk, local_index) = read_chunk_task(r, chunks_per_side)?;
+            TaskKind::FarmlandRevert { chunk, local_index }
         }
         _ => return Err(SaveError::BadData("вид задачи")),
     })

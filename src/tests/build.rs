@@ -1,10 +1,11 @@
 //! Тесты строительства: списание предметов (`Inventory::take_items`) и
 //! применение команды `PlayerBuild` (плата, проверка тайла).
 
+use crate::simulation::crafts::CraftBook;
 use crate::simulation::commands::{Command, CommandQueue, buildable_at};
 use crate::simulation::dirty::DirtyTiles;
 use crate::simulation::items::{ItemKind, ItemStack};
-use crate::simulation::objects::{ObjectKind, WorldObject};
+use crate::simulation::objects::{BuildingKind, WorldObject};
 use crate::simulation::player::{Player, WorldPos};
 use crate::simulation::scheduler::Scheduler;
 use crate::simulation::tile::TileType;
@@ -22,7 +23,7 @@ fn setup() -> (World, Player, TilePos) {
 /// Применяет очередь команд к миру с игроком.
 fn apply(queue: &mut CommandQueue, world: &mut World, player: &mut Player) {
     let mut dirty = DirtyTiles::default();
-    queue.apply_all(world, Some(player), &mut dirty, &mut Scheduler::default(), 0);
+    queue.apply_all(world, Some(player), &mut dirty, &mut Scheduler::default(), 0, &CraftBook::default());
 }
 
 /// Списание раскладывается по стекам: 16 палок берутся из двух стеков.
@@ -60,10 +61,10 @@ fn build_deducts_cost_and_places_campfire() {
     player.inventory.add(ItemKind::Stick, 20);
 
     let mut queue = CommandQueue::default();
-    queue.push(Command::PlayerBuild { pos, kind: ObjectKind::Campfire });
+    queue.push(Command::PlayerBuild { pos, kind: BuildingKind::Campfire });
     apply(&mut queue, &mut world, &mut player);
 
-    assert_eq!(world.object_at(pos), Some(&WorldObject::campfire()));
+    assert_eq!(world.object_at(pos), Some(&WorldObject::building(BuildingKind::Campfire)));
     assert_eq!(player.inventory.count_of(ItemKind::Stick), 4);
 }
 
@@ -74,7 +75,7 @@ fn build_requires_enough_items() {
     player.inventory.add(ItemKind::Stick, 10);
 
     let mut queue = CommandQueue::default();
-    queue.push(Command::PlayerBuild { pos, kind: ObjectKind::Campfire });
+    queue.push(Command::PlayerBuild { pos, kind: BuildingKind::Campfire });
     apply(&mut queue, &mut world, &mut player);
 
     assert_eq!(world.object_at(pos), None);
@@ -109,24 +110,11 @@ fn build_out_of_reach_fails() {
     let far = TilePos { x: pos.x + 10, y: pos.y };
 
     let mut queue = CommandQueue::default();
-    queue.push(Command::PlayerBuild { pos: far, kind: ObjectKind::Campfire });
+    queue.push(Command::PlayerBuild { pos: far, kind: BuildingKind::Campfire });
     apply(&mut queue, &mut world, &mut player);
 
     assert_eq!(world.object_at(far), None);
     assert_eq!(player.inventory.count_of(ItemKind::Stick), 20);
 }
 
-/// Вид, не являющийся постройкой, командой строительства не ставится:
-/// деревья и кусты — только через редактор.
-#[test]
-fn build_rejects_non_building_kinds() {
-    let (mut world, mut player, pos) = setup();
-    player.inventory.add(ItemKind::Stick, 64);
 
-    let mut queue = CommandQueue::default();
-    queue.push(Command::PlayerBuild { pos, kind: ObjectKind::Tree });
-    apply(&mut queue, &mut world, &mut player);
-
-    assert_eq!(world.object_at(pos), None);
-    assert_eq!(player.inventory.count_of(ItemKind::Stick), 64);
-}

@@ -128,6 +128,12 @@ pub fn start_tick() -> u64 {
     START_HOUR_OF_DAY as u64 * SECS_PER_HOUR / GAME_SECS_PER_TICK as u64
 }
 
+/// Номер месяца с начала мира по тику (для задач планировщика, у которых
+/// нет доступа к часам): тот же расчёт, что у `GameClock::month`.
+pub fn month_of_tick(tick: u64) -> u32 {
+    (tick * GAME_SECS_PER_TICK as u64 / SECS_PER_MONTH) as u32
+}
+
 /// Тик следующей границы часа строго после `after_tick`
 /// (момент события `TimeOfDayChanged`).
 pub fn next_hour_tick(after_tick: u64) -> u64 {

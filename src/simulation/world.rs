@@ -2,7 +2,10 @@
 
 use super::chunk::{Chunk, ResourceDeposit, TerrainTiles, CHUNK_SIZE};
 use super::combat::{Projectile, StuckSpear};
+use super::containers::Container;
+use super::crops::Crop;
 use super::entities::EntityStore;
+use super::item_entity::{ItemEntities, ItemEntity};
 use super::items::ItemStack;
 use super::objects::WorldObject;
 use super::tile::{ResourceKind, Tile, TileType};
@@ -81,6 +84,8 @@ pub struct World {
     pub stuck_spears: Vec<StuckSpear>,
     /// Следующий идентификатор снаряда (для рендера); 0 — «нет id».
     pub next_projectile_id: u64,
+    /// Дроп-сущности предметов (MC-стиль): разброс, автоподбор, despawn.
+    pub item_entities: ItemEntities,
 }
 
 impl World {
@@ -112,10 +117,13 @@ impl World {
             bytes += map_bytes::<u8, ResourceDeposit>(chunk.resources.len());
             bytes += map_bytes::<u8, WorldObject>(chunk.objects.len());
             bytes += map_bytes::<u8, ItemStack>(chunk.items.len());
+            bytes += map_bytes::<u8, Crop>(chunk.crops.len());
+            bytes += map_bytes::<u8, Container>(chunk.containers.len());
         }
         bytes += (self.entities.len() as u64) * size_of::<super::entities::SimEntity>();
         bytes += (self.projectiles.capacity() as u64) * size_of::<Projectile>();
         bytes += (self.stuck_spears.capacity() as u64) * size_of::<StuckSpear>();
+        bytes += (self.item_entities.len() as u64) * size_of::<ItemEntity>();
         bytes
     }
 
@@ -133,6 +141,7 @@ impl World {
             projectiles: Vec::new(),
             stuck_spears: Vec::new(),
             next_projectile_id: 0,
+            item_entities: ItemEntities::default(),
         }
     }
 
@@ -229,6 +238,63 @@ impl World {
     pub fn item_at(&self, pos: TilePos) -> Option<&ItemStack> {
         let (cpos, idx) = split_tile_pos(pos);
         self.chunk(cpos).items.get(&idx)
+    }
+
+    /// Культура на тайле, если есть.
+    pub fn crop_at(&self, pos: TilePos) -> Option<&Crop> {
+        let (cpos, idx) = split_tile_pos(pos);
+        self.chunk(cpos).crops.get(&idx)
+    }
+
+    /// Ставит культуру на тайл или убирает её (одна культура на тайл).
+    pub fn set_crop(&mut self, pos: TilePos, crop: Option<Crop>) {
+        let (cpos, idx) = split_tile_pos(pos);
+        let chunk = self.chunk_mut(cpos);
+        match crop {
+            Some(crop) => {
+                chunk.crops.insert(idx, crop);
+            }
+            None => {
+                chunk.crops.remove(&idx);
+            }
+        }
+    }
+
+    /// Контейнер станции на тайле, если есть.
+    #[allow(dead_code)] // читается UI станций и тестами
+    pub fn container_at(&self, pos: TilePos) -> Option<&Container> {
+        let (cpos, idx) = split_tile_pos(pos);
+        self.chunk(cpos).containers.get(&idx)
+    }
+
+    /// Ставит контейнер станции на тайл или убирает его. Создаётся/удаляется
+    /// вместе со станцией-объектом (`set_object_with_container`).
+    pub fn set_container(&mut self, pos: TilePos, container: Option<Container>) {
+        let (cpos, idx) = split_tile_pos(pos);
+        let chunk = self.chunk_mut(cpos);
+        match container {
+            Some(container) => {
+                chunk.containers.insert(idx, container);
+            }
+            None => {
+                chunk.containers.remove(&idx);
+            }
+        }
+    }
+
+    /// Ставит объект и синхронно ведёт его контейнер: у станций контейнер
+    /// появляется и удаляется вместе с объектом, у прочих объектов его нет.
+    pub fn set_object_with_container(&mut self, pos: TilePos, obj: Option<WorldObject>) {
+        let container = obj
+            .filter(|o| super::objects::ObjectKind::is_station(o.kind))
+            .map(|o| Container::new(o.kind));
+        self.set_object(pos, obj);
+        self.set_container(pos, container);
+    }
+
+    /// Item-сущность по id (для рендера и отладки).
+    pub fn item_entity(&self, id: u64) -> Option<&ItemEntity> {
+        self.item_entities.get(id)
     }
 }
 

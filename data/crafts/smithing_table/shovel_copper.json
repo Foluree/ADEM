@@ -1,0 +1,10 @@
+{
+  "id": "shovel_copper",
+  "grid": [
+    [null, "ingot_copper", null],
+    [null, "stick", null],
+    [null, "stick", null]
+  ],
+  "tools": ["hammer_stone"],
+  "result": { "item": "shovel_copper", "count": 1 }
+}

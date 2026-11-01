@@ -1,0 +1,6 @@
+{
+  "id": "campfire_carrot_baked",
+  "shapeless": true,
+  "ingredients": [{ "item": "carrot", "count": 1 }],
+  "result": { "item": "carrot_baked", "count": 1 }
+}

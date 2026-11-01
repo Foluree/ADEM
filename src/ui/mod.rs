@@ -1,4 +1,4 @@
-//! UI: нижняя панель, FPS-счётчик, модальные меню, инвентарь.
+//! UI: нижняя панель, FPS-счётчик, модальные меню, инвентарь, станции.
 
 pub mod bottom_panel;
 pub mod construction;
@@ -11,6 +11,7 @@ pub mod inventory;
 pub mod menu_bg;
 pub mod menus;
 pub mod pause_menu;
+pub mod station;
 pub mod style;
 pub mod tooltip;
 
@@ -19,6 +20,8 @@ use bevy::prelude::*;
 use bevy::ui_widgets::TextInput;
 
 use icons::UiIcons;
+
+pub use inventory::CraftBookRes;
 
 /// Ресурс с хэндлом шрифта, чтобы все тексты использовали FiraSans-Medium.
 #[derive(Resource)]
@@ -100,6 +103,7 @@ impl Plugin for UiPlugin {
             .add_plugins(health::HealthPlugin)
             .add_plugins(hotbar::HotbarPlugin)
             .add_plugins(construction::ConstructionPlugin)
+            .add_plugins(station::StationPlugin)
             .add_plugins(tooltip::TooltipPlugin);
     }
 }

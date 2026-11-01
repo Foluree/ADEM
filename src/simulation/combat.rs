@@ -10,7 +10,8 @@
 //! Небольшая высота дуги = «смягчённое» движение вверх/вниз. Всё
 //! детерминировано, без RNG; порядок в `Vec` стабилен для сохранений.
 
-use super::items::{self, ItemKind};
+use super::entities::EntityKind;
+use super::items::{self, ItemStack, ItemKind};
 use super::player::{Player, WorldPos};
 use super::world::{TilePos, World};
 
@@ -196,8 +197,8 @@ impl World {
 
     /// Продвигает все снаряды на один тик: движение, попадания по существам,
     /// падение. Снаряд-стрела при попадании исчезает, копьё втыкается.
-    /// Смерть существа — удаление из мира (см. шапку модуля).
-    pub fn tick_projectiles(&mut self) {
+    /// Смерть существа — удаление из мира и дроп добычи (см. шапку модуля).
+    pub fn tick_projectiles(&mut self, tick: u64) {
         // Попадания собираются по id, чтобы не держать заём существ при
         // мутации снарядов.
         let mut hits: Vec<(u64, u64)> = Vec::new(); // (id снаряда, id существа)
@@ -219,11 +220,14 @@ impl World {
             let Some(projectile) = self.projectiles.iter().find(|p| p.id == projectile_id) else {
                 continue;
             };
-            let (damage, kind, pos, heading) = (
+            // Все нужные значения снимаются до мутаций мира (смерть существа,
+            // дроп) — заём снаряда не должен пересекаться с &mut self.
+            let (damage, kind, pos, heading, landing_pitch) = (
                 projectile.damage,
                 projectile.kind,
                 projectile.pos(),
                 projectile.heading(),
+                projectile.landing_pitch(),
             );
             // Урон и смерть.
             let died = {
@@ -237,6 +241,7 @@ impl World {
                 }
             };
             if died {
+                drop_entity_loot(self, entity_id, tick);
                 self.entities.remove(entity_id);
             }
             // Дальше снаряд не летит: стрела исчезает, копьё втыкается.
@@ -244,7 +249,7 @@ impl World {
                 self.stuck_spears.push(StuckSpear {
                     pos,
                     heading,
-                    pitch: projectile.landing_pitch(),
+                    pitch: landing_pitch,
                 });
             }
             self.projectiles.retain(|p| p.id != projectile_id);
@@ -306,12 +311,12 @@ pub fn try_melee_attack(
     };
 
     player.attack_ready_tick = tick + stats.cooldown_ticks;
-    apply_damage(world, victim, stats.damage);
+    apply_damage(world, victim, stats.damage, tick);
     true
 }
 
-/// Наносит урон существу; смерть (hp ≤ 0) удаляет его из мира.
-fn apply_damage(world: &mut World, entity_id: u64, damage: f32) {
+/// Наносит урон существу; смерть (hp ≤ 0) удаляет его из мира с дропом.
+fn apply_damage(world: &mut World, entity_id: u64, damage: f32, tick: u64) {
     let died = {
         let entity = world
             .entities
@@ -327,7 +332,38 @@ fn apply_damage(world: &mut World, entity_id: u64, damage: f32) {
         }
     };
     if died {
+        drop_entity_loot(world, entity_id, tick);
         world.entities.remove(entity_id);
+    }
+}
+
+/// Дроп добычи с погибшего существа (item-сущности у места смерти).
+/// Дробится детерминированно от (seed, тик, id существа).
+fn drop_entity_loot(world: &mut World, entity_id: u64, tick: u64) {
+    let Some(entity) = world.entities.entities.iter().find(|e| e.id == entity_id) else {
+        return;
+    };
+    let (pos, seed) = (entity.pos, world.seed);
+    let mut h = seed
+        ^ tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ entity_id.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = h.wrapping_mul(0xD6E8_FEB8_6659_7B93);
+    h ^= h >> 32;
+    let roll = (h >> 40) as f32 / (1u32 << 24) as f32;
+
+    let items = &mut world.item_entities;
+    match entity.kind {
+        EntityKind::Wolf => {
+            // Мясо хищника: 2–3 куска, плюс кость с шансом 30%.
+            let meat = if roll < 0.5 { 2 } else { 3 };
+            items.drop_stack(
+                seed, pos, ItemStack { kind: ItemKind::MeatPredatorRaw, count: meat }, tick,
+            );
+            let bone_roll = (h >> 16) as f32 / (1u32 << 24) as f32;
+            if bone_roll < 0.3 {
+                items.drop_stack(seed, pos, ItemStack { kind: ItemKind::Bone, count: 1 }, tick);
+            }
+        }
     }
 }
 
@@ -338,9 +374,8 @@ pub fn pickup_stuck_spears(world: &mut World, player: &mut Player) -> usize {
     let mut picked = 0;
     let mut i = 0;
     while i < world.stuck_spears.len() {
-        if world.stuck_spears[i].pos.dist(player.pos) <= SPEAR_PICKUP_RADIUS_TILES
-            && player.inventory.can_fit(ItemKind::Spear, 1)
-        {
+        if world.stuck_spears[i].pos.dist(player.pos) <= SPEAR_PICKUP_RADIUS_TILES 
+                && player.inventory.can_fit(ItemKind::Spear, 1) {
             player.inventory.add(ItemKind::Spear, 1);
             world.stuck_spears.swap_remove(i);
             picked += 1;

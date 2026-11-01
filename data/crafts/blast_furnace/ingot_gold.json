@@ -1,0 +1,6 @@
+{
+  "id": "ingot_gold",
+  "shapeless": true,
+  "ingredients": [{ "item": "raw_gold", "count": 1 }],
+  "result": { "item": "ingot_gold", "count": 1 }
+}

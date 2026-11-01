@@ -25,10 +25,13 @@ use crate::app::window_icon::set_window_icon;
 use crate::rendering::RenderingPlugin;
 use crate::simulation::climate;
 use crate::simulation::combat;
+use crate::simulation::containers;
+use crate::simulation::crops;
 use crate::simulation::generation::generate_world;
 use crate::simulation::scheduler::{Task, TaskKind};
 use crate::simulation::time::{TICKS_PER_SEC, next_hour_tick, next_season_tick, start_tick};
 use crate::simulation::vegetation;
+use crate::ui::CraftBookRes;
 use crate::ui::pause_menu::BindingCapture;
 use crate::ui::{UiPlugin, text_input_focused};
 
@@ -145,6 +148,7 @@ fn tick_world(
     mut clock: ResMut<ClockRes>,
     mut sched: ResMut<SchedulerRes>,
     mut timing: ResMut<TickTiming>,
+    book: Res<CraftBookRes>,
     mut fired: Local<Vec<(u64, Task)>>,
     mut events: MessageWriter<TickEvent>,
 ) {
@@ -204,7 +208,9 @@ fn tick_world(
         // и бьют в том же тике.
         if let Some(world) = state.world.as_mut() {
             world.tick_entities(tick);
-            world.tick_projectiles();
+            world.tick_projectiles(tick);
+            // Дроп-сущности: автоподбор игроком и исчезновение по возрасту.
+            world.item_entities.tick(tick, player.0.as_mut());
         }
     }
 
@@ -236,6 +242,39 @@ fn tick_world(
                     continue;
                 };
                 vegetation::apply_task(kind, world, &mut sched.0, *fired_tick, &mut dirty);
+            }
+            TaskKind::CropGrowth { chunk, local_index } => {
+                let Some(world) = state.world.as_mut() else {
+                    continue;
+                };
+                crops::apply_growth(world, &mut sched.0, *fired_tick, &mut dirty, *chunk, *local_index);
+            }
+            TaskKind::FarmlandRevert { chunk, local_index } => {
+                let Some(world) = state.world.as_mut() else {
+                    continue;
+                };
+                crops::apply_farmland_revert(
+                    world,
+                    &mut sched.0,
+                    *fired_tick,
+                    &mut dirty,
+                    *chunk,
+                    *local_index,
+                );
+            }
+            TaskKind::StationTick { chunk, local_index } => {
+                let Some(world) = state.world.as_mut() else {
+                    continue;
+                };
+                containers::apply_station_tick(
+                    world,
+                    &mut sched.0,
+                    *fired_tick,
+                    &mut dirty,
+                    &book.0,
+                    *chunk,
+                    *local_index,
+                );
             }
             _ => {}
         }
@@ -278,13 +317,21 @@ pub(crate) fn apply_commands(
     mut player: ResMut<PlayerRes>,
     clock: Res<ClockRes>,
     mut sched: ResMut<SchedulerRes>,
+    book: Res<CraftBookRes>,
 ) {
     if queue.0.is_empty() {
         return;
     }
     let mut dirty = std::mem::take(&mut state.dirty_tiles);
     if let Some(world) = state.world.as_mut() {
-        queue.0.apply_all(world, player.0.as_mut(), &mut dirty, &mut sched.0, clock.0.tick);
+        queue.0.apply_all(
+            world,
+            player.0.as_mut(),
+            &mut dirty,
+            &mut sched.0,
+            clock.0.tick,
+            &book.0,
+        );
     }
     state.dirty_tiles = dirty;
 }

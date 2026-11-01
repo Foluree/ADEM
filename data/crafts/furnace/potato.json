@@ -1,0 +1,6 @@
+{
+  "id": "potato_baked",
+  "shapeless": true,
+  "ingredients": [{ "item": "potato", "count": 1 }],
+  "result": { "item": "potato_baked", "count": 1 }
+}

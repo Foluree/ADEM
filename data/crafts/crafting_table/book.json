@@ -1,0 +1,9 @@
+{
+  "id": "book",
+  "grid": [
+    ["paper", "paper", "paper"],
+    ["paper", "string", null],
+    [null, null, null]
+  ],
+  "result": { "item": "book", "count": 1 }
+}

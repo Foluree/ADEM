@@ -16,7 +16,7 @@ use crate::app::input::cursor_world_tile;
 use crate::app::settings::{ControlAction, Settings};
 use crate::app::state::{CommandQueueRes, GameMode, GameState, PlayerRes};
 use crate::simulation::commands::Command;
-use crate::simulation::objects::{ObjectKind, build_cost};
+use crate::simulation::objects::{BuildingKind, ObjectKind, build_cost};
 use crate::ui::UiFont;
 use crate::ui::bottom_panel::FitIcon;
 use crate::ui::icons::UiIcons;
@@ -53,7 +53,7 @@ impl Plugin for ConstructionPlugin {
 #[derive(Resource, Default, Debug)]
 pub struct ConstructionUi {
     pub open: bool,
-    pub selected: Option<ObjectKind>,
+    pub selected: Option<BuildingKind>,
 }
 
 impl ConstructionUi {
@@ -78,7 +78,7 @@ struct ConstructionPanel;
 
 /// Строка постройки в меню.
 #[derive(Component)]
-struct BuildEntry(ObjectKind);
+struct BuildEntry(BuildingKind);
 
 /// Тогл окна по бинду. Как окно инвентаря: модальные меню (пауза,
 /// технологии) перекрывают, захват бинда и текстовый ввод отключают тогл.
@@ -227,8 +227,13 @@ fn spawn_window(
                         },
                         TextColor(style::text_dim()),
                     ));
-                    for kind in ObjectKind::BUILDINGS {
-                        spawn_entry(panel, kind, font, icons, names);
+                    // В меню только постройки с назначенной ценой: станции
+                    // появятся, когда будут их крафты (пока ставятся
+                    // редактором).
+                    for kind in BuildingKind::ALL {
+                        if build_cost(kind).is_some() {
+                            spawn_entry(panel, kind, font, icons, names);
+                        }
                     }
                 });
         });
@@ -237,7 +242,7 @@ fn spawn_window(
 /// Строка постройки: иконка, название, цена. Клик выбирает/снимает выбор.
 fn spawn_entry(
     panel: &mut ChildSpawnerCommands,
-    kind: ObjectKind,
+    kind: BuildingKind,
     font: &UiFont,
     icons: &UiIcons,
     names: &ItemNames,
@@ -266,7 +271,10 @@ fn spawn_entry(
             BuildEntry(kind),
         ))
         .with_children(|row| {
-            row.spawn((ImageNode::new(icons.object(kind).clone()), Node::default()))
+            row.spawn((
+                ImageNode::new(icons.object(ObjectKind::Building(kind)).clone()),
+                Node::default(),
+            ))
                 .insert(FitIcon { box_px: 32.0 });
             row.spawn((
                 Text::new(name),
@@ -290,10 +298,15 @@ fn spawn_entry(
 }
 
 /// Название постройки для меню (предметные названия — в info/items.json).
-fn building_name(kind: ObjectKind) -> &'static str {
+fn building_name(kind: BuildingKind) -> &'static str {
     match kind {
-        ObjectKind::Campfire => "Костёр",
-        _ => "Постройка",
+        BuildingKind::Campfire => "Костёр",
+        BuildingKind::CraftingTable => "Верстак",
+        BuildingKind::Furnace => "Печь",
+        BuildingKind::Barrel => "Бочка",
+        BuildingKind::BlastFurnace => "Плавильная печь",
+        BuildingKind::Storage => "Склад",
+        BuildingKind::SmithingTable => "Кузнечный стол",
     }
 }
 

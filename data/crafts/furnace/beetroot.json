@@ -1,0 +1,6 @@
+{
+  "id": "beetroot_roasted",
+  "shapeless": true,
+  "ingredients": [{ "item": "beetroot", "count": 1 }],
+  "result": { "item": "beetroot_roasted", "count": 1 }
+}

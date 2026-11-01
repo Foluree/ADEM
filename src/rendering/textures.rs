@@ -7,7 +7,8 @@
 use bevy::prelude::*;
 
 use crate::simulation::{
-    EntityKind, EntityState, ItemKind, ObjectKind, WorldObject, ITEM_KIND_COUNT,
+    BuildingKind, CropKind, EntityKind, EntityState, ItemKind, ObjectKind, WorldObject,
+    CROP_KIND_COUNT, ITEM_KIND_COUNT, MAX_CROP_STAGES,
 };
 
 /// Хэндлы текстур для всех типов тайлов, объектов и игрока.
@@ -24,13 +25,23 @@ pub(crate) struct TileTextures {
     deep_water: Handle<Image>,
     ocean: Handle<Image>,
     mountain: Handle<Image>,
+    moss: Handle<Image>,
+    mud: Handle<Image>,
+    podzol: Handle<Image>,
     tree: Handle<Image>,
     bush: Handle<Image>,
     rock: Handle<Image>,
     apple_tree: Handle<Image>,
     apple_tree_empty: Handle<Image>,
-    /// Текстуры построек по дискриминанту вида-постройки.
-    buildings: [Handle<Image>; BUILDING_KIND_COUNT],
+    /// Крест костра: две вертикальные грани вдоль середин сторон тайла.
+    campfire_cross: Handle<Image>,
+    /// Склад: плоская текстура, заполняющая поверхность тайла.
+    storage_flat: Handle<Image>,
+    /// Текстуры станций по порядку `STATION_KINDS`.
+    stations: [StationTextures; STATION_KIND_COUNT],
+    /// Стадии культур: `[культура][стадия]` (пустые хэндлы для
+    /// несуществующих стадий не грузятся — см. `crop_texture`).
+    crops: Vec<Handle<Image>>,
     /// Иконки предметов по дискриминанту `ItemKind`.
     items: [Handle<Image>; ITEM_KIND_COUNT],
     player: Handle<Image>,
@@ -39,13 +50,47 @@ pub(crate) struct TileTextures {
     wolf_walk: [Handle<Image>; 2],
 }
 
-/// Число видов-построек с текстурами (порядок совпадает с
-/// `ObjectKind::BUILDINGS`).
-pub(crate) const BUILDING_KIND_COUNT: usize = 1;
+/// Текстуры одной станции-блока: верх и две видимые боковые грани
+/// (−X — «фронт», −Y — «бок»). Для печей `front_on` — рабочая фронтальная
+/// текстура (горит/готовит).
+pub(crate) struct StationTextures {
+    pub(crate) top: Handle<Image>,
+    pub(crate) side: Handle<Image>,
+    pub(crate) front: Handle<Image>,
+    pub(crate) front_on: Option<Handle<Image>>,
+}
+
+/// Станции с изометрическим блоком (порядок = порядок в `stations`).
+pub(crate) const STATION_KINDS: [BuildingKind; 5] = [
+    BuildingKind::CraftingTable,
+    BuildingKind::Furnace,
+    BuildingKind::Barrel,
+    BuildingKind::BlastFurnace,
+    BuildingKind::SmithingTable,
+];
+
+pub(crate) const STATION_KIND_COUNT: usize = STATION_KINDS.len();
 
 impl TileTextures {
     /// Загружает все текстуры из `assets/textures/...`.
     pub(crate) fn load(assets: &AssetServer) -> Self {
+        // Стадии культур грузим подряд: для каждой культуры — её число стадий.
+        let crop_files: [&str; CROP_KIND_COUNT] = [
+            "wheat",
+            "beetroots",
+            "carrots",
+            "potatoes",
+            "cherry",
+        ];
+        let mut crops = Vec::with_capacity(CROP_KIND_COUNT * MAX_CROP_STAGES);
+        for (kind, base) in crop_files.iter().enumerate() {
+            for stage in 0..CropKind::from_discriminant(kind as u8)
+                .map_or(0, CropKind::stage_count)
+            {
+                crops.push(assets.load(format!("textures/crops/{base}_stage{stage}.png")));
+            }
+        }
+
         Self {
             water: assets.load("textures/tiles/water.png"),
             sand: assets.load("textures/tiles/sand.png"),
@@ -58,12 +103,50 @@ impl TileTextures {
             deep_water: assets.load("textures/tiles/deep_water.png"),
             ocean: assets.load("textures/tiles/ocean.png"),
             mountain: assets.load("textures/tiles/mountain.png"),
+            moss: assets.load("textures/tiles/moss.png"),
+            mud: assets.load("textures/tiles/mud.png"),
+            podzol: assets.load("textures/tiles/podzol.png"),
             tree: assets.load("textures/objects/tree.png"),
             bush: assets.load("textures/objects/bush.png"),
             rock: assets.load("textures/objects/rock.png"),
             apple_tree: assets.load("textures/objects/apple_tree.png"),
             apple_tree_empty: assets.load("textures/objects/apple_tree_empty.png"),
-            buildings: [assets.load("textures/buildings/campfire.png")],
+            campfire_cross: assets.load("textures/buildings/campfire_cross.png"),
+            storage_flat: assets.load("textures/buildings/storage.png"),
+            stations: [
+                // Верстак: боковины одинаковы, фронтальной грани нет.
+                StationTextures {
+                    top: assets.load("textures/buildings/crafting_table_top.png"),
+                    side: assets.load("textures/buildings/crafting_table_side.png"),
+                    front: assets.load("textures/buildings/crafting_table_side.png"),
+                    front_on: None,
+                },
+                StationTextures {
+                    top: assets.load("textures/buildings/furnace_top.png"),
+                    side: assets.load("textures/buildings/furnace_side.png"),
+                    front: assets.load("textures/buildings/furnace_front.png"),
+                    front_on: Some(assets.load("textures/buildings/furnace_front_on.png")),
+                },
+                StationTextures {
+                    top: assets.load("textures/buildings/barrel_top.png"),
+                    side: assets.load("textures/buildings/barrel_side.png"),
+                    front: assets.load("textures/buildings/barrel_side.png"),
+                    front_on: None,
+                },
+                StationTextures {
+                    top: assets.load("textures/buildings/blast_furnace_top.png"),
+                    side: assets.load("textures/buildings/blast_furnace_side.png"),
+                    front: assets.load("textures/buildings/blast_furnace_front.png"),
+                    front_on: Some(assets.load("textures/buildings/blast_furnace_front_on.png")),
+                },
+                StationTextures {
+                    top: assets.load("textures/buildings/smithing_table_top.png"),
+                    side: assets.load("textures/buildings/smithing_table_side.png"),
+                    front: assets.load("textures/buildings/smithing_table_front.png"),
+                    front_on: None,
+                },
+            ],
+            crops,
             items: [
                 assets.load("textures/items/stick.png"),
                 assets.load("textures/items/rock.png"),
@@ -137,7 +220,6 @@ impl TileTextures {
                 assets.load("textures/items/food/potato.png"),
                 assets.load("textures/items/food/potato_baked.png"),
                 assets.load("textures/items/food/strange_tuber.png"),
-                assets.load("textures/items/food/strawberries.png"),
                 assets.load("textures/items/raw_ore/raw_copper.png"),
                 assets.load("textures/items/raw_ore/raw_gold.png"),
                 assets.load("textures/items/raw_ore/raw_silver.png"),
@@ -150,6 +232,12 @@ impl TileTextures {
                 assets.load("textures/items/tools/shears_copper.png"),
                 assets.load("textures/items/tools/shovel_copper.png"),
                 assets.load("textures/items/tools/sickle_copper.png"),
+                assets.load("textures/items/seeds/seeds_beetroot.png"),
+                assets.load("textures/items/food/beetroot.png"),
+                assets.load("textures/items/food/beetroot_roasted.png"),
+                assets.load("textures/items/food/cherry.png"),
+                assets.load("textures/items/coal.png"),
+                assets.load("textures/items/charcoal.png"),
             ],
             player: assets.load("textures/entities/player.png"),
             wolf_standing: assets.load("textures/entities/wolf/wolf_standing.png"),
@@ -177,8 +265,40 @@ impl TileTextures {
             ObjectKind::Bush => &self.bush,
             ObjectKind::Rock => &self.rock,
             ObjectKind::AppleTree => &self.apple_tree,
-            ObjectKind::Campfire => &self.buildings[0],
+            // Плоская текстура склада-декаля; остальное — первая попавшаяся
+            // грань станции (для меню строительства/голограммы).
+            ObjectKind::Building(BuildingKind::Storage) => &self.storage_flat,
+            ObjectKind::Building(BuildingKind::Campfire) => &self.campfire_cross,
+            ObjectKind::Building(station) => &self.station_textures(station).front,
         }
+    }
+
+    /// Текстуры станции-блока (верх/бок/фронт/фронт-в-работе).
+    /// Порядок станций — `STATION_KINDS`; станция вне списка (костёр,
+    /// склад) рисуется не блоком, поэтому сюда не попадает.
+    pub(crate) fn station_textures(&self, kind: BuildingKind) -> &StationTextures {
+        let index = STATION_KINDS
+            .iter()
+            .position(|k| *k == kind)
+            .expect("все блочные станции должны быть в STATION_KINDS");
+        &self.stations[index]
+    }
+
+    /// Хэндл креста костра.
+    pub(crate) fn campfire_cross(&self) -> &Handle<Image> {
+        &self.campfire_cross
+    }
+
+    /// Хэндл плоской текстуры склада.
+    pub(crate) fn storage_flat(&self) -> &Handle<Image> {
+        &self.storage_flat
+    }
+
+    /// Хэндл текстуры стадии культуры.
+    pub(crate) fn crop_texture(&self, kind: CropKind, stage: u8) -> &Handle<Image> {
+        let base = kind as usize * MAX_CROP_STAGES;
+        let stage = (stage as usize).min(kind.stage_count() - 1);
+        &self.crops[base + stage]
     }
 
     /// Хэндл текстуры предмета.
@@ -203,8 +323,8 @@ impl TileTextures {
         }
     }
 
-    /// Хэндлы тайлов в порядке индексов атласа: Water … Mountain.
-    pub(crate) fn atlas_sources(&self) -> [&Handle<Image>; 11] {
+    /// Хэндлы тайлов в порядке индексов атласа: Water … Podzol.
+    pub(crate) fn atlas_sources(&self) -> [&Handle<Image>; 14] {
         [
             &self.water,
             &self.sand,
@@ -217,6 +337,9 @@ impl TileTextures {
             &self.deep_water,
             &self.ocean,
             &self.mountain,
+            &self.moss,
+            &self.mud,
+            &self.podzol,
         ]
     }
 }
