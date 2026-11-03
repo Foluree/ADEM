@@ -1,94 +1,25 @@
-//! Модальные меню технологий (T) и соц. институтов (Y): полноценные
-//! полноэкранные деревья слева-направо. Деревья ветвятся: основная
-//! последовательная цепочка задаёт эпохи, боковые ветви требуют узлы
-//! цепочки и раскладываются в те же колонки глубины; границы эпох
-//! отмечены вертикальными светло-серыми линиями (позиции
-//! разделителей — константы в этом файле). Корни (без требований) слева,
-//! ветви растут вправо по колонкам глубины; соединители — гладкие
-//! кубические Безье без изломов (полилиния из повёрнутых через
-//! `UiTransform` сегментов, приём из бестиария Endless_Space).
-//! Обзор: зум колёсиком к курсору, панорама зажатой ПКМ. Вид не
-//! сохраняется: ресурс создаётся при открытии (дерево показывается
-//! целиком) и удаляется при закрытии любым путём.
-//! Данные грузятся из `data/science/tech_*.json` (технологии по эпохам)
-//! и `data/culture/social_*.json` (институты по эпохам) один раз при старте.
-//! Фон меню — текстура `textures/ui/bg.png`, см. `ui/menu_bg.rs`.
+//! Общий движок деревьев технологий/институтов: раскладка слева-направо,
+//! отрисовка карточек и Безье-соединителей, обзор (панорама ПКМ, зум
+//! колесом), очистка вида и строгая валидация данных. Данные конкретных
+//! деревьев — в `tech.rs` и `social.rs`; движок знает только `TreeEntry`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
 use bevy::input::mouse::MouseWheel;
-use bevy::input_focus::InputFocus;
 use bevy::math::Rot2;
 use bevy::prelude::*;
 use bevy::ui::UiTransform;
-use bevy::ui_widgets::TextInput;
 use serde::Deserialize;
 
-use crate::app::settings::{ControlAction, Settings};
-use crate::app::state::{GameState, MenuKind};
-use crate::ui::menu_bg::{self, MenuBackground, MenuBgCache};
-use crate::ui::pause_menu::BindingCapture;
-use crate::ui::{style, text_input_focused, BlocksWorldInput};
+use crate::app::state::MenuKind;
+use crate::ui::menu_bg::{self, MenuBgCache};
+use crate::ui::{style, BlocksWorldInput};
 use crate::ui::UiFont;
 
-pub struct MenusPlugin;
-
-impl Plugin for MenusPlugin {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<TechData>()
-            .init_resource::<SocialData>()
-            .init_resource::<MenuBgCache>()
-            .add_systems(Startup, (load_data, menu_bg::load_bg_source))
-            .add_systems(
-                Update,
-                (toggle_menus, cleanup_tree_view, pan_zoom_tree, menu_bg::update_menu_background).chain(),
-            );
-    }
-}
-
-// ---------- Данные ----------
-
-#[derive(Deserialize, Default, Resource, Debug)]
-pub struct TechData {
-    #[serde(default)]
-    pub technologies: Vec<TechEntry>,
-}
-
-#[allow(unused)]
-#[derive(Deserialize, Default, Debug, Clone)]
-pub struct TechEntry {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub era: String,
-    #[serde(default)]
-    pub requires: Vec<String>,
-    #[serde(default)]
-    pub description: String,
-}
-
-#[derive(Deserialize, Default, Resource, Debug)]
-pub struct SocialData {
-    #[serde(default)]
-    pub institutions: Vec<SocialEntry>,
-}
-
-#[allow(unused)]
-#[derive(Deserialize, Default, Debug, Clone)]
-pub struct SocialEntry {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub era: String,
-    #[serde(default)]
-    pub requires: Vec<String>,
-    #[serde(default)]
-    pub description: String,
-}
-
-// ---------- Компоненты и константы холста ----------
+use super::social::{SOCIAL_ERA_COLUMNS, SocialData};
+use super::tech::{TECH_ERA_COLUMNS, TechData};
 
 /// Маркер корня техно/социального дерева (и творческого меню). Виден
 /// пауз-меню: их ESC-цепочка закрывает эти меню тем же нажатием.
@@ -96,10 +27,10 @@ pub struct SocialEntry {
 pub(crate) struct MenuRoot;
 
 /// Сторона карточки: ширина и высота (px холста, масштабируются зумом).
-const CARD_W: f32 = 240.0;
+pub(crate) const CARD_W: f32 = 240.0;
 const CARD_H: f32 = 110.0;
 /// Горизонтальный зазор между колонками и вертикальный между карточками.
-const GAP_X: f32 = 130.0;
+pub(crate) const GAP_X: f32 = 130.0;
 const GAP_Y: f32 = 44.0;
 /// Базовая толщина линий, px холста; на экране клампится в [MIN, MAX].
 const LINE_PX: f32 = 3.0;
@@ -130,19 +61,10 @@ const ERA_LINE_PX: f32 = 2.0;
 /// Отступ разделителя эпох выше и ниже дерева, px холста.
 const ERA_LINE_MARGIN: f32 = 60.0;
 
-/// Сколько колонок (последовательных карточек) занимает каждая эпоха в
-/// дереве технологий — порядок эпох: каменный, бронзовый, железный век,
-/// средневековье. Разделители рисуются после каждой границы, кроме
-/// последней. Значение правится вместе с данными `data/science/`.
-const TECH_ERA_COLUMNS: [usize; 4] = [10, 10, 10, 10];
-
-/// То же для дерева социальных институтов (`data/culture/`).
-const SOCIAL_ERA_COLUMNS: [usize; 4] = [8, 8, 8, 8];
-
 /// Позиционируемый узел холста: базовая (немасштабированная) геометрия.
 /// Экранная позиция/размер = `offset + base * zoom` (как в бестиарии).
 #[derive(Component)]
-struct CanvasNode {
+pub(crate) struct CanvasNode {
     base: Vec2,
     size: Vec2,
 }
@@ -150,53 +72,41 @@ struct CanvasNode {
 /// Один сегмент кривой (короткий прямоугольник между точками полилинии
 /// Безье). Позицию, длину, толщину и доворот каждый кадр считает обзор.
 #[derive(Component)]
-struct CurveSegment {
+pub(crate) struct CurveSegment {
     a: Vec2,
     b: Vec2,
 }
 
 /// Текст карточки с базовым размером шрифта (масштабируется зумом).
 #[derive(Component)]
-struct CardTitle {
+pub(crate) struct CardTitle {
     base: f32,
 }
 #[derive(Component)]
-struct CardEra {
+pub(crate) struct CardEra {
     base: f32,
 }
 #[derive(Component)]
-struct CardDesc {
+pub(crate) struct CardDesc {
     base: f32,
 }
 
 /// Вид дерева: сдвиг (экранные px) и зум. Живёт только пока дерево открыто.
 #[derive(Resource, Debug)]
-struct TreeView {
+pub(crate) struct TreeView {
     offset: Vec2,
     zoom: f32,
 }
 
-// ---------- Загрузка ----------
-
-/// Читает каталоги данных эпох: технологии — `data/science/tech_*.json`,
-/// институты — `data/culture/social_*.json`. Файлы эпох сливаются в
-/// порядке лексикографии имён (детерминизм, как у рецептов крафта);
-/// ошибки отдельных файлов не роняют игру — только лог. После загрузки
-/// данные проверяются на типовые ошибки разметки (см. `validate_tree`).
-fn load_data(mut tech: ResMut<TechData>, mut social: ResMut<SocialData>) {
-    *tech = load_tech_dir("data/science");
-    *social = load_social_dir("data/culture");
-    validate_tree("технологии", &tech.technologies);
-    validate_tree("институты", &social.institutions);
-}
+// ---------- Валидация данных ----------
 
 /// Доступ узлов разных типов (технологии, институты) к полям проверки.
-trait TreeNode {
+pub(crate) trait TreeNode {
     fn node_id(&self) -> &str;
     fn node_requires(&self) -> &[String];
 }
 
-impl TreeNode for TechEntry {
+impl TreeNode for super::tech::TechEntry {
     fn node_id(&self) -> &str {
         &self.id
     }
@@ -205,7 +115,7 @@ impl TreeNode for TechEntry {
     }
 }
 
-impl TreeNode for SocialEntry {
+impl TreeNode for super::social::SocialEntry {
     fn node_id(&self) -> &str {
         &self.id
     }
@@ -220,7 +130,7 @@ impl TreeNode for SocialEntry {
 /// Проверки: уникальные id, требования к известным узлам, сходимость
 /// глубин требований (несходимость = цикл, включая самоссылку).
 /// Возвращает число найденных проблем (для тестов).
-fn validate_tree(kind: &str, entries: &[impl TreeNode]) -> usize {
+pub(crate) fn validate_tree(kind: &str, entries: &[impl TreeNode]) -> usize {
     let mut problems = 0;
     let mut index: HashMap<&str, usize> = HashMap::new();
     for (i, entry) in entries.iter().enumerate() {
@@ -291,7 +201,7 @@ fn validate_tree(kind: &str, entries: &[impl TreeNode]) -> usize {
 
 /// Список `*.json`-файлов каталога в лексикографическом порядке.
 /// Ошибка чтения каталога — пустой список (нет данных, нет дерева).
-fn json_files(dir: &str) -> Vec<String> {
+pub(crate) fn json_files(dir: &str) -> Vec<String> {
     match fs::read_dir(dir) {
         Ok(entries) => {
             let mut paths: Vec<String> = entries
@@ -310,93 +220,11 @@ fn json_files(dir: &str) -> Vec<String> {
     }
 }
 
-/// Загружает все файлы технологий эпохи и сливает их в один набор.
-fn load_tech_dir(dir: &str) -> TechData {
-    let mut data = TechData::default();
-    for path in json_files(dir) {
-        match read_json::<TechData>(&path) {
-            Ok(mut part) => data.technologies.append(&mut part.technologies),
-            Err(e) => warn!("Технологии: {e}"),
-        }
-    }
-    debug!("Загружено технологий: {}", data.technologies.len());
-    data
-}
-
-/// Загружает все файлы институтов эпохи и сливает их в один набор.
-fn load_social_dir(dir: &str) -> SocialData {
-    let mut data = SocialData::default();
-    for path in json_files(dir) {
-        match read_json::<SocialData>(&path) {
-            Ok(mut part) => data.institutions.append(&mut part.institutions),
-            Err(e) => warn!("Институты: {e}"),
-        }
-    }
-    debug!("Загружено институтов: {}", data.institutions.len());
-    data
-}
-
 /// Читает и десериализует JSON-файл.
-fn read_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, String> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T, String> {
     let p = Path::new(path);
     let text = fs::read_to_string(p).map_err(|e| format!("{path}: {e}"))?;
     serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))
-}
-
-// ---------- Управление меню ----------
-
-/// Обрабатывает горячие клавиши меню (бинды из настроек). Пока фокус
-/// в текстовом поле, идёт захват бинда или открыт пауз-меню,
-/// хоткеи не срабатывают.
-fn toggle_menus(
-    mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut state: ResMut<GameState>,
-    settings: Res<Settings>,
-    capture: Res<BindingCapture>,
-    tech: Res<TechData>,
-    social: Res<SocialData>,
-    bg: Res<MenuBgCache>,
-    font: Res<UiFont>,
-    windows: Query<&Window>,
-    existing: Query<Entity, With<MenuRoot>>,
-    focus: Res<InputFocus>,
-    text_inputs: Query<(), With<TextInput>>,
-) {
-    if text_input_focused(&focus, &text_inputs) || capture.0.is_some() {
-        return;
-    }
-    if state.active_menu == Some(MenuKind::Pause) {
-        return;
-    }
-    let want_tech = keys.just_pressed(settings.controls.key(ControlAction::TechMenu));
-    let want_social = keys.just_pressed(settings.controls.key(ControlAction::SocialMenu));
-    if !want_tech && !want_social {
-        return;
-    }
-    let target = if want_tech { MenuKind::Tech } else { MenuKind::Social };
-
-    let mut already_open = false;
-    for e in &existing {
-        commands.entity(e).despawn();
-        already_open = true;
-    }
-    if already_open && state.active_menu == Some(target) {
-        state.active_menu = None;
-        return;
-    }
-
-    state.active_menu = Some(target);
-    spawn_tree(&mut commands, target, &tech, &social, &bg, &font, &windows);
-}
-
-/// Убирает вид дерева, когда корень меню закрыт любым путём (клавиша,
-/// ESC, переключение на творческое меню). Вид нарочно не переживает
-/// закрытие: при следующем открытии дерево показывается целиком.
-fn cleanup_tree_view(mut commands: Commands, roots: Query<(), With<MenuRoot>>) {
-    if roots.is_empty() {
-        commands.remove_resource::<TreeView>();
-    }
 }
 
 // ---------- Раскладка дерева ----------
@@ -434,7 +262,7 @@ fn era_label(era: &str) -> String {
 /// X-координаты вертикальных разделителей эпох (px холста) по числу
 /// колонок каждой эпохи: линия ставится посередине зазора на границе
 /// эпох; после последней границы линия не нужна.
-fn era_separator_positions(era_columns: &[usize]) -> Vec<f32> {
+pub(crate) fn era_separator_positions(era_columns: &[usize]) -> Vec<f32> {
     let pitch = CARD_W + GAP_X;
     let mut positions = Vec::new();
     let mut columns_passed = 0_usize;
@@ -569,7 +397,7 @@ fn compute_tree_layout(entries: &[TreeEntry]) -> TreeLayout {
 
 /// Создаёт полноэкранное дерево. Пустые данные — экран с сообщением,
 /// остальная механика (ESC, зум) работает как обычно.
-fn spawn_tree(
+pub(crate) fn spawn_tree(
     commands: &mut Commands,
     kind: MenuKind,
     tech: &TechData,
@@ -666,7 +494,7 @@ fn spawn_tree(
                     image: menu_bg::cached_handle(bg).unwrap_or_default(),
                     ..default()
                 },
-                MenuBackground,
+                menu_bg::MenuBackground,
             ));
             // Разделители эпох — сразу после фона: лежат под линиями и карточками.
             // Вертикальные светло-серые линии на всю высоту дерева; масштаб
@@ -873,7 +701,7 @@ fn spawn_card(
 /// Панорама (зажатая ПКМ) + зум (колесо к курсору) + раскладка узлов.
 /// Содержимое карточек масштабируется только при смене зума: смена
 /// шрифта каждый кадр дёргала бы переразметку (приём из бестиария).
-fn pan_zoom_tree(
+pub(crate) fn pan_zoom_tree(
     view: Option<ResMut<TreeView>>,
     windows: Query<&Window>,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -1003,6 +831,11 @@ fn pan_zoom_tree(
     }
 }
 
-#[cfg(test)]
-#[path = "../tests/menus.rs"]
-mod tests;
+/// Убирает вид дерева, когда корень меню закрыт любым путём (клавиша,
+/// ESC, переключение на творческое меню). Вид нарочно не переживает
+/// закрытие: при следующем открытии дерево показывается целиком.
+pub(crate) fn cleanup_tree_view(mut commands: Commands, roots: Query<(), With<MenuRoot>>) {
+    if roots.is_empty() {
+        commands.remove_resource::<TreeView>();
+    }
+}

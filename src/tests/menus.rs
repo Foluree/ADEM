@@ -1,4 +1,6 @@
 use super::*;
+use super::tech::{TechEntry, TECH_ERA_COLUMNS};
+use super::tree_view::{CARD_W, GAP_X, era_separator_positions};
 
 /// Узел для тестов валидации.
 fn entry(id: &str, requires: &[&str]) -> TechEntry {

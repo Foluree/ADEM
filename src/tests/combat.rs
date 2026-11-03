@@ -1,7 +1,6 @@
 use super::*;
 use crate::simulation::entities::{EntityKind, HUMAN_MAX_HP, WOLF_BITE_DAMAGE};
 use crate::simulation::generation::generate_world;
-use crate::simulation::item_entity::PICKUP_DELAY_TICKS;
 use crate::simulation::world::WorldSize;
 
 /// Мир без воды и существ для боевых тестов.

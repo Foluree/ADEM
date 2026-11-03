@@ -1,0 +1,1 @@
+cargo flamegraph --profile profiling

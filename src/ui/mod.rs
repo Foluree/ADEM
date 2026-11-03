@@ -11,6 +11,7 @@ pub mod inspector;
 pub mod inventory;
 pub mod menu_bg;
 pub mod menus;
+pub mod settings_window;
 pub mod pause_menu;
 pub mod stations;
 pub mod style;

@@ -6,33 +6,39 @@
 //! панели, остальные элементы идут по столбцам сверху вниз
 //! (1.1, 2.1, 1.2, 2.2, ...), поэтому панель никогда не растёт в высоту.
 //! Поля размера и сида мира живут справа и в подменю не меняются.
+//!
+//! Состав модуля:
+//! - `categories` — наборы кнопок базового вида и подменю (инструменты,
+//!   линзы), их иконки и русские названия для тултипов;
+//! - `world_fields` — поля размера мира и сида справа на панели.
+
+mod categories;
+mod world_fields;
+
+pub(crate) use categories::panel_action_tooltip;
+#[allow(unused_imports)]
+pub(crate) use world_fields::reset_editable;
 
 use bevy::input_focus::InputFocus;
-use bevy::input_focus::tab_navigation::TabIndex;
 use bevy::picking::hover::Hovered;
-use bevy::prelude::*;
-use bevy::text::{EditableText, EditableTextFilter, TextCursorStyle, TextEdit, TextLayout};
 use bevy::picking::Pickable;
+use bevy::prelude::*;
 use bevy::ui::Pressed;
 use bevy::ui_widgets::{Activate, ActivateOnPress, Button, TextInput};
 
 use crate::app::settings::{ControlAction, Settings};
-use crate::app::state::{
-    ClockRes, GameMode, GameState, LensKind, SchedulerRes, SimSpeed, Tool, ToolCategory,
-};
-use crate::simulation::entities::EntityKind;
-use crate::simulation::generation::generate_world;
-use crate::simulation::objects::{BuildingKind, ObjectKind};
-use crate::simulation::scheduler::Scheduler;
-use crate::simulation::tile::TileType;
-use crate::simulation::vegetation;
-use crate::simulation::world::WorldSize;
+use crate::app::state::{GameMode, GameState, LensKind, SimSpeed, Tool, ToolCategory};
+
+
 use crate::ui::UiFont;
 use crate::ui::icons::UiIcons;
 use crate::ui::pause_menu::BindingCapture;
 use crate::ui::style;
 use crate::ui::text_input_focused;
 use crate::ui::BlocksWorldInput;
+
+use categories::{base_items, menu_items};
+use world_fields::spawn_world_fields;
 
 pub struct BottomPanelPlugin;
 
@@ -49,8 +55,8 @@ impl Plugin for BottomPanelPlugin {
                     update_button_styles,
                     update_pause_icon,
                     fit_icons,
-                    handle_world_size_input,
-                    handle_world_seed_input,
+                    world_fields::handle_world_size_input,
+                    world_fields::handle_world_seed_input,
                     toggle_bottom_panel_visibility,
                     clear_panel_pressed,
                 ),
@@ -64,7 +70,7 @@ impl Plugin for BottomPanelPlugin {
 /// Сторона квадратной кнопки — все кнопки панели одного размера.
 const BUTTON_SIZE: f32 = 64.0;
 /// Зазор между кнопками (и столбцами).
-const BUTTON_GAP: f32 = 6.0;
+pub(crate) const BUTTON_GAP: f32 = 6.0;
 /// Вертикальный отступ панели сверху и снизу.
 const PANEL_PADDING: f32 = 8.0;
 /// Кнопок в столбце: панель строго в два ряда.
@@ -75,117 +81,6 @@ const PANEL_HEIGHT: f32 = ROWS as f32 * BUTTON_SIZE + BUTTON_GAP + PANEL_PADDING
 const PANEL_PADDING_X: f32 = 12.0;
 /// Квадрат, в который вписывается иконка кнопки с сохранением пропорций.
 const ICON_BOX: f32 = 46.0;
-
-/// Размещаемые тайлы в порядке кнопок (Empty не ставится).
-const PLACEABLE_TILES: [TileType; 14] = [
-    TileType::Water,
-    TileType::DeepWater,
-    TileType::Ocean,
-    TileType::Sand,
-    TileType::Dirt,
-    TileType::Grass,
-    TileType::ForestGrass,
-    TileType::Stone,
-    TileType::Mountain,
-    TileType::Clay,
-    TileType::Farmland,
-    TileType::Moss,
-    TileType::Mud,
-    TileType::Podzol,
-];
-
-/// Кнопки инструментов категории, по порядку в сетке. Постройки —
-/// только в категории Buildings, объекты — в Objects.
-fn tools_of(category: ToolCategory) -> Vec<Tool> {
-    match category {
-        ToolCategory::Tiles => PLACEABLE_TILES.iter().map(|t| Tool::Tile(*t)).collect(),
-        ToolCategory::Objects => ObjectKind::ALL.iter().copied().map(Tool::Object).collect(),
-        ToolCategory::Buildings => {
-            BuildingKind::ALL.iter().copied().map(Tool::Building).collect()
-        }
-        ToolCategory::Entities => EntityKind::ALL.iter().map(|k| Tool::Entity(*k)).collect(),
-    }
-}
-
-/// Иконка кнопки категории в базовом виде панели.
-fn category_icon(category: ToolCategory, icons: &UiIcons) -> Handle<Image> {
-    match category {
-        ToolCategory::Tiles => icons.tile(TileType::Grass),
-        ToolCategory::Objects => icons.object(ObjectKind::Tree),
-        ToolCategory::Buildings => icons.object(ObjectKind::Building(BuildingKind::Campfire)),
-        ToolCategory::Entities => icons.entity(EntityKind::Wolf),
-    }
-    .clone()
-}
-
-// --- Названия для тултипов ---
-
-/// Русское название тайла (тултипы панели редактора).
-pub(crate) fn tile_name(kind: TileType) -> &'static str {
-    match kind {
-        TileType::Empty => "Пустота",
-        TileType::Water => "Вода",
-        TileType::Sand => "Песок",
-        TileType::Dirt => "Земля",
-        TileType::Grass => "Трава",
-        TileType::ForestGrass => "Лесная трава",
-        TileType::Stone => "Камень",
-        TileType::Clay => "Глина",
-        TileType::Farmland => "Пашня",
-        TileType::DeepWater => "Глубокая вода",
-        TileType::Ocean => "Океан",
-        TileType::Mountain => "Гора",
-        TileType::Moss => "Мох",
-        TileType::Mud => "Грязь",
-        TileType::Podzol => "Подзол",
-    }
-}
-
-/// Русское название природного объекта или постройки.
-pub(crate) fn object_kind_name(kind: ObjectKind) -> &'static str {
-    match kind {
-        ObjectKind::Tree => "Дерево",
-        ObjectKind::Bush => "Куст",
-        ObjectKind::Rock => "Валун",
-        ObjectKind::AppleTree => "Яблоня",
-        ObjectKind::Building(kind) => crate::ui::construction::building_name(kind),
-    }
-}
-
-/// Русское название вида существ.
-pub(crate) fn entity_kind_name(kind: EntityKind) -> &'static str {
-    match kind {
-        EntityKind::Wolf => "Волк",
-        EntityKind::Human => "Человек",
-    }
-}
-
-/// Название кнопки панели для тултипа. `None` — тултип не нужен: плитки
-/// времени (пауза, скорость) подписаны сами.
-pub(crate) fn panel_action_tooltip(action: &PanelAction) -> Option<&'static str> {
-    match action {
-        PanelAction::TogglePause | PanelAction::SetSpeed(_) => None,
-        PanelAction::OpenMenu(PanelMenu::Speed) => None,
-        PanelAction::OpenMenu(PanelMenu::Tools(category)) => Some(match category {
-            ToolCategory::Tiles => "Тайлы",
-            ToolCategory::Objects => "Объекты",
-            ToolCategory::Buildings => "Постройки",
-            ToolCategory::Entities => "Существа",
-        }),
-        PanelAction::OpenMenu(PanelMenu::Lenses) => Some("Линзы карты"),
-        PanelAction::Back => Some("Назад"),
-        PanelAction::SelectTool(tool) => Some(match tool {
-            Tool::Tile(kind) => tile_name(*kind),
-            Tool::Object(kind) => object_kind_name(*kind),
-            Tool::Building(kind) => crate::ui::construction::building_name(*kind),
-            Tool::Entity(kind) => entity_kind_name(*kind),
-        }),
-        PanelAction::ToggleLens(kind) => Some(match kind {
-            LensKind::Sentients => "Разумные существа",
-            LensKind::Buildings => "Постройки",
-        }),
-    }
-}
 
 // --- Состояние вида панели ---
 
@@ -240,22 +135,6 @@ struct PanelButtonsHost;
 #[derive(Component)]
 struct PauseIcon;
 
-/// Маркер поля ввода размера мира.
-#[derive(Component)]
-struct WorldSizeInput;
-
-/// Маркер поля ввода сида мира.
-#[derive(Component)]
-struct WorldSeedInput;
-
-/// Ссылка на текст подписи сида мира.
-#[derive(Component)]
-struct WorldSeedLabel;
-
-/// Ссылка на текст подписи размера мира (показывает применённое значение).
-#[derive(Component)]
-struct WorldSizeLabel;
-
 /// Маркер иконки, которую надо вписать в квадрат с сохранением пропорций.
 /// Используется и окном инвентаря: система `fit_icons` глобальная.
 #[derive(Component)]
@@ -285,78 +164,6 @@ enum ButtonContent {
     Pause(Handle<Image>),
     /// Короткая подпись (скорость, «назад»).
     Text(&'static str),
-}
-
-/// Базовые кнопки: пауза, скорость, тайлы, объекты, существа.
-fn base_items(state: &GameState, icons: &UiIcons) -> Vec<PanelItem> {
-    let pause_icon = if state.paused {
-        icons.play().clone()
-    } else {
-        icons.pause().clone()
-    };
-    let mut items = vec![
-        PanelItem {
-            action: PanelAction::TogglePause,
-            content: ButtonContent::Pause(pause_icon),
-        },
-        // Кнопка скорости показывает текущее значение, подменю — все.
-        PanelItem {
-            action: PanelAction::OpenMenu(PanelMenu::Speed),
-            content: ButtonContent::Text(state.speed.label()),
-        },
-    ];
-    for category in ToolCategory::ALL {
-        items.push(PanelItem {
-            action: PanelAction::OpenMenu(PanelMenu::Tools(category)),
-            content: ButtonContent::Icon(category_icon(category, icons)),
-        });
-    }
-    // Линзы карты: отдельное подменю переключателей (не инструменты —
-    // клик по карте ничего не ставит).
-    items.push(PanelItem {
-        action: PanelAction::OpenMenu(PanelMenu::Lenses),
-        content: ButtonContent::Icon(icons.entity(EntityKind::Human).clone()),
-    });
-    items
-}
-
-/// Элементы открытого подменю в порядке кнопок.
-fn menu_items(menu: PanelMenu, icons: &UiIcons) -> Vec<PanelItem> {
-    match menu {
-        PanelMenu::Speed => SimSpeed::all()
-            .iter()
-            .map(|speed| PanelItem {
-                action: PanelAction::SetSpeed(*speed),
-                content: ButtonContent::Text(speed.label()),
-            })
-            .collect(),
-        PanelMenu::Tools(category) => tools_of(category)
-            .into_iter()
-            .map(|tool| PanelItem {
-                action: PanelAction::SelectTool(tool),
-                content: ButtonContent::Icon(match tool {
-                    Tool::Tile(kind) => icons.tile(kind),
-                    Tool::Object(kind) => icons.object(kind),
-                    Tool::Building(kind) => icons.object(ObjectKind::Building(kind)),
-                    Tool::Entity(kind) => icons.entity(kind),
-                }
-                .clone()),
-            })
-            .collect(),
-        PanelMenu::Lenses => [
-            (LensKind::Sentients, icons.entity(EntityKind::Human).clone()),
-            (
-                LensKind::Buildings,
-                icons.object(ObjectKind::Building(BuildingKind::Campfire)).clone(),
-            ),
-        ]
-        .into_iter()
-        .map(|(kind, icon)| PanelItem {
-            action: PanelAction::ToggleLens(kind),
-            content: ButtonContent::Icon(icon),
-        })
-        .collect(),
-    }
 }
 
 // --- Построение ---
@@ -401,90 +208,12 @@ fn spawn_bottom_panel(mut commands: Commands, state: Res<GameState>, font: Res<U
             ));
 
             // Размер мира и сид: подписи + поля ввода.
-            panel.spawn(column_node()).with_children(|col| {
-                col.spawn(row_node()).with_children(|size| {
-                    size.spawn((
-                        Text::new(format!("Мир: {}", state.world_size.label())),
-                        TextFont {
-                            font: font.0.clone().into(),
-                            font_size: 14.0.into(),
-                            ..default()
-                        },
-                        TextColor(style::text()),
-                        WorldSizeLabel,
-                    ));
-
-                    let mut editable = EditableText::new(state.world_size.tiles().to_string());
-                    editable.max_characters = Some(5);
-                    size.spawn((
-                        Node {
-                            width: Val::Px(76.0),
-                            padding: UiRect::all(Val::Px(7.0)),
-                            border: UiRect::all(Val::Px(1.0)),
-                            ..default()
-                        },
-                        BackgroundColor(style::surface()),
-                        BorderColor::from(style::border()),
-                        editable,
-                        EditableTextFilter::new(|c| c.is_ascii_digit()),
-                        TextLayout::no_wrap(),
-                        TextCursorStyle::default(),
-                        TabIndex(0),
-                        TextInput,
-                        TextFont {
-                            font: font.0.clone().into(),
-                            font_size: 14.0.into(),
-                            ..default()
-                        },
-                        TextColor(style::text()),
-                        WorldSizeInput,
-                    ));
-                });
-
-                col.spawn(row_node()).with_children(|seed_row| {
-                    seed_row.spawn((
-                        Text::new(format!("Сид: {}", state.seed)),
-                        TextFont {
-                            font: font.0.clone().into(),
-                            font_size: 14.0.into(),
-                            ..default()
-                        },
-                        TextColor(style::text()),
-                        WorldSeedLabel,
-                    ));
-
-                    let mut editable = EditableText::new(state.seed.to_string());
-                    editable.max_characters = Some(20);
-                    seed_row.spawn((
-                        Node {
-                            width: Val::Px(120.0),
-                            padding: UiRect::all(Val::Px(7.0)),
-                            border: UiRect::all(Val::Px(1.0)),
-                            ..default()
-                        },
-                        BackgroundColor(style::surface()),
-                        BorderColor::from(style::border()),
-                        editable,
-                        EditableTextFilter::new(|c| c.is_ascii_digit()),
-                        TextLayout::no_wrap(),
-                        TextCursorStyle::default(),
-                        TabIndex(0),
-                        TextInput,
-                        TextFont {
-                            font: font.0.clone().into(),
-                            font_size: 14.0.into(),
-                            ..default()
-                        },
-                        TextColor(style::text()),
-                        WorldSeedInput,
-                    ));
-                });
-            });
+            spawn_world_fields(panel, &state, &font);
         });
 }
 
 /// Строка-кластер внутри панели.
-fn row_node() -> Node {
+pub(crate) fn row_node() -> Node {
     Node {
         flex_direction: FlexDirection::Row,
         column_gap: Val::Px(BUTTON_GAP),
@@ -494,7 +223,7 @@ fn row_node() -> Node {
 }
 
 /// Столбец-кластер внутри панели.
-fn column_node() -> Node {
+pub(crate) fn column_node() -> Node {
     Node {
         flex_direction: FlexDirection::Column,
         row_gap: Val::Px(BUTTON_GAP),
@@ -784,149 +513,6 @@ fn fit_icons(
     }
 }
 
-/// Поле ввода размера мира: pending-текст живёт в виджете до применения.
-///
-/// Enter — применить (значение зажимается в лимиты мира и округляется до
-/// кратности чанку, мир перегенерируется). Escape — отменить ввод и вернуть
-/// применённое значение. Без фокуса поле всегда показывает применённый размер.
-fn handle_world_size_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut state: ResMut<GameState>,
-    clock: Res<ClockRes>,
-    mut sched: ResMut<SchedulerRes>,
-    focus: Res<InputFocus>,
-    mut inputs: Query<(Entity, &mut EditableText), With<WorldSizeInput>>,
-    mut size_label: Query<&mut Text, With<WorldSizeLabel>>,
-) {
-    // Подпись отражает применённый размер: во время набора видно,
-    // что pending в поле ещё не действует.
-    if state.is_changed() {
-        let want = format!("Мир: {}", state.world_size.label());
-        for t in &mut size_label {
-            crate::ui::set_text_if_neq(t, &want);
-        }
-    }
-
-    let Ok((entity, mut editable)) = inputs.single_mut() else {
-        return;
-    };
-    handle_world_field(
-        &keys,
-        &focus,
-        entity,
-        &mut editable,
-        state.world_size.tiles(),
-        |text| text.parse::<u32>().ok(),
-        |side| {
-            let size = WorldSize::new(side);
-            if size != state.world_size {
-                regenerate_world(size, state.seed, &mut state, &clock, &mut sched.0);
-                state.world_size = size;
-            }
-            state.world_size.tiles().to_string()
-        },
-    );
-}
-
-/// Поле ввода сида мира: применяется по Enter.
-fn handle_world_seed_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut state: ResMut<GameState>,
-    clock: Res<ClockRes>,
-    mut sched: ResMut<SchedulerRes>,
-    focus: Res<InputFocus>,
-    mut inputs: Query<(Entity, &mut EditableText), With<WorldSeedInput>>,
-    mut seed_label: Query<&mut Text, With<WorldSeedLabel>>,
-) {
-    if state.is_changed() {
-        let want = format!("Сид: {}", state.seed);
-        for t in &mut seed_label {
-            crate::ui::set_text_if_neq(t, &want);
-        }
-    }
-
-    let Ok((entity, mut editable)) = inputs.single_mut() else {
-        return;
-    };
-    handle_world_field(
-        &keys,
-        &focus,
-        entity,
-        &mut editable,
-        state.seed,
-        |text| text.parse::<u64>().ok(),
-        |seed| {
-            if seed != state.seed {
-                regenerate_world(
-                    state.world_size,
-                    seed,
-                    &mut state,
-                    &clock,
-                    &mut sched.0,
-                );
-                state.seed = seed;
-            }
-            state.seed.to_string()
-        },
-    );
-}
-
-/// Общий каркас полей ввода «размер мира»/«сид»: pending-текст живёт в
-/// виджете до Enter, Escape откатывает, без фокуса поле показывает
-/// применённое значение. Разные у полей только тип значения (`parse`) и
-/// `apply`, который применяет его и возвращает новый текст для поля.
-fn handle_world_field<T>(
-    keys: &ButtonInput<KeyCode>,
-    focus: &InputFocus,
-    entity: Entity,
-    editable: &mut EditableText,
-    committed: T,
-    parse: fn(&str) -> Option<T>,
-    apply: impl FnOnce(T) -> String,
-) where
-    T: ToString,
-{
-    let committed = committed.to_string();
-    if focus.get() != Some(entity) {
-        // Отменённый/неприменённый ввод не сохраняем.
-        if editable.value().to_string() != committed {
-            reset_editable(editable, &committed);
-        }
-        return;
-    }
-
-    if keys.just_pressed(KeyCode::Enter) {
-        match parse(editable.value().to_string().trim()) {
-            // Пустое поле или превышение разрядности откатывает ввод.
-            Some(value) => {
-                let applied = apply(value);
-                reset_editable(editable, &applied);
-            }
-            None => reset_editable(editable, &committed),
-        }
-    } else if keys.just_pressed(KeyCode::Escape) {
-        reset_editable(editable, &committed);
-    }
-}
-
-/// Перегенерирует мир с новыми размером/сидом: генерация, посев цепочек
-/// растительности, запрос перерисовки. Захваченное существо теряется:
-/// мир заменён целиком, управлять не кем (можно захватить другое по F1).
-/// Общая часть обоих полей ввода.
-fn regenerate_world(
-    size: WorldSize,
-    seed: u64,
-    state: &mut GameState,
-    clock: &ClockRes,
-    sched: &mut Scheduler,
-) {
-    let world = generate_world(size, seed);
-    vegetation::seed_all(&world, sched, clock.0.tick);
-    state.world = Some(world);
-    state.pending_rerender = true;
-    state.set_controlled(None);
-}
-
 /// Скрывает нижнюю панель редактора в режиме игрока.
 fn toggle_bottom_panel_visibility(
     state: Res<GameState>,
@@ -959,12 +545,4 @@ fn clear_panel_pressed(
             commands.entity(entity).remove::<Pressed>();
         }
     }
-}
-
-pub(crate) fn reset_editable(editable: &mut EditableText, value: &str) {
-    editable.pending_edits.clear();
-    editable.pending_paste = None;
-    editable.editor_mut().set_text(value);
-    // Курсор в конец — то же, что делает EditableText::new.
-    editable.queue_edit(TextEdit::TextEnd(false));
 }
