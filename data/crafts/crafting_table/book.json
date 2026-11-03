@@ -1,8 +1,13 @@
 {
   "id": "book",
+  "parent": "crafting_table",
+  "ingredients": {
+    "0": "paper",
+    "1": "string"
+  },
   "grid": [
-    ["paper", "paper", "paper"],
-    ["paper", "string", null],
+    ["0", "0", "0"],
+    ["0", "1", null],
     [null, null, null]
   ],
   "result": { "item": "book", "count": 1 }

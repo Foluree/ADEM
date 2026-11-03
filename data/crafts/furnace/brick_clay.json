@@ -1,6 +1,6 @@
 {
   "id": "brick_clay_baked",
-  "shapeless": true,
-  "ingredients": [{ "item": "brick_clay_unfired", "count": 1 }],
+  "parent": "furnace",
+  "input": { "item": "brick_clay_unfired", "count": 1 },
   "result": { "item": "brick_clay_baked", "count": 1 }
 }

@@ -119,24 +119,24 @@ fn inventory_respects_per_kind_max_stack() {
 
     // Три копья — три слота по единице, слияния в один стек нет.
     let mut inv = Inventory::default();
-    assert_eq!(inv.add(ItemKind::Spear, 3), 0);
+    assert_eq!(inv.add(ItemKind::SpearPrimal, 3), 0);
     assert_eq!(
         inv.items[0],
-        Some(ItemStack { kind: ItemKind::Spear, count: 1 })
+        Some(ItemStack { kind: ItemKind::SpearPrimal, count: 1 })
     );
     assert_eq!(
         inv.items[1],
-        Some(ItemStack { kind: ItemKind::Spear, count: 1 })
+        Some(ItemStack { kind: ItemKind::SpearPrimal, count: 1 })
     );
     assert_eq!(
         inv.items[2],
-        Some(ItemStack { kind: ItemKind::Spear, count: 1 })
+        Some(ItemStack { kind: ItemKind::SpearPrimal, count: 1 })
     );
-    assert_eq!(inv.count_of(ItemKind::Spear), 3);
+    assert_eq!(inv.count_of(ItemKind::SpearPrimal), 3);
 
     // Больше слотов нет — остаток возвращается, can_fit согласован.
-    assert_eq!(inv.add(ItemKind::Spear, 10), 5);
-    assert!(!inv.can_fit(ItemKind::Spear, 1));
+    assert_eq!(inv.add(ItemKind::SpearPrimal, 10), 5);
+    assert!(!inv.can_fit(ItemKind::SpearPrimal, 1));
 
     // Расходники ведут как раньше: стрелы доливаются в один стек до 64.
     let mut stash = Inventory::default();
@@ -1028,7 +1028,7 @@ fn grass_gathering_yields_one_and_leaves_dirt() {
 
     // С ножом — можно.
     mind_mut(&mut world, actor).inventory.items[0] = Some(crate::simulation::ItemStack {
-        kind: ItemKind::Knife,
+        kind: ItemKind::KnifePrimal,
         count: 1,
     });
     assert!(actions::interact(&mut world, actor, blocked));
@@ -1046,7 +1046,7 @@ fn hoe_plows_grass_into_farmland() {
     world.set_terrain(pos, TileType::Grass);
     let actor = spawn_human(&mut world, WorldPos::of_tile_center(pos));
     mind_mut(&mut world, actor).inventory.items[0] = Some(crate::simulation::ItemStack {
-        kind: ItemKind::Hoe,
+        kind: ItemKind::HoePrimal,
         count: 1,
     });
 

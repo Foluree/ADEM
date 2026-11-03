@@ -1,31 +1,43 @@
 //! Рецепты крафта из `data/crafts/**/*.json` и сопоставление с сеткой 3×3.
 //!
-//! Рецепт бывает двух видов (гибрид по решению автора):
-//! - `shaped` (по умолчанию) — важны форма и взаимное расположение
-//!   ингредиентов; сетка рецепта обрезается по занятым клеткам и ищется
-//!   в любом месте сетки игрока;
-//! - `shapeless` — важны только виды и количества, порядок не важен.
+//! У каждого рецепта есть `parent` — вид (или виды) крафтера, которому
+//! рецепт доступен. Значения: `manual`, `crafting_table`, `smithing_table`,
+//! `campfire`, `furnace`, `blast_furnace`. Схема рецепта зависит от вида
+//! крафтера:
+//! - сеточные (`manual`, `crafting_table`, `smithing_table`) — `shaped`
+//!   (по умолчанию) с картой символов `ingredients` и сеткой `grid` или
+//!   `shapeless` с массивом `ingredients`;
+//! - кулинарные (`campfire`, `furnace`, `blast_furnace`) — один `input`,
+//!   без `shapeless`/`grid`: поля, которые для готовки бессмысленны, не
+//!   пишутся в данных.
 //!
-//! JSON держится в данных, а не в коде: строки предметов — стабильные
-//! идентификаторы `ItemKind::id()`. Категория рецепта определяется местом
-//! файла: корень каталога — ручной крафт (`manual`), подпапка — станция
-//! с именем папки (`furnace/`, `crafting_table/`, …). Так верстак наследует
-//! ручные рецепты без копирования (тот же файл), а свои добавляет в своей
-//! папке.
+//! Категория рецепта больше не выводится из места файла: папка остаётся
+//! организацией, а видимость определяет `parent`. Загрузчик проверяет
+//! раскладку (папка должна входить в `parent`), но при расхождении пишет
+//! предупреждение в debug-сборке и **не** блокирует загрузку.
+//!
+//! Рецепты хранятся по группам крафтеров: матчинг смотрит только свою
+//! группу, а у готовки есть индекс `входной предмет → рецепт` (O(1)).
+//! Верстак наследует группу `manual`; кузнечный стол — только свою.
+//!
+//! Формат `grid` использует ссылки (как в Minecraft): в `ingredients`
+//! перечислены символы, в клетках сетки — символы или `null`. При загрузке
+//! это один раз разворачивается в компактный `ShapedPattern` с `ItemKind`.
 //!
 //! Рецепт может требовать инструменты (кузнечный стол): поле `tools`
 //! перечисляет предметы, которые должны лежать в слотах инструментов.
 //! Инструменты не расходуются — это требование «чем работаешь».
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::items::{Inventory, ItemKind, ItemStack};
+use super::items::{ITEM_KIND_COUNT, Inventory, ItemKind, ItemStack};
+use super::objects::BuildingKind;
 
-/// Категория ручного крафта в сетке 3×3 (и верстака — сетка наследует
-/// ручные рецепты).
+/// Имя корневой группы (и корневой папки данных): ручной крафт в инвентаре.
 pub const MANUAL_CATEGORY: &str = "manual";
 
 /// Число ячеек сетки крафта.
@@ -36,25 +48,142 @@ pub const GRID_SLOTS: usize = 9;
 /// иначе крутил бы цикл подсчёта бесконечно. На реальных данных недостижим.
 const MAX_BULK_CRAFTS: u32 = 10_000;
 
+/// Вид крафтера — группа рецептов и источник правил их схемы.
+///
+/// Порядок вариантов — порядок групп в `CraftBook` (не сохраняется в
+/// сейвах, поэтому стабильность дискриминантов не требуется).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum CrafterKind {
+    /// Сетка 3×3 в окне инвентаря.
+    Manual,
+    /// Верстак: сетка 3×3, наследует `manual`.
+    CraftingTable,
+    /// Кузнечный стол: сетка 3×3 + обязательные инструменты.
+    SmithingTable,
+    /// Костёр: готовая еда, топливо не нужно.
+    Campfire,
+    /// Печь: готовка на топливе.
+    Furnace,
+    /// Плавильня: руда → слитки, топливо — только уголь.
+    BlastFurnace,
+}
+
+/// Схема рецептов крафтера.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecipeShape {
+    /// Сетка 3×3: shaped или shapeless.
+    Grid,
+    /// Один вход → результат, без сетки.
+    Cooking,
+}
+
+const MANUAL_CHAIN: &[CrafterKind] = &[CrafterKind::Manual];
+const CRAFTING_TABLE_CHAIN: &[CrafterKind] =
+    &[CrafterKind::Manual, CrafterKind::CraftingTable];
+const SMITHING_TABLE_CHAIN: &[CrafterKind] = &[CrafterKind::SmithingTable];
+const CAMPFIRE_CHAIN: &[CrafterKind] = &[CrafterKind::Campfire];
+const FURNACE_CHAIN: &[CrafterKind] = &[CrafterKind::Furnace];
+const BLAST_FURNACE_CHAIN: &[CrafterKind] = &[CrafterKind::BlastFurnace];
+
+impl CrafterKind {
+    /// Все виды крафтеров в порядке групп.
+    pub const ALL: [CrafterKind; 6] = [
+        Self::Manual,
+        Self::CraftingTable,
+        Self::SmithingTable,
+        Self::Campfire,
+        Self::Furnace,
+        Self::BlastFurnace,
+    ];
+
+    /// Число видов (размер массива групп).
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Стабильный строковый id из JSON.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::CraftingTable => "crafting_table",
+            Self::SmithingTable => "smithing_table",
+            Self::Campfire => "campfire",
+            Self::Furnace => "furnace",
+            Self::BlastFurnace => "blast_furnace",
+        }
+    }
+
+    /// Вид крафтера по строковому id из JSON.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.id() == id)
+    }
+
+    /// Схема рецептов, которую принимает крафтер.
+    pub const fn recipe_shape(self) -> RecipeShape {
+        match self {
+            Self::Manual | Self::CraftingTable | Self::SmithingTable => RecipeShape::Grid,
+            Self::Campfire | Self::Furnace | Self::BlastFurnace => RecipeShape::Cooking,
+        }
+    }
+
+    /// Готовит ли крафтер по рецептам с одним входом.
+    pub const fn cooks(self) -> bool {
+        matches!(self, Self::Campfire | Self::Furnace | Self::BlastFurnace)
+    }
+
+    /// Цепочка групп для матчинга: верстак видит свои рецепты и `manual`,
+    /// остальные — только свои.
+    pub const fn recipe_chain(self) -> &'static [CrafterKind] {
+        match self {
+            Self::Manual => MANUAL_CHAIN,
+            Self::CraftingTable => CRAFTING_TABLE_CHAIN,
+            Self::SmithingTable => SMITHING_TABLE_CHAIN,
+            Self::Campfire => CAMPFIRE_CHAIN,
+            Self::Furnace => FURNACE_CHAIN,
+            Self::BlastFurnace => BLAST_FURNACE_CHAIN,
+        }
+    }
+
+    /// Крафтер, соответствующий постройке. `None` — постройка без рецептов.
+    pub fn from_building(kind: BuildingKind) -> Option<Self> {
+        match kind {
+            BuildingKind::Campfire => Some(Self::Campfire),
+            BuildingKind::CraftingTable => Some(Self::CraftingTable),
+            BuildingKind::Furnace => Some(Self::Furnace),
+            BuildingKind::BlastFurnace => Some(Self::BlastFurnace),
+            BuildingKind::SmithingTable => Some(Self::SmithingTable),
+            BuildingKind::Barrel | BuildingKind::Storage => None,
+        }
+    }
+}
+
+/// Тело рецепта в уже разрешённом (оптимизированном) виде.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecipeBody {
+    /// Форма сетки: обрезана по занятым клеткам.
+    Shaped(ShapedPattern),
+    /// Набор ингредиентов: виды + количества, слитые и отсортированные.
+    Shapeless(Vec<(ItemKind, u32)>),
+    /// Кулинарный вход: вид + количество.
+    Cooking { input: (ItemKind, u32) },
+}
+
 /// Разобранный рецепт с уже разрешёнными видами предметов.
 #[derive(Clone, Debug)]
 pub struct CraftRecipe {
     /// Стабильный идентификатор рецепта (имя файла без расширения).
-    #[allow(dead_code)] // читается тестами и будущими станциями/отладкой
     pub id: String,
-    /// Категория станции; для ручной сетки — `manual`.
-    pub category: String,
-    /// true — рецепт без формы (порядок ингредиентов не важен).
-    pub shapeless: bool,
-    /// Форма рецепта (только для shaped).
-    pub pattern: Option<ShapedPattern>,
-    /// Ингредиенты без формы: вид + количество.
-    pub ingredients: Vec<(ItemKind, u32)>,
+    /// Крафтеры, которым доступен рецепт (порядок из JSON, без дублей).
+    pub parents: Vec<CrafterKind>,
+    /// Тело рецепта: форма, набор ингредиентов или кулинарный вход.
+    pub body: RecipeBody,
     /// Что получается.
     pub result: ItemStack,
     /// Требуемые инструменты (кузнечный стол): должны лежать в слотах
     /// инструментов, не расходуются. Пусто — инструменты не нужны.
     pub tools: Vec<ItemKind>,
+    /// Стоимость одного крафта (слитая и отсортированная). Для готовки —
+    /// вход. Считается один раз при загрузке: массовый крафт не аллоцирует.
+    cost: Vec<(ItemKind, u32)>,
 }
 
 /// Обрезанная по занятым клеткам форма рецепта.
@@ -67,23 +196,59 @@ pub struct ShapedPattern {
     pub cells: Vec<Option<ItemKind>>,
 }
 
-/// Набор рецептов. Загружается один раз при старте.
-#[derive(Clone, Debug, Default)]
+/// Набор рецептов с индексами по крафтерам. Загружается один раз при старте.
+#[derive(Clone, Debug)]
 pub struct CraftBook {
+    /// Арена рецептов в порядке загрузки (детерминированный матчинг).
     pub recipes: Vec<CraftRecipe>,
+    /// Индексы рецептов по группам крафтеров (в порядке загрузки).
+    groups: [Vec<u32>; CrafterKind::COUNT],
+    /// Индекс готовки: `cooking[крафтер][входной предмет] → индекс рецепта`.
+    /// `u32::MAX` — рецепта нет. Первый загруженный рецепт побеждает.
+    cooking: [[u32; ITEM_KIND_COUNT]; CrafterKind::COUNT],
+}
+
+/// Результат загрузки: книга, фатальные ошибки файлов и предупреждения.
+#[derive(Debug)]
+pub struct CraftBookLoad {
+    pub book: CraftBook,
+    /// Файлы, которые не загрузились (игра продолжает работать).
+    pub errors: Vec<String>,
+    /// Некритичные расхождения данных (папка vs `parent`). Логируются
+    /// только в debug-сборке.
+    pub warnings: Vec<String>,
+}
+
+impl Default for CraftBook {
+    fn default() -> Self {
+        Self {
+            recipes: Vec::new(),
+            groups: std::array::from_fn(|_| Vec::new()),
+            cooking: [[u32::MAX; ITEM_KIND_COUNT]; CrafterKind::COUNT],
+        }
+    }
 }
 
 impl CraftBook {
-    /// Читает все `*.json` из каталога и его подпапок. Категория рецепта —
-    /// по месту файла: корень — `manual`, подпапка X — `X` (станция).
-    /// Файлы и подпапки обходятся в лексикографическом порядке, поэтому
-    /// набор рецептов детерминирован. Ошибки отдельных файлов не роняют
-    /// игру: они возвращаются списком для лога.
-    pub fn load_dir(dir: &str) -> (Self, Vec<String>) {
-        let mut book = Self::default();
-        let mut errors = Vec::new();
-        load_recipes_recursive(std::path::Path::new(dir), MANUAL_CATEGORY, &mut book, &mut errors);
-        (book, errors)
+    /// Читает все `*.json` из каталога и его подпапок. Видимость рецепта
+    /// определяет `parent`; папка — только организация (и проверка
+    /// раскладки с предупреждением). Файлы и подпапки обходятся в
+    /// лексикографическом порядке, поэтому набор рецептов детерминирован.
+    /// Ошибки отдельных файлов не роняют игру: они возвращаются списком.
+    pub fn load_dir(dir: &str) -> CraftBookLoad {
+        let mut load = CraftBookLoad {
+            book: CraftBook::default(),
+            errors: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let mut seen: HashSet<(CrafterKind, String)> = HashSet::new();
+        load_recipes_recursive(
+            Path::new(dir),
+            Some(MANUAL_CATEGORY),
+            &mut load,
+            &mut seen,
+        );
+        load
     }
 
     /// Рецепт ручной сетки, подходящий под содержимое. Первый по порядку
@@ -92,38 +257,72 @@ impl CraftBook {
         &self,
         grid: &[Option<ItemStack>; GRID_SLOTS],
     ) -> Option<&CraftRecipe> {
-        self.matching_recipe_for(&[MANUAL_CATEGORY], grid, &[])
+        self.matching_recipe_for(CrafterKind::Manual.recipe_chain(), grid, &[])
     }
 
-    /// Рецепт первой подходящей категории из `categories` (порядок важен:
-    /// наследование — manual раньше crafting_table). `held_tools` — виды
-    /// предметов в слотах инструментов станции (кузнечный стол).
+    /// Рецепт первой подходящей группы из `crafters` (порядок важен:
+    /// наследование — `manual` раньше `crafting_table`). `held_tools` —
+    /// виды предметов в слотах инструментов станции (кузнечный стол).
     pub fn matching_recipe_for(
         &self,
-        categories: &[&str],
+        crafters: &[CrafterKind],
         grid: &[Option<ItemStack>; GRID_SLOTS],
         held_tools: &[ItemKind],
     ) -> Option<&CraftRecipe> {
-        self.recipes.iter().find(|recipe| {
-            categories.contains(&recipe.category.as_str())
-                && recipe.tools_satisfied(held_tools)
-                && recipe.matches(grid)
-        })
+        // Пустая сетка не подходит ни одному сеточному рецепту. Проверка
+        // до перебора групп: этот вызов идёт каждый кадр из UI.
+        if grid.iter().all(Option::is_none) {
+            return None;
+        }
+        for &crafter in crafters {
+            for &index in &self.groups[crafter as usize] {
+                let recipe = &self.recipes[index as usize];
+                if recipe.is_grid()
+                    && recipe.tools_satisfied(held_tools)
+                    && recipe.matches(grid)
+                {
+                    return Some(recipe);
+                }
+            }
+        }
+        None
+    }
+
+    /// Кулинарный рецепт для входа — O(1) по индексу предмета.
+    pub fn cooking_recipe(
+        &self,
+        crafter: CrafterKind,
+        input: ItemKind,
+    ) -> Option<&CraftRecipe> {
+        let index = self.cooking[crafter as usize][input as usize];
+        (index != u32::MAX).then(|| &self.recipes[index as usize])
+    }
+
+    /// Рецепты группы в порядке загрузки (отладка, тесты, будущий справочник).
+    #[allow(dead_code)] // потребитель — тесты и будущий справочник рецептов
+    pub fn recipes_for(
+        &self,
+        crafter: CrafterKind,
+    ) -> impl Iterator<Item = &CraftRecipe> + '_ {
+        self.groups[crafter as usize]
+            .iter()
+            .map(move |&index| &self.recipes[index as usize])
     }
 }
 
-/// Рекурсивный обход каталога рецептов: файлы текущей папки — с категорией
-/// `category`, подпапки — со своей категорией по имени. Порядок стабильный.
+/// Рекурсивный обход каталога рецептов. `folder` — имя текущей папки
+/// (для корня — `manual`); используется только для предупреждения о
+/// несовпадении с `parent`.
 fn load_recipes_recursive(
-    dir: &std::path::Path,
-    category: &str,
-    book: &mut CraftBook,
-    errors: &mut Vec<String>,
+    dir: &Path,
+    folder: Option<&str>,
+    load: &mut CraftBookLoad,
+    seen: &mut HashSet<(CrafterKind, String)>,
 ) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
-            errors.push(format!("{}: {error}", dir.display()));
+            load.errors.push(format!("{}: {error}", dir.display()));
             return;
         }
     };
@@ -144,34 +343,131 @@ fn load_recipes_recursive(
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
-                errors.push(format!("{}: {error}", path.display()));
+                load.errors.push(format!("{}: {error}", path.display()));
                 continue;
             }
         };
         match parse_recipe(&text) {
-            Ok(mut recipe) => {
-                recipe.category = category.to_string();
-                book.recipes.push(recipe);
+            Ok(recipe) => {
+                warn_folder_mismatch(&path, folder, &recipe, &mut load.warnings);
+                push_recipe(&mut load.book, seen, recipe, &path, &mut load.errors);
             }
-            Err(error) => errors.push(format!("{}: {error}", path.display())),
+            Err(error) => load.errors.push(format!("{}: {error}", path.display())),
         }
     }
     for subdir in subdirs {
-        // Имя подпапки = категория станции (furnace/, crafting_table/…).
+        // Имя подпапки — подсказка раскладки, а не категория рецепта.
         let Some(name) = subdir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        load_recipes_recursive(&subdir, name, book, errors);
+        load_recipes_recursive(&subdir, Some(name), load, seen);
     }
 }
 
+/// Предупреждение, если файл лежит не в папке одного из своих крафтеров.
+/// Загрузку не блокирует: удобнее отлаживать данные, не теряя рецепт.
+fn warn_folder_mismatch(
+    path: &Path,
+    folder: Option<&str>,
+    recipe: &CraftRecipe,
+    warnings: &mut Vec<String>,
+) {
+    let Some(folder) = folder else { return };
+    match CrafterKind::from_id(folder) {
+        Some(folder_kind) if !recipe.parents.contains(&folder_kind) => {
+            warnings.push(format!(
+                "{}: папка '{folder}' не входит в parent ({})",
+                path.display(),
+                parent_list(&recipe.parents),
+            ));
+        }
+        Some(_) => {}
+        None => warnings.push(format!(
+            "{}: папка '{folder}' не известна как крафтер",
+            path.display(),
+        )),
+    }
+}
+
+fn parent_list(parents: &[CrafterKind]) -> String {
+    parents
+        .iter()
+        .map(|parent| parent.id())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Кладёт рецепт в арену и во все его группы. Дубликат `(крафтер, id)`
+/// отклоняется: иначе «первый подходящий» зависел бы от порядка файлов.
+fn push_recipe(
+    book: &mut CraftBook,
+    seen: &mut HashSet<(CrafterKind, String)>,
+    recipe: CraftRecipe,
+    path: &Path,
+    errors: &mut Vec<String>,
+) {
+    if let Some(&parent) = recipe
+        .parents
+        .iter()
+        .find(|&&parent| seen.contains(&(parent, recipe.id.clone())))
+    {
+        errors.push(format!(
+            "{}: дубликат id '{}' для крафтера '{}'",
+            path.display(),
+            recipe.id,
+            parent.id(),
+        ));
+        return;
+    }
+
+    let index = book.recipes.len() as u32;
+    for &parent in &recipe.parents {
+        seen.insert((parent, recipe.id.clone()));
+        book.groups[parent as usize].push(index);
+        if let RecipeBody::Cooking { input } = &recipe.body {
+            let slot = &mut book.cooking[parent as usize][input.0 as usize];
+            if *slot == u32::MAX {
+                *slot = index;
+            }
+        }
+    }
+    book.recipes.push(recipe);
+}
+
 impl CraftRecipe {
+    /// Сеточный ли рецепт (shaped/shapeless). У кулинарного матчинга нет.
+    pub fn is_grid(&self) -> bool {
+        !matches!(self.body, RecipeBody::Cooking { .. })
+    }
+
+    /// Бесформенный ли рецепт.
+    #[allow(dead_code)] // потребитель — тесты
+    pub fn is_shapeless(&self) -> bool {
+        matches!(self.body, RecipeBody::Shapeless(_))
+    }
+
+    /// Форма рецепта (только для shaped).
+    pub fn pattern(&self) -> Option<&ShapedPattern> {
+        match &self.body {
+            RecipeBody::Shaped(pattern) => Some(pattern),
+            _ => None,
+        }
+    }
+
+    /// Вход кулинарного рецепта (вид + количество).
+    pub fn cooking_input(&self) -> Option<(ItemKind, u32)> {
+        match &self.body {
+            RecipeBody::Cooking { input } => Some(*input),
+            _ => None,
+        }
+    }
+
     /// Подходит ли рецепт под сетку игрока.
     pub fn matches(&self, grid: &[Option<ItemStack>; GRID_SLOTS]) -> bool {
-        if self.shapeless {
-            self.matches_shapeless(grid)
-        } else {
-            self.matches_shaped(grid)
+        match &self.body {
+            RecipeBody::Shaped(_) => self.matches_shaped(grid),
+            RecipeBody::Shapeless(_) => self.matches_shapeless(grid),
+            RecipeBody::Cooking { .. } => false,
         }
     }
 
@@ -182,56 +478,50 @@ impl CraftRecipe {
             .iter()
             .all(|tool| held_tools.contains(tool))
     }
+
     /// Снимает ингредиенты с сетки после успешного крафта. Для формы —
     /// по одному предмету из каждой занятой клетки; для бесформенного —
     /// ровно столько, сколько указано в рецепте.
     pub fn consume(&self, grid: &mut [Option<ItemStack>; GRID_SLOTS]) {
-        if self.shapeless {
-            for &(kind, count) in &self.ingredients {
-                let mut left = count;
+        match &self.body {
+            RecipeBody::Shapeless(ingredients) => {
+                for &(kind, count) in ingredients {
+                    let mut left = count;
+                    for cell in grid.iter_mut() {
+                        if left == 0 {
+                            break;
+                        }
+                        let Some(stack) = cell else { continue };
+                        if stack.kind != kind {
+                            continue;
+                        }
+                        let take = stack.count.min(left);
+                        stack.count -= take;
+                        left -= take;
+                        if stack.count == 0 {
+                            *cell = None;
+                        }
+                    }
+                }
+            }
+            RecipeBody::Shaped(_) => {
                 for cell in grid.iter_mut() {
-                    if left == 0 {
-                        break;
-                    }
                     let Some(stack) = cell else { continue };
-                    if stack.kind != kind {
-                        continue;
-                    }
-                    let take = stack.count.min(left);
-                    stack.count -= take;
-                    left -= take;
+                    stack.count -= 1;
                     if stack.count == 0 {
                         *cell = None;
                     }
                 }
             }
-        } else {
-            for cell in grid.iter_mut() {
-                let Some(stack) = cell else { continue };
-                stack.count -= 1;
-                if stack.count == 0 {
-                    *cell = None;
-                }
-            }
+            RecipeBody::Cooking { .. } => {}
         }
     }
 
     /// Стоимость одного крафта по видам предметов. Для формы — по одному
     /// предмету с каждой занятой клетки, для бесформенного — количества из
-    /// рецепта. Одинаковые виды складываются: две клетки палок в форме
-    /// требуют две палки за крафт.
-    fn ingredient_cost(&self) -> Vec<(ItemKind, u32)> {
-        let mut cost = Vec::new();
-        if self.shapeless {
-            for &(kind, count) in &self.ingredients {
-                add_cost(&mut cost, kind, count);
-            }
-        } else if let Some(pattern) = &self.pattern {
-            for kind in pattern.cells.iter().flatten() {
-                add_cost(&mut cost, *kind, 1);
-            }
-        }
-        cost
+    /// рецепта. Одинаковые виды сложены при загрузке.
+    fn ingredient_cost(&self) -> &[(ItemKind, u32)] {
+        &self.cost
     }
 
     /// Сколько крафтов рецепта позволяет запас ингредиентов (сетка +
@@ -242,7 +532,7 @@ impl CraftRecipe {
         inventory: &Inventory,
     ) -> u32 {
         let mut max = u32::MAX;
-        for (kind, need) in self.ingredient_cost() {
+        for &(kind, need) in self.ingredient_cost() {
             if need == 0 {
                 continue;
             }
@@ -274,6 +564,9 @@ impl CraftRecipe {
         grid: &[Option<ItemStack>; GRID_SLOTS],
         inventory: &Inventory,
     ) -> u32 {
+        if !self.is_grid() {
+            return 0;
+        }
         let limit = self.max_crafts_by_ingredients(grid, inventory);
         let mut grid = *grid;
         let mut inventory = *inventory;
@@ -297,7 +590,10 @@ impl CraftRecipe {
         grid: &mut [Option<ItemStack>; GRID_SLOTS],
         inventory: &mut Inventory,
     ) -> bool {
-        let enough_ingredients = self.ingredient_cost().into_iter().all(|(kind, need)| {
+        if !self.is_grid() {
+            return false;
+        }
+        let enough_ingredients = self.ingredient_cost().iter().all(|&(kind, need)| {
             let in_grid: u32 = grid
                 .iter()
                 .flatten()
@@ -350,24 +646,35 @@ impl CraftRecipe {
     }
 
     /// Бесформенное совпадение: одинаковый набор видов и количеств.
+    /// Списки ингредиентов слиты и отсортированы при загрузке, поэтому
+    /// проверка не аллоцирует (идёт каждый кадр из UI).
     fn matches_shapeless(&self, grid: &[Option<ItemStack>; GRID_SLOTS]) -> bool {
-        let mut counts: Vec<(ItemKind, u32)> = Vec::new();
-        for stack in grid.iter().flatten() {
-            match counts.iter_mut().find(|(kind, _)| *kind == stack.kind) {
-                Some((_, count)) => *count += stack.count,
-                None => counts.push((stack.kind, stack.count)),
-            }
+        let RecipeBody::Shapeless(ingredients) = &self.body else {
+            return false;
+        };
+        if ingredients.is_empty() || ingredients.len() > GRID_SLOTS {
+            return false;
         }
-        counts.sort_by_key(|(kind, _)| *kind as u8);
-        let mut wanted = self.ingredients.clone();
-        wanted.sort_by_key(|(kind, _)| *kind as u8);
-        counts == wanted
+        let mut actual = [0u32; GRID_SLOTS];
+        for stack in grid.iter().flatten() {
+            let Some(index) = ingredients
+                .iter()
+                .position(|(kind, _)| *kind == stack.kind)
+            else {
+                return false;
+            };
+            actual[index] += stack.count;
+        }
+        ingredients
+            .iter()
+            .enumerate()
+            .all(|(index, &(_, need))| actual[index] == need)
     }
 
     /// Совпадение по форме: та же обрезанная ширина/высота и те же виды
     /// в клетках. Количество в клетке не важно — тратится по одному.
     fn matches_shaped(&self, grid: &[Option<ItemStack>; GRID_SLOTS]) -> bool {
-        let Some(pattern) = &self.pattern else {
+        let Some(pattern) = self.pattern() else {
             return false;
         };
         let Some((left, top, width, height)) = occupied_bounds(grid) else {
@@ -396,6 +703,26 @@ fn add_cost(cost: &mut Vec<(ItemKind, u32)>, kind: ItemKind, count: u32) {
         Some((_, total)) => *total += count,
         None => cost.push((kind, count)),
     }
+}
+
+/// Стоимость одного крафта по телу рецепта (считается при загрузке).
+fn build_cost(body: &RecipeBody) -> Vec<(ItemKind, u32)> {
+    let mut cost = Vec::new();
+    match body {
+        RecipeBody::Shaped(pattern) => {
+            for kind in pattern.cells.iter().flatten() {
+                add_cost(&mut cost, *kind, 1);
+            }
+        }
+        RecipeBody::Shapeless(ingredients) => {
+            for &(kind, count) in ingredients {
+                add_cost(&mut cost, kind, count);
+            }
+        }
+        RecipeBody::Cooking { input } => add_cost(&mut cost, input.0, input.1),
+    }
+    cost.sort_by_key(|(kind, _)| *kind as u8);
+    cost
 }
 
 /// Границы занятых клеток сетки: `(left, top, width, height)`.
@@ -427,17 +754,27 @@ fn occupied_bounds(grid: &[Option<ItemStack>; GRID_SLOTS]) -> Option<(usize, usi
 #[derive(Deserialize)]
 struct RawRecipe {
     id: String,
-    #[serde(default = "manual_category")]
-    category: String,
+    parent: OneOrMany<String>,
     #[serde(default)]
     shapeless: bool,
     #[serde(default)]
     grid: Vec<Vec<Option<String>>>,
     #[serde(default)]
-    ingredients: Vec<RawIngredient>,
+    ingredients: Option<RawIngredients>,
+    #[serde(default)]
+    input: Option<RawStack>,
     #[serde(default)]
     tools: Vec<String>,
-    result: RawResult,
+    result: RawStack,
+}
+
+/// `ingredients` — объект «символ → предмет» у shaped и массив входов
+/// у shapeless. Форма JSON выбирается по виду рецепта.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawIngredients {
+    Keyed(BTreeMap<String, String>),
+    List(Vec<RawIngredient>),
 }
 
 #[derive(Deserialize)]
@@ -448,29 +785,66 @@ struct RawIngredient {
 }
 
 #[derive(Deserialize)]
-struct RawResult {
+struct RawStack {
     item: String,
     #[serde(default = "one")]
     count: u32,
 }
 
-fn manual_category() -> String {
-    MANUAL_CATEGORY.to_string()
+/// `parent` в JSON: одна строка или массив строк.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
 }
+
+impl<T> OneOrMany<T> {
+    fn into_vec(self) -> Vec<T> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
+}
+
 fn one() -> u32 {
     1
 }
 
-/// Разбирает один JSON-файл рецепта.
+/// Разбирает один JSON-файл рецепта. Папка файла здесь не проверяется —
+/// это делает загрузчик (несовпадение = предупреждение, не ошибка).
 pub fn parse_recipe(json: &str) -> Result<CraftRecipe, String> {
-    let raw: RawRecipe = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let mut raw: RawRecipe = serde_json::from_str(json).map_err(|error| error.to_string())?;
     if raw.id.is_empty() {
         return Err("пустой id рецепта".to_string());
     }
-    let result_kind = ItemKind::from_id(&raw.result.item).ok_or_else(|| format!("неизвестный предмет результата: {}", raw.result.item))?;
+
+    // Крафтеры: известные, без дублей, одной схемы.
+    let parent_ids =
+        std::mem::replace(&mut raw.parent, OneOrMany::Many(Vec::new())).into_vec();
+    if parent_ids.is_empty() {
+        return Err("пустой parent".to_string());
+    }
+    let mut parents: Vec<CrafterKind> = Vec::with_capacity(parent_ids.len());
+    for id in parent_ids {
+        let kind = CrafterKind::from_id(&id)
+            .ok_or_else(|| format!("неизвестный крафтер: {id}"))?;
+        if !parents.contains(&kind) {
+            parents.push(kind);
+        }
+    }
+    let shape = parents[0].recipe_shape();
+    if parents.iter().any(|parent| parent.recipe_shape() != shape) {
+        return Err("parent смешивает сеточных и кулинарных крафтеров".to_string());
+    }
+
+    let result_kind = ItemKind::from_id(&raw.result.item)
+        .ok_or_else(|| format!("неизвестный предмет результата: {}", raw.result.item))?;
     if raw.result.count == 0 {
         return Err("количество результата должно быть больше нуля".to_string());
     }
+
     // Требуемые инструменты: известные предметы, не больше слотов стола.
     if raw.tools.len() > 4 {
         return Err("больше четырёх требуемых инструментов".to_string());
@@ -481,45 +855,109 @@ pub fn parse_recipe(json: &str) -> Result<CraftRecipe, String> {
             .ok_or_else(|| format!("неизвестный инструмент: {tool}"))?;
         tools.push(kind);
     }
+    if shape == RecipeShape::Cooking && !tools.is_empty() {
+        return Err("кулинарный рецепт не поддерживает tools".to_string());
+    }
 
+    let body = match shape {
+        RecipeShape::Cooking => parse_cooking_body(&raw)?,
+        RecipeShape::Grid => parse_grid_body(&raw)?,
+    };
+    let cost = build_cost(&body);
+
+    Ok(CraftRecipe {
+        id: raw.id,
+        parents,
+        body,
+        result: ItemStack { kind: result_kind, count: raw.result.count },
+        tools,
+        cost,
+    })
+}
+
+/// Тело кулинарного рецепта: ровно один `input`, без сетки и `shapeless`.
+fn parse_cooking_body(raw: &RawRecipe) -> Result<RecipeBody, String> {
     if raw.shapeless {
-        if raw.ingredients.is_empty() {
+        return Err("у кулинарного рецепта не должно быть shapeless".to_string());
+    }
+    if !raw.grid.is_empty() {
+        return Err("у кулинарного рецепта не должно быть grid".to_string());
+    }
+    if raw.ingredients.is_some() {
+        return Err("у кулинарного рецепта не должно быть ingredients".to_string());
+    }
+    let input = raw
+        .input
+        .as_ref()
+        .ok_or_else(|| "у кулинарного рецепта нет input".to_string())?;
+    let kind = ItemKind::from_id(&input.item)
+        .ok_or_else(|| format!("неизвестный входной предмет: {}", input.item))?;
+    if input.count == 0 {
+        return Err(format!("нулевое количество входа: {}", input.item));
+    }
+    Ok(RecipeBody::Cooking { input: (kind, input.count) })
+}
+
+/// Тело сеточного рецепта: shaped (карта символов + grid) или shapeless.
+fn parse_grid_body(raw: &RawRecipe) -> Result<RecipeBody, String> {
+    if raw.input.is_some() {
+        return Err("у сеточного рецепта не должно быть input".to_string());
+    }
+    if raw.shapeless {
+        if !raw.grid.is_empty() {
+            return Err("у shapeless-рецепта не должно быть grid".to_string());
+        }
+        let Some(RawIngredients::List(list)) = raw.ingredients.as_ref() else {
+            return Err(
+                "у shapeless-рецепта ingredients должен быть массивом входов".to_string(),
+            );
+        };
+        if list.is_empty() {
             return Err("у бесформенного рецепта нет ингредиентов".to_string());
         }
-        let mut ingredients = Vec::with_capacity(raw.ingredients.len());
-        for ingredient in &raw.ingredients {
+        let mut ingredients = Vec::with_capacity(list.len());
+        for ingredient in list {
             let kind = ItemKind::from_id(&ingredient.item)
                 .ok_or_else(|| format!("неизвестный ингредиент: {}", ingredient.item))?;
             if ingredient.count == 0 {
                 return Err(format!("нулевое количество ингредиента: {}", ingredient.item));
             }
-            ingredients.push((kind, ingredient.count));
+            add_cost(&mut ingredients, kind, ingredient.count);
         }
-        return Ok(CraftRecipe {
-            id: raw.id,
-            category: raw.category,
-            shapeless: true,
-            pattern: None,
-            ingredients,
-            result: ItemStack { kind: result_kind, count: raw.result.count },
-            tools,
-        });
+        if ingredients.len() > GRID_SLOTS {
+            return Err("у бесформенного рецепта больше девяти разных ингредиентов".to_string());
+        }
+        ingredients.sort_by_key(|(kind, _)| *kind as u8);
+        return Ok(RecipeBody::Shapeless(ingredients));
     }
 
-    let pattern = parse_pattern(&raw.grid)?;
-    Ok(CraftRecipe {
-        id: raw.id,
-        category: raw.category,
-        shapeless: false,
-        pattern: Some(pattern),
-        ingredients: Vec::new(),
-        result: ItemStack { kind: result_kind, count: raw.result.count },
-        tools,
-    })
+    let Some(RawIngredients::Keyed(keys)) = raw.ingredients.as_ref() else {
+        return Err(
+            "у shaped-рецепта ingredients должен быть объектом «символ → предмет»".to_string(),
+        );
+    };
+    if keys.is_empty() {
+        return Err("у shaped-рецепта пустая карта ingredients".to_string());
+    }
+    let mut resolved: BTreeMap<&str, ItemKind> = BTreeMap::new();
+    for (symbol, item) in keys {
+        if symbol.is_empty() {
+            return Err("пустой символ в ingredients".to_string());
+        }
+        let kind = ItemKind::from_id(item)
+            .ok_or_else(|| format!("неизвестный ингредиент формы: {item}"))?;
+        resolved.insert(symbol.as_str(), kind);
+    }
+    let pattern = parse_pattern(&raw.grid, &resolved)?;
+    Ok(RecipeBody::Shaped(pattern))
 }
 
-/// Проверяет сетку 3×3 и обрезает её по занятым клеткам.
-fn parse_pattern(grid: &[Vec<Option<String>>]) -> Result<ShapedPattern, String> {
+/// Проверяет сетку 3×3, разворачивает символы в `ItemKind` и обрезает
+/// форму по занятым клеткам.
+fn parse_pattern(
+    grid: &[Vec<Option<String>>],
+    keys: &BTreeMap<&str, ItemKind>,
+) -> Result<ShapedPattern, String> {
     if grid.len() != 3 || grid.iter().any(|row| row.len() != 3) {
         return Err("форма рецепта должна быть сеткой 3×3".to_string());
     }
@@ -533,9 +971,10 @@ fn parse_pattern(grid: &[Vec<Option<String>>]) -> Result<ShapedPattern, String> 
 
     for (y, row) in grid.iter().enumerate() {
         for (x, cell) in row.iter().enumerate() {
-            let Some(id) = cell else { continue };
-            let kind = ItemKind::from_id(id)
-                .ok_or_else(|| format!("неизвестный ингредиент формы: {id}"))?;
+            let Some(symbol) = cell else { continue };
+            let Some(&kind) = keys.get(symbol.as_str()) else {
+                return Err(format!("символ '{symbol}' не описан в ingredients"));
+            };
             cells[y * 3 + x] = Some(kind);
             left = left.min(x);
             top = top.min(y);

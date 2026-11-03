@@ -326,7 +326,7 @@ impl CommandQueue {
                         });
                     // Бросается копьё из руки: пустой слот или другой предмет
                     // — команда бессмысленна.
-                    let Some((slot, _)) = slot.filter(|(_, stack)| stack.kind == ItemKind::Spear)
+                    let Some((slot, _)) = slot.filter(|(_, stack)| stack.kind == ItemKind::SpearPrimal)
                     else {
                         continue;
                     };

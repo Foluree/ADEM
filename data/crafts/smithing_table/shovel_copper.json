@@ -1,9 +1,14 @@
 {
   "id": "shovel_copper",
+  "parent": "smithing_table",
+  "ingredients": {
+    "0": "ingot_copper",
+    "1": "stick"
+  },
   "grid": [
-    [null, "ingot_copper", null],
-    [null, "stick", null],
-    [null, "stick", null]
+    [null, "0", null],
+    [null, "1", null],
+    [null, "1", null]
   ],
   "tools": ["hammer_stone"],
   "result": { "item": "shovel_copper", "count": 1 }

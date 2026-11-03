@@ -1,6 +1,6 @@
 {
   "id": "meat_bird_cooked",
-  "shapeless": true,
-  "ingredients": [{ "item": "meat_bird_raw", "count": 1 }],
+  "parent": ["furnace", "campfire"],
+  "input": { "item": "meat_bird_raw", "count": 1 },
   "result": { "item": "meat_bird_cooked", "count": 1 }
 }

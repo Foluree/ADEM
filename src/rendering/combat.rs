@@ -171,7 +171,7 @@ fn spawn_weapon_fx(
                 // часовой и вдвое меньший размер.
                 let (kind_texture, size, extra_rotation) = match fx_msg.kind {
                     WeaponFxKind::Thrust => (
-                        textures.item_texture(ItemKind::Spear),
+                        textures.item_texture(ItemKind::SpearPrimal),
                         THRUST_SPRITE_TILES,
                         0.0,
                     ),
@@ -464,7 +464,7 @@ fn update_projectile_sprites(
             }
             ProjectileKind::ThrownSpear => {
                 let sprite = Sprite {
-                    image: textures.item_texture(ItemKind::Spear).clone(),
+                    image: textures.item_texture(ItemKind::SpearPrimal).clone(),
                     custom_size: Some(Vec2::splat(TILE_SIZE * THROWN_SPEAR_SPRITE_TILES)),
                     ..default()
                 };
@@ -548,7 +548,7 @@ fn update_stuck_spear_sprites(
         // тем короче видимая проекция.
         let steep = (spear.pitch / std::f32::consts::FRAC_PI_2).clamp(0.0, 1.0);
         let sprite = Sprite {
-            image: textures.item_texture(ItemKind::Spear).clone(),
+            image: textures.item_texture(ItemKind::SpearPrimal).clone(),
             custom_size: Some(Vec2::splat(TILE_SIZE * 1.4 * (1.0 - steep * 0.35))),
             ..default()
         };

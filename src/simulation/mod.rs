@@ -50,7 +50,10 @@ pub use containers::{
     CAMPFIRE_INPUT, CAMPFIRE_OUTPUT, SLOT_AREA_PLAYER_MISC,
 };
 #[allow(unused_imports)]
-pub use crafts::{CraftBook, CraftRecipe, ShapedPattern, GRID_SLOTS, MANUAL_CATEGORY};
+pub use crafts::{
+    CraftBook, CraftBookLoad, CraftRecipe, CrafterKind, RecipeBody, RecipeShape,
+    ShapedPattern, GRID_SLOTS, MANUAL_CATEGORY,
+};
 #[allow(unused_imports)]
 pub use crops::{Crop, CropKind, CROP_KIND_COUNT, MAX_CROP_STAGES};
 #[allow(unused_imports)]

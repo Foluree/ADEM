@@ -8,6 +8,7 @@ use bevy::prelude::*;
 use bevy::ui_widgets::{Activate, Button};
 
 use crate::app::state::GameState;
+use crate::simulation::crafts::CrafterKind;
 use crate::simulation::items::{ItemKind, SlotArea, SlotRef, ItemStack};
 use crate::simulation::objects::{BuildingKind, ObjectKind};
 use crate::ui::bottom_panel::FitIcon;
@@ -20,14 +21,14 @@ use crate::ui::{CraftBookRes, UiFont};
 
 use super::{StationAddress, StationUi};
 
-/// Категории рецептов станции (верстак наследует ручные).
-pub fn station_categories(kind: ObjectKind) -> &'static [&'static str] {
+/// Группы рецептов станции (верстак наследует ручные, кузнечный — свои).
+pub fn station_categories(kind: ObjectKind) -> &'static [CrafterKind] {
     let Some(kind) = kind.building_kind() else {
         return &[];
     };
     match kind {
-        BuildingKind::CraftingTable => &["manual", "crafting_table"],
-        BuildingKind::SmithingTable => &["smithing_table"],
+        BuildingKind::CraftingTable => CrafterKind::CraftingTable.recipe_chain(),
+        BuildingKind::SmithingTable => CrafterKind::SmithingTable.recipe_chain(),
         _ => &[],
     }
 }

@@ -1,9 +1,14 @@
 {
   "id": "axe_copper",
+  "parent": "smithing_table",
+  "ingredients": {
+    "0": "ingot_copper",
+    "1": "stick"
+  },
   "grid": [
-    ["ingot_copper", "ingot_copper", null],
-    ["ingot_copper", "stick", null],
-    [null, "stick", null]
+    ["0", "0", null],
+    ["0", "1", null],
+    [null, "1", null]
   ],
   "tools": ["hammer_stone"],
   "result": { "item": "axe_copper", "count": 1 }

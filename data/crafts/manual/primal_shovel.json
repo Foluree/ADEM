@@ -1,0 +1,15 @@
+{
+  "id": "primal_shovel",
+  "parent": "manual",
+  "ingredients": {
+    "0": "rock",
+    "1": "stick",
+    "2": "cordage"
+  },
+  "grid": [
+    [null, "0", null],
+    [null, "1", null],
+    [null, "1", "2"]
+  ],
+  "result": { "item": "primal_shovel", "count": 1 }
+}

@@ -1,6 +1,6 @@
 {
   "id": "meat_herbivore_cooked",
-  "shapeless": true,
-  "ingredients": [{ "item": "meat_herbivore_raw", "count": 1 }],
+  "parent": ["furnace", "campfire"],
+  "input": { "item": "meat_herbivore_raw", "count": 1 },
   "result": { "item": "meat_herbivore_cooked", "count": 1 }
 }

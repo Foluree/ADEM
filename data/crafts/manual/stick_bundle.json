@@ -1,6 +1,6 @@
 {
   "id": "stick_bundle",
-  "category": "manual",
+  "parent": "manual",
   "shapeless": true,
   "ingredients": [
     { "item": "stick", "count": 8 }

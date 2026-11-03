@@ -234,7 +234,8 @@ impl EntityState {
 }
 
 /// Направление взгляда. Текстуры нарисованы смотрящими вправо, поэтому
-/// при взгляде влево рендер зеркалит спрайт по горизонтали.
+/// при взгляде влево рендер зеркалит спрайт по горизонтали. Взгляд
+/// меняется только при экранно-горизонтальном движении (см. `screen_facing`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Facing {
@@ -250,6 +251,18 @@ impl Facing {
             1 => Some(Self::Left),
             _ => None,
         }
+    }
+}
+
+/// Взгляд по экранной горизонтали движения/цели в изометрии:
+/// экранное «вправо» — знак (dx − dy). `None` — движение экранно
+/// вертикально (вверх/вниз): взгляд не меняется.
+pub fn screen_facing(dx: f32, dy: f32) -> Option<Facing> {
+    let sx = dx - dy;
+    if sx.abs() > f32::EPSILON {
+        Some(if sx > 0.0 { Facing::Right } else { Facing::Left })
+    } else {
+        None
     }
 }
 
@@ -626,12 +639,8 @@ impl World {
             entity.state_duration = 10 * TICKS_PER_SEC as u64;
             entity.target = target;
             entity.stuck_ticks = 0;
-            if (target.x - pos.x).abs() > f32::EPSILON {
-                entity.facing = if target.x > pos.x {
-                    Facing::Right
-                } else {
-                    Facing::Left
-                };
+            if let Some(facing) = screen_facing(target.x - pos.x, target.y - pos.y) {
+                entity.facing = facing;
             }
         }
     }
@@ -676,12 +685,10 @@ impl World {
             let distance = pos.dist(attacker_pos);
             if distance <= WOLF_BITE_REACH_TILES {
                 // В досягаемости: стоим лицом к обидчику и кусаем по кулдауну.
-                if (attacker_pos.x - pos.x).abs() > f32::EPSILON {
-                    entity.facing = if attacker_pos.x > pos.x {
-                        Facing::Right
-                    } else {
-                        Facing::Left
-                    };
+                if let Some(facing) =
+                    screen_facing(attacker_pos.x - pos.x, attacker_pos.y - pos.y)
+                {
+                    entity.facing = facing;
                 }
                 if entity.state != EntityState::Standing {
                     entity.state = EntityState::Standing;
@@ -717,12 +724,8 @@ impl World {
                 entity.state_duration = 10 * TICKS_PER_SEC as u64;
                 entity.target = flee;
                 entity.stuck_ticks = 0;
-                if (flee.x - pos.x).abs() > f32::EPSILON {
-                    entity.facing = if flee.x > pos.x {
-                        Facing::Right
-                    } else {
-                        Facing::Left
-                    };
+                if let Some(facing) = screen_facing(flee.x - pos.x, flee.y - pos.y) {
+                    entity.facing = facing;
                 }
             }
         }
@@ -883,10 +886,10 @@ fn step_towards(entity: &mut SimEntity, terrain: &TerrainView<'_>, side: f32) ->
         return false;
     }
 
-    // Взгляд следует за горизонтальным направлением движения; при
-    // движении строго по вертикали существо сохраняет прежний взгляд.
-    if dx.abs() > f32::EPSILON {
-        entity.facing = if dx > 0.0 { Facing::Right } else { Facing::Left };
+    // Взгляд следует за экранно-горизонтальным направлением движения; при
+    // движении по экранной вертикали существо сохраняет прежний взгляд.
+    if let Some(facing) = screen_facing(dx, dy) {
+        entity.facing = facing;
     }
 
     // Скорость — собственная скорость существа; замедление рельефом —

@@ -12,7 +12,7 @@
 //! перевыставляется после каждого события, пока цикл продолжается.
 //! Стоимость — O(1) на событие; выключенные печи задач не имеют.
 
-use super::crafts::{CraftBook, CraftRecipe};
+use super::crafts::{CraftBook, CraftRecipe, CrafterKind};
 use super::dirty::DirtyTiles;
 use super::items::{ItemKind, ItemStack, MAX_STACK};
 use super::objects::{BuildingKind, ObjectKind};
@@ -246,17 +246,12 @@ pub fn is_output_slot(kind: ObjectKind, slot: usize) -> bool {
     output_slot(kind) == Some(slot)
 }
 
-/// Категория рецептов станции в `CraftBook`. `None` — станция без готовки.
-pub fn station_category(kind: ObjectKind) -> Option<&'static str> {
+/// Кулинарный крафтер станции в `CraftBook`. `None` — станция без готовки.
+pub fn cooking_crafter(kind: ObjectKind) -> Option<CrafterKind> {
     let ObjectKind::Building(kind) = kind else {
         return None;
     };
-    match kind {
-        BuildingKind::Campfire => Some("campfire"),
-        BuildingKind::Furnace => Some("furnace"),
-        BuildingKind::BlastFurnace => Some("blast_furnace"),
-        _ => None,
-    }
+    CrafterKind::from_building(kind).filter(|crafter| crafter.cooks())
 }
 
 /// Время готовки станции, тиков. Публично: UI читает для шкалы прогресса.
@@ -305,20 +300,6 @@ pub fn can_put_into(kind: ObjectKind, slot: usize, item: ItemKind) -> bool {
     }
 }
 
-/// Рецепт готовки для входного стека: первый подходящий рецепт категории
-/// станции с одним ингредиентом того же вида.
-fn matching_cook<'a>(
-    book: &'a CraftBook,
-    category: &str,
-    input: ItemKind,
-) -> Option<&'a CraftRecipe> {
-    book.recipes.iter().find(|recipe| {
-        recipe.category == category
-            && recipe.ingredients.len() == 1
-            && recipe.ingredients[0].0 == input
-    })
-}
-
 /// Влезет ли результат рецепта в слот выхода контейнера.
 fn result_fits(container: &Container, output: usize, recipe: &CraftRecipe) -> bool {
     match container.get(output) {
@@ -346,7 +327,7 @@ fn schedule_next(sched: &mut Scheduler, pos: TilePos, container: &Container) {
 /// под результат и топливо (у костра топливо не нужно). Списывает одну
 /// единицу топлива и выставляет сроки. Возвращает `true` при поджиге.
 fn try_ignite(world: &mut World, book: &CraftBook, pos: TilePos, kind: ObjectKind, tick: u64) -> bool {
-    let Some(category) = station_category(kind) else {
+    let Some(crafter) = cooking_crafter(kind) else {
         return false;
     };
     let Some(l) = layout(kind) else {
@@ -362,8 +343,9 @@ fn try_ignite(world: &mut World, book: &CraftBook, pos: TilePos, kind: ObjectKin
     let mut input_kind = None;
     for &input_slot in l.inputs {
         if let Some(stack) = container.get(input_slot)
-            && let Some(recipe) = matching_cook(book, category, stack.kind)
-            && recipe.ingredients[0].1 <= stack.count
+            && let Some(recipe) = book.cooking_recipe(crafter, stack.kind)
+            && let Some((_, need)) = recipe.cooking_input()
+            && need <= stack.count
             && result_fits(container, l.output, recipe)
         {
             input_kind = Some(stack.kind);
@@ -435,23 +417,23 @@ pub fn apply_station_tick(
         // Станцию снесли — контейнер обязана была удалить `set_object`.
         return;
     };
-    if station_category(kind).is_none() {
+    if cooking_crafter(kind).is_none() {
         return;
     }
 
     // Готовка завершается раньше/вместе с топливом: выкладываем результат.
     if container_at(world, pos).is_some_and(|c| c.cook_finish_tick == Some(tick)) {
         let l = layout(kind).unwrap();
-        let category = station_category(kind).unwrap();
+        let crafter = cooking_crafter(kind).unwrap();
         let container = container_at_mut(world, pos).unwrap();
         container.cook_finish_tick = None;
         if let Some(&input_slot) = l.inputs.first()
             && let Some(stack) = container.get(input_slot)
-            && let Some(recipe) = matching_cook(book, category, stack.kind) {
+            && let Some(recipe) = book.cooking_recipe(crafter, stack.kind)
+            && let Some((_, need)) = recipe.cooking_input() {
                 // Место под результат и запас ингредиента проверялись
                 // поджигом; повторная проверка — на случай ручного
                 // вмешательства через UI.
-                let need = recipe.ingredients[0].1;
                 if result_fits(container, l.output, recipe) && stack.count >= need {
                     let left = stack.count - need;
                     let next = (left > 0).then_some(ItemStack { kind: stack.kind, count: left });
@@ -532,7 +514,7 @@ pub fn wake_station(
     let Some(kind) = world.object_at(pos).map(|o| o.kind) else {
         return;
     };
-    if station_category(kind).is_none() {
+    if cooking_crafter(kind).is_none() {
         return;
     }
     if container_at(world, pos).is_some_and(|c| c.cook_finish_tick.is_some()) {

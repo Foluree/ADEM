@@ -316,14 +316,10 @@ impl World {
                 entity.stuck_ticks = 0;
             }
             // Стоя у костра, смотрит на огонь, а не куда пришлось.
-            if (center.x - pos.x).abs() > f32::EPSILON
+            if let Some(facing) = super::entities::screen_facing(center.x - pos.x, center.y - pos.y)
                 && let Some(entity) = self.entities.get_mut(id)
             {
-                entity.facing = if center.x > pos.x {
-                    super::entities::Facing::Right
-                } else {
-                    super::entities::Facing::Left
-                };
+                entity.facing = facing;
             }
             return;
         }
@@ -452,12 +448,10 @@ impl World {
         entity.state_duration = duration_ticks;
         entity.target = target;
         entity.stuck_ticks = 0;
-        if (target.x - entity.pos.x).abs() > f32::EPSILON {
-            entity.facing = if target.x > entity.pos.x {
-                super::entities::Facing::Right
-            } else {
-                super::entities::Facing::Left
-            };
+        if let Some(facing) =
+            super::entities::screen_facing(target.x - entity.pos.x, target.y - entity.pos.y)
+        {
+            entity.facing = facing;
         }
     }
 

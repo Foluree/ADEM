@@ -1,9 +1,14 @@
 {
   "id": "hoe_copper",
+  "parent": "smithing_table",
+  "ingredients": {
+    "0": "ingot_copper",
+    "1": "stick"
+  },
   "grid": [
-    ["ingot_copper", "ingot_copper", null],
-    [null, "stick", null],
-    [null, "stick", null]
+    ["0", "0", null],
+    [null, "1", null],
+    [null, "1", null]
   ],
   "tools": ["hammer_stone"],
   "result": { "item": "hoe_copper", "count": 1 }

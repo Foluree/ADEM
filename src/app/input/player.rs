@@ -285,7 +285,7 @@ pub(crate) fn world_click_input(
 
     // Копьё: короткое нажатие — укол (мимо существ — обычная добыча),
     // удержание дольше `SPEAR_THROW_HOLD_SECS` — бросок на отпускание.
-    if held == Some(ItemKind::Spear) {
+    if held == Some(ItemKind::SpearPrimal) {
         if mouse.just_pressed(MouseButton::Left) {
             *spear_hold = Some(0.0);
         }
@@ -302,7 +302,7 @@ pub(crate) fn world_click_input(
                 // Свой ограничитель анимации: симуляция списывает кулдаун
                 // только при попадании, поэтому без него заклик мимо играл
                 // бы выпад на каждое нажатие. Интервал — кулдаун копья.
-                let spear_cooldown = ItemKind::Spear
+                let spear_cooldown = ItemKind::SpearPrimal
                     .weapon_stats()
                     .map(|stats| stats.cooldown_ticks)
                     .unwrap_or(10);
@@ -333,7 +333,7 @@ pub(crate) fn world_click_input(
         // и инструменты без анимации, бой при этом считается всегда.
         // Анимация только когда кулдаун прошлой атаки вышел — как у лука
         // и копья, чтобы визуал не убегал вперёд реального урона.
-        if held == Some(ItemKind::Knife) && clock.0.tick >= attack_ready {
+        if held == Some(ItemKind::KnifePrimal) && clock.0.tick >= attack_ready {
             fx.write(WeaponFx { kind: WeaponFxKind::Blade, origin, aim });
         }
         queue.0.push(Command::PlayerInteract { pos: tile });

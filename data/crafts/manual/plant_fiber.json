@@ -1,6 +1,6 @@
 {
   "id": "plant_fiber",
-  "category": "manual",
+  "parent": "manual",
   "shapeless": true,
   "ingredients": [
     { "item": "grass_bunch", "count": 2 }

@@ -128,12 +128,19 @@ pub struct CraftBookRes(pub CraftBook);
 /// Читает рецепты один раз при старте. Ошибки отдельных файлов не роняют
 /// игру — только пишутся в лог, остальные рецепты продолжают работать.
 fn load_crafts(mut commands: Commands) {
-    let (book, errors) = CraftBook::load_dir("data/crafts");
-    for error in errors {
+    let load = CraftBook::load_dir("data/crafts");
+    for error in load.errors {
         warn!("Крафт: {error}");
     }
-    debug!("Загружено рецептов крафта: {}", book.recipes.len());
-    commands.insert_resource(CraftBookRes(book));
+    // Расхождения папки и `parent` — не ошибка данных: рецепт загружен.
+    // Показываем только в debug-сборке, чтобы не шуметь в релизе.
+    if cfg!(debug_assertions) {
+        for warning in load.warnings {
+            warn!("Крафт: {warning}");
+        }
+    }
+    debug!("Загружено рецептов крафта: {}", load.book.recipes.len());
+    commands.insert_resource(CraftBookRes(load.book));
 }
 
 /// Маркер корня окна (сносится целиком при закрытии). Виден ESC-цепочке пауз-меню.

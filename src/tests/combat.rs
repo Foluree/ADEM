@@ -103,7 +103,7 @@ fn wolf_bite_kills_and_drops_inventory() {
 #[test]
 fn wolf_bite_rejected_for_human() {
     let mut world = flat_world();
-    let human = human_with_item(&mut world, WorldPos { x: 10.0, y: 10.0 }, ItemKind::Knife);
+    let human = human_with_item(&mut world, WorldPos { x: 10.0, y: 10.0 }, ItemKind::KnifePrimal);
     let wolf = world
         .entities
         .spawn(EntityKind::Wolf, WorldPos { x: 10.8, y: 10.0 });
@@ -119,7 +119,7 @@ fn melee_attack_damages_and_kills_wolf() {
         .entities
         .spawn(EntityKind::Wolf, WorldPos { x: 10.0, y: 10.0 });
     // Нож в выбранном слоте: 5 урона.
-    let human = human_with_item(&mut world, WorldPos { x: 10.0, y: 11.0 }, ItemKind::Knife);
+    let human = human_with_item(&mut world, WorldPos { x: 10.0, y: 11.0 }, ItemKind::KnifePrimal);
 
     assert!(try_melee_attack(
         &mut world,
@@ -160,7 +160,7 @@ fn melee_out_of_range_and_cooldown() {
     world
         .entities
         .spawn(EntityKind::Wolf, WorldPos { x: 10.0, y: 10.0 });
-    let human = human_with_item(&mut world, WorldPos { x: 20.0, y: 20.0 }, ItemKind::Knife);
+    let human = human_with_item(&mut world, WorldPos { x: 20.0, y: 20.0 }, ItemKind::KnifePrimal);
 
     // Волк дальше базового радиуса — удар невозможен, кулдаун не тратится.
     assert!(!try_melee_attack(
@@ -183,7 +183,7 @@ fn melee_out_of_range_and_cooldown() {
 #[test]
 fn spear_throw_flies_sticks_and_is_picked_up() {
     let mut world = flat_world();
-    let human = human_with_item(&mut world, WorldPos { x: 100.0, y: 100.0 }, ItemKind::Spear);
+    let human = human_with_item(&mut world, WorldPos { x: 100.0, y: 100.0 }, ItemKind::SpearPrimal);
 
     // Бросок на 8 тайлов (копьё списывается командой — здесь
     // симулируем списание вручную, т.к. spawn_projectile вызван напрямую).
@@ -226,7 +226,7 @@ fn spear_throw_flies_sticks_and_is_picked_up() {
             .as_ref()
             .unwrap()
             .inventory
-            .count_of(ItemKind::Spear),
+            .count_of(ItemKind::SpearPrimal),
         1
     );
 }

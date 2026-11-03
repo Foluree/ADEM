@@ -127,14 +127,10 @@ pub fn step_direction(world: &mut World, actor: u64, dir: (f32, f32)) {
     let pos = entity.pos;
     let base_speed = entity.walk_speed();
 
-    // Взгляд следует за горизонтальной осью ввода (в осях сетки), как у
-    // ходьбы FSM: текстуры нарисованы смотрящими вправо, влево зеркалятся.
-    if dir.0.abs() > f32::EPSILON {
-        entity.facing = if dir.0 > 0.0 {
-            super::entities::Facing::Right
-        } else {
-            super::entities::Facing::Left
-        };
+    // Взгляд следует за экранной горизонталью ввода: чистое W/S в экранных
+    // осях — сеточная диагональ одного знака, при ней взгляд сохраняется.
+    if let Some(facing) = super::entities::screen_facing(dir.0, dir.1) {
+        entity.facing = facing;
     }
     // Движение по вводу — ходьба без срока давности: пока контроллер
     // ведёт, существо идёт (FSM захваченного состояние не меняет).
@@ -446,7 +442,7 @@ fn gather_grass(world: &mut World, actor: u64, pos: TilePos) -> bool {
         return false;
     }
     let selected = mind(world, actor).and_then(|m| m.selected_item());
-    let allowed = matches!(selected, None | Some(ItemKind::Knife));
+    let allowed = matches!(selected, None | Some(ItemKind::KnifePrimal));
     if !allowed {
         return false;
     }

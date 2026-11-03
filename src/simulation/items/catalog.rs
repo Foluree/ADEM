@@ -27,17 +27,17 @@ pub enum ItemKind {
     /// Верёвка из волокон (крафт).
     Cordage,
     /// Примитивный топор.
-    Axe,
+    AxePrimal,
     /// Примитивная кирка.
-    Pickaxe,
+    PickaxePrimal,
     /// Примитивная мотыга.
-    Hoe,
+    HoePrimal,
     /// Примитивная лопата.
-    Shovel,
+    ShovelPrimal,
     /// Примитивное копьё.
-    Spear,
+    SpearPrimal,
     /// Каменный нож.
-    Knife,
+    KnifePrimal,
     /// Примитивная удочка.
     FishingRod,
     /// Стрела (боеприпас лука).
@@ -205,12 +205,12 @@ impl ItemKind {
         ItemKind::GrassBunch,
         ItemKind::PlantFiber,
         ItemKind::Cordage,
-        ItemKind::Axe,
-        ItemKind::Pickaxe,
-        ItemKind::Hoe,
-        ItemKind::Shovel,
-        ItemKind::Spear,
-        ItemKind::Knife,
+        ItemKind::AxePrimal,
+        ItemKind::PickaxePrimal,
+        ItemKind::HoePrimal,
+        ItemKind::ShovelPrimal,
+        ItemKind::SpearPrimal,
+        ItemKind::KnifePrimal,
         ItemKind::FishingRod,
         ItemKind::Arrow,
         ItemKind::Bow,
@@ -301,12 +301,12 @@ impl ItemKind {
             3 => Some(Self::GrassBunch),
             4 => Some(Self::PlantFiber),
             5 => Some(Self::Cordage),
-            6 => Some(Self::Axe),
-            7 => Some(Self::Pickaxe),
-            8 => Some(Self::Hoe),
-            9 => Some(Self::Shovel),
-            10 => Some(Self::Spear),
-            11 => Some(Self::Knife),
+            6 => Some(Self::AxePrimal),
+            7 => Some(Self::PickaxePrimal),
+            8 => Some(Self::HoePrimal),
+            9 => Some(Self::ShovelPrimal),
+            10 => Some(Self::SpearPrimal),
+            11 => Some(Self::KnifePrimal),
             12 => Some(Self::FishingRod),
             13 => Some(Self::Arrow),
             14 => Some(Self::Bow),
@@ -398,12 +398,12 @@ impl ItemKind {
             ItemKind::GrassBunch => "grass_bunch",
             ItemKind::PlantFiber => "plant_fiber",
             ItemKind::Cordage => "cordage",
-            ItemKind::Axe => "axe",
-            ItemKind::Pickaxe => "pickaxe",
-            ItemKind::Hoe => "hoe",
-            ItemKind::Shovel => "shovel",
-            ItemKind::Spear => "spear",
-            ItemKind::Knife => "knife",
+            ItemKind::AxePrimal => "primal_axe",
+            ItemKind::PickaxePrimal => "primal_pickaxe",
+            ItemKind::HoePrimal => "primal_hoe",
+            ItemKind::ShovelPrimal => "primal_shovel",
+            ItemKind::SpearPrimal => "primal_spear",
+            ItemKind::KnifePrimal => "primal_knife",
             ItemKind::FishingRod => "fishing_rod",
             ItemKind::Arrow => "arrow",
             ItemKind::Bow => "bow",
@@ -512,12 +512,12 @@ impl ItemKind {
             | ItemKind::GrassBunch
             | ItemKind::PlantFiber
             | ItemKind::Cordage
-            | ItemKind::Axe
-            | ItemKind::Pickaxe
-            | ItemKind::Hoe
-            | ItemKind::Shovel
-            | ItemKind::Spear
-            | ItemKind::Knife
+            | ItemKind::AxePrimal
+            | ItemKind::PickaxePrimal
+            | ItemKind::HoePrimal
+            | ItemKind::ShovelPrimal
+            | ItemKind::SpearPrimal
+            | ItemKind::KnifePrimal
             | ItemKind::FishingRod
             | ItemKind::Arrow
             | ItemKind::Bow
@@ -605,12 +605,12 @@ impl ItemKind {
     /// Match без wildcard: новый вид не компилируется, пока предел не решён.
     pub fn max_stack(self) -> u32 {
         match self {
-            ItemKind::Axe
-            | ItemKind::Pickaxe
-            | ItemKind::Hoe
-            | ItemKind::Shovel
-            | ItemKind::Spear
-            | ItemKind::Knife
+            ItemKind::AxePrimal
+            | ItemKind::PickaxePrimal
+            | ItemKind::HoePrimal
+            | ItemKind::ShovelPrimal
+            | ItemKind::SpearPrimal
+            | ItemKind::KnifePrimal
             | ItemKind::FishingRod
             | ItemKind::Bow
             | ItemKind::HelmetChainmail
@@ -704,17 +704,17 @@ impl ItemKind {
     /// дальности, топор — +5%.
     pub fn weapon_stats(self) -> Option<WeaponStats> {
         match self {
-            ItemKind::Knife => Some(WeaponStats {
+            ItemKind::KnifePrimal => Some(WeaponStats {
                 damage: 5.0,
                 cooldown_ticks: 6,
                 range_tiles: BASE_ATTACK_RANGE_TILES,
             }),
-            ItemKind::Spear => Some(WeaponStats {
+            ItemKind::SpearPrimal => Some(WeaponStats {
                 damage: 5.0,
                 cooldown_ticks: 10,
                 range_tiles: BASE_ATTACK_RANGE_TILES * 1.2,
             }),
-            ItemKind::Axe => Some(WeaponStats {
+            ItemKind::AxePrimal => Some(WeaponStats {
                 damage: 7.0,
                 cooldown_ticks: 15,
                 range_tiles: BASE_ATTACK_RANGE_TILES * 1.05,
@@ -731,12 +731,12 @@ impl ItemKind {
     /// wildcard: новый инструмент не компилируется, пока класс не решён.
     pub fn tool_class(self) -> Option<ToolClass> {
         match self {
-            ItemKind::Pickaxe | ItemKind::PickaxeCopper => Some(ToolClass::Pickaxe),
-            ItemKind::Axe | ItemKind::AxeCopper => Some(ToolClass::Axe),
-            ItemKind::Shovel | ItemKind::ShovelCopper => Some(ToolClass::Shovel),
-            ItemKind::Hoe | ItemKind::HoeCopper => Some(ToolClass::Hoe),
-            ItemKind::Spear => Some(ToolClass::Spear),
-            ItemKind::Knife => Some(ToolClass::Knife),
+            ItemKind::PickaxePrimal | ItemKind::PickaxeCopper => Some(ToolClass::Pickaxe),
+            ItemKind::AxePrimal | ItemKind::AxeCopper => Some(ToolClass::Axe),
+            ItemKind::ShovelPrimal | ItemKind::ShovelCopper => Some(ToolClass::Shovel),
+            ItemKind::HoePrimal | ItemKind::HoeCopper => Some(ToolClass::Hoe),
+            ItemKind::SpearPrimal => Some(ToolClass::Spear),
+            ItemKind::KnifePrimal => Some(ToolClass::Knife),
             ItemKind::HammerStone | ItemKind::HammerCopper => Some(ToolClass::Hammer),
             ItemKind::SawCopper => Some(ToolClass::Saw),
             ItemKind::SickleCopper => Some(ToolClass::Sickle),

@@ -1,0 +1,15 @@
+{
+  "id": "primal_pickaxe",
+  "parent": "manual",
+  "ingredients": {
+    "0": "rock",
+    "1": "stick",
+    "2": "cordage"
+  },
+  "grid": [
+    ["0", "0", "0"],
+    [null, "1", "2"],
+    [null, "1", null]
+  ],
+  "result": { "item": "primal_pickaxe", "count": 1 }
+}

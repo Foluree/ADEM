@@ -1,10 +1,14 @@
 {
   "id": "bow_mirrored",
-  "category": "manual",
+  "parent": "manual",
+  "ingredients": {
+    "0": "stick",
+    "1": "cordage"
+  },
   "grid": [
-    [null, "stick", "cordage"],
-    [null, "stick", "cordage"],
-    [null, "stick", "cordage"]
+    [null, "0", "1"],
+    [null, "0", "1"],
+    [null, "0", "1"]
   ],
   "result": { "item": "bow", "count": 1 }
 }

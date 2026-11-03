@@ -1,9 +1,15 @@
 {
   "id": "hammer_stone",
+  "parent": "crafting_table",
+  "ingredients": {
+    "0": "rock",
+    "1": "stick",
+    "2": "cordage"
+  },
   "grid": [
-    ["rock", "rock", null],
-    ["stick", "stick", null],
-    [null, "cordage", null]
+    ["0", "0", null],
+    ["1", "1", null],
+    [null, "2", null]
   ],
   "result": { "item": "hammer_stone", "count": 1 }
 }

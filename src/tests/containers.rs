@@ -20,9 +20,9 @@ fn furnace_world(kind: BuildingKind) -> (World, CraftBook) {
     let mut world = World::new(WorldSize::new(256), 7);
     let pos = TilePos { x: 10, y: 10 };
     world.set_object_with_container(pos, Some(WorldObject::building(kind)));
-    let (book, errors) = CraftBook::load_dir("data/crafts");
-    assert!(errors.is_empty());
-    (world, book)
+    let load = CraftBook::load_dir("data/crafts");
+    assert!(load.errors.is_empty());
+    (world, load.book)
 }
 
 /// Человек рядом со станцией: инвентарь существует у существа с «умом».

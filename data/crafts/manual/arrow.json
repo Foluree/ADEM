@@ -1,6 +1,6 @@
 {
   "id": "arrow",
-  "category": "manual",
+  "parent": "manual",
   "shapeless": true,
   "ingredients": [
     { "item": "rock", "count": 1 },

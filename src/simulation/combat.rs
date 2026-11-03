@@ -10,7 +10,7 @@
 //! Небольшая высота дуги = «смягчённое» движение вверх/вниз. Всё
 //! детерминировано, без RNG; порядок в `Vec` стабилен для сохранений.
 
-use super::entities::{EntityKind, Facing, WOLF_BITE_COOLDOWN_TICKS, WOLF_BITE_DAMAGE, WOLF_BITE_REACH_TILES};
+use super::entities::{EntityKind, WOLF_BITE_COOLDOWN_TICKS, WOLF_BITE_DAMAGE, WOLF_BITE_REACH_TILES};
 use super::items::{self, ItemStack, ItemKind};
 use super::world::{TilePos, World, WorldPos};
 
@@ -417,12 +417,9 @@ pub fn wolf_bite(world: &mut World, actor: u64, target: TilePos, tick: u64) -> b
         wolf.next_bite_tick = tick + WOLF_BITE_COOLDOWN_TICKS;
         // Морда к жертве — как у ответного укуса ИИ (`tick_wolf_provocations`):
         // стоящий волк разворачивается, идущий следующий тик повернёт ввод.
-        if (point.x - origin.x).abs() > f32::EPSILON {
-            wolf.facing = if point.x > origin.x {
-                Facing::Right
-            } else {
-                Facing::Left
-            };
+        if let Some(facing) = super::entities::screen_facing(point.x - origin.x, point.y - origin.y)
+        {
+            wolf.facing = facing;
         }
     }
     apply_damage(world, victim, WOLF_BITE_DAMAGE, tick, Some(actor));
@@ -537,7 +534,7 @@ pub fn pickup_stuck_spears(world: &mut World, actor: u64) -> usize {
         .entities
         .get(actor)
         .and_then(|e| e.mind.as_ref())
-        .is_some_and(|m| m.inventory.can_fit(ItemKind::Spear, 1));
+        .is_some_and(|m| m.inventory.can_fit(ItemKind::SpearPrimal, 1));
     if !fits {
         return 0;
     }
@@ -550,7 +547,7 @@ pub fn pickup_stuck_spears(world: &mut World, actor: u64) -> usize {
                 .get_mut(actor)
                 .and_then(|e| e.mind.as_mut())
             {
-                m.inventory.add(ItemKind::Spear, 1);
+                m.inventory.add(ItemKind::SpearPrimal, 1);
             }
             world.stuck_spears.swap_remove(i);
             picked += 1;

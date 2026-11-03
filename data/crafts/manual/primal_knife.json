@@ -1,0 +1,15 @@
+{
+  "id": "primal_knife",
+  "parent": "manual",
+  "ingredients": {
+    "0": "rock",
+    "1": "stick",
+    "2": "cordage"
+  },
+  "grid": [
+    [null, "0", null],
+    [null, "1", "2"],
+    [null, null, null]
+  ],
+  "result": { "item": "primal_knife", "count": 1 }
+}

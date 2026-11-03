@@ -1,5 +1,6 @@
 {
   "id": "paper",
+  "parent": "crafting_table",
   "shapeless": true,
   "ingredients": [
     { "item": "paper_pulp", "count": 2 }

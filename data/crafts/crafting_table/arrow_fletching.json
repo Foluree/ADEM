@@ -1,9 +1,9 @@
 {
   "id": "arrow_fletching",
+  "parent": "crafting_table",
   "shapeless": true,
   "ingredients": [
-    { "item": "feather", "count": 2 },
-    { "item": "shard_bone", "count": 1 }
+    { "item": "feather", "count": 2 }
   ],
-  "result": { "item": "arrow_fletching", "count": 2 }
+  "result": { "item": "arrow_fletching", "count": 4 }
 }

@@ -1,5 +1,6 @@
 {
   "id": "shears_copper",
+  "parent": "smithing_table",
   "shapeless": true,
   "ingredients": [
     { "item": "ingot_copper", "count": 2 },
