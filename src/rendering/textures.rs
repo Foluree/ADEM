@@ -270,6 +270,7 @@ impl TileTextures {
                 nearest("textures/items/food/cherry.png".into()),
                 nearest("textures/items/coal.png".into()),
                 nearest("textures/items/charcoal.png".into()),
+                nearest("textures/items/torch.png".into()),
             ],
             player: nearest("textures/entities/player.png".into()),
             wolf_standing: nearest("textures/entities/wolf/wolf_standing.png".into()),

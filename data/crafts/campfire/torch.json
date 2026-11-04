@@ -1,0 +1,6 @@
+{
+  "id": "torch",
+  "parent": "campfire",
+  "input": { "item": "stick", "count": 1 },
+  "result": { "item": "torch", "count": 1 }
+}

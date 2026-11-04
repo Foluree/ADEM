@@ -170,6 +170,7 @@ impl UiIcons {
                 nearest("textures/items/food/cherry.png"),
                 nearest("textures/items/coal.png"),
                 nearest("textures/items/charcoal.png"),
+                nearest("textures/items/torch.png"),
             ],
             // Человек временно рисуется текстурой игрока (как в рендере).
             entities: [
