@@ -92,6 +92,7 @@ pub(crate) fn entity_kind_name(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::Wolf => "Волк",
         EntityKind::Human => "Человек",
+        EntityKind::Rabbit => "Кролик",
     }
 }
 

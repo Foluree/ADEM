@@ -332,6 +332,8 @@ fn read_entity(r: &mut Reader<'_>) -> Result<SimEntity, SaveError> {
         next_bite_tick: 0,
         provoked_by: None,
         provoked_until_tick: 0,
+        // Кулдаун выпаса — transient: после загрузки кролик может есть.
+        next_graze_tick: 0,
     })
 }
 

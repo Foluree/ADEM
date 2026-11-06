@@ -32,6 +32,34 @@ const WANDER_RADIUS_TILES: f32 = 8.0;
 /// общие правила мира (`simulation/movement.rs`).
 const WOLF_WALK_SPEED: f32 = 0.2;
 
+/// Базовая скорость ходьбы кролика, тайлов за тик. Чуть медленнее волка:
+/// хищник должен догонять убегающую добычу.
+const RABBIT_WALK_SPEED: f32 = 0.18;
+
+/// Максимальный запас здоровья кролика.
+const RABBIT_MAX_HP: f32 = 40.0;
+
+/// Радиус, в котором кролик замечает волка и убегает, тайлов.
+pub(crate) const RABBIT_FLEE_RADIUS_TILES: f32 = 6.0;
+
+/// Дальность убегания кролика от волка за одну цель, тайлов.
+const RABBIT_FLEE_DISTANCE_TILES: f32 = 8.0;
+
+/// Порог сытости, ниже которого кролик ищет траву и ест.
+pub(crate) const RABBIT_GRAZE_BELOW: f32 = 80.0;
+
+/// Сытость, восстанавливаемая одним поеданием травы.
+pub(crate) const RABBIT_GRAZE_AMOUNT: f32 = 15.0;
+
+/// Кулдаун поедания травы, тиков.
+pub(crate) const RABBIT_GRAZE_COOLDOWN_TICKS: u64 = 50;
+
+/// Радиус поиска травяного тайла голодным кроликом, тайлов.
+const RABBIT_GRASS_SEARCH_TILES: i32 = 8;
+
+/// Пауза перед повторным поиском травы, если рядом её не оказалось.
+const RABBIT_GRASS_RETRY_TICKS: u64 = 2 * TICKS_PER_SEC as u64;
+
 /// Длительности состояний, реальные секунды при x1.
 const WALK_SECS: (u64, u64) = (3, 8);
 const STAND_SECS: (u64, u64) = (1, 3);
@@ -43,6 +71,13 @@ const LIE_CHANCE: f32 = 0.2;
 
 /// Период смены кадров анимации ходьбы: 0.5 секунды.
 const WALK_FRAME_TICKS: u64 = (TICKS_PER_SEC as u64) / 2;
+
+/// Период смены кадров анимации ходьбы кролика: 0.25 секунды.
+/// Прыжковые кадры короткие, поэтому листаются быстрее волчьих.
+const RABBIT_WALK_FRAME_TICKS: u64 = (TICKS_PER_SEC as u64) / 4;
+
+/// Число кадров ходьбы кролика (присед → толчок → полёт).
+const RABBIT_WALK_FRAMES: u8 = 3;
 
 /// Сколько тиков волк может «толкаться» в препятствие, прежде чем
 /// прекратить ходьбу и перейти в стояние.
@@ -94,17 +129,19 @@ pub const HUMAN_MAX_HP: f32 = 100.0;
 pub enum EntityKind {
     Wolf,
     Human,
+    Rabbit,
 }
 
 impl EntityKind {
     /// Все виды существ в стабильном порядке (генерация, UI редактора).
-    pub const ALL: [EntityKind; 2] = [EntityKind::Wolf, EntityKind::Human];
+    pub const ALL: [EntityKind; 3] = [EntityKind::Wolf, EntityKind::Human, EntityKind::Rabbit];
 
     /// Максимальный запас здоровья вида.
     pub fn max_hp(self) -> f32 {
         match self {
             EntityKind::Wolf => 80.0,
             EntityKind::Human => HUMAN_MAX_HP,
+            EntityKind::Rabbit => RABBIT_MAX_HP,
         }
     }
 
@@ -114,6 +151,7 @@ impl EntityKind {
         match self {
             EntityKind::Wolf => WOLF_WALK_SPEED,
             EntityKind::Human => HUMAN_WALK_SPEED,
+            EntityKind::Rabbit => RABBIT_WALK_SPEED,
         }
     }
 
@@ -128,6 +166,7 @@ impl EntityKind {
         match value {
             0 => Some(Self::Wolf),
             1 => Some(Self::Human),
+            2 => Some(Self::Rabbit),
             _ => None,
         }
     }
@@ -309,6 +348,9 @@ pub struct SimEntity {
     pub provoked_by: Option<u64>,
     /// Тик, до которого волк помнит обиду. Transient: в сейв не пишется.
     pub provoked_until_tick: u64,
+    /// Тик, с которого кролик снова может есть траву (кулдаун поедания).
+    /// Transient: в сейв не пишется.
+    pub next_graze_tick: u64,
 }
 
 impl SimEntity {
@@ -334,6 +376,7 @@ impl SimEntity {
             next_bite_tick: 0,
             provoked_by: None,
             provoked_until_tick: 0,
+            next_graze_tick: 0,
         }
     }
 
@@ -344,9 +387,16 @@ impl SimEntity {
         self.kind.walk_speed()
     }
 
-    /// Кадр анимации ходьбы: 0 или 1, смена раз в `WALK_FRAME_TICKS`.
+    /// Кадр анимации ходьбы. У волка два кадра раз в `WALK_FRAME_TICKS`,
+    /// у кролика три прыжковых кадра раз в `RABBIT_WALK_FRAME_TICKS`.
     pub fn walk_frame(&self) -> u8 {
-        ((self.state_ticks / WALK_FRAME_TICKS) % 2) as u8
+        match self.kind {
+            EntityKind::Wolf => ((self.state_ticks / WALK_FRAME_TICKS) % 2) as u8,
+            EntityKind::Rabbit => {
+                ((self.state_ticks / RABBIT_WALK_FRAME_TICKS) % RABBIT_WALK_FRAMES as u64) as u8
+            }
+            EntityKind::Human => 0,
+        }
     }
 }
 
@@ -580,69 +630,241 @@ impl World {
         // Ответный кусь и убегание волка — после FSM: провокация
         // переопределяет цель обычного поведения.
         self.tick_wolf_provocations(tick);
-        // Голодный волк ищет лёжащее мясо (подъест в радиусе поедания).
-        self.seek_wolf_meat();
+        // Фауна: охота волков на кроликов, побег и выпас кроликов.
+        self.tick_fauna(tick, player_controlled);
         // Автономное поведение людей — после FSM: ИИ выставляет цели,
         // движение исполняется общим кодом на следующем тике.
         self.tick_human_ai(player_controlled, tick);
     }
 
-    /// Голодный стоящий волк идёт к ближайшему лежащему мясу: дроп-сущности
-    /// перебираются в поиске еды, само поедание — в `tick_item_entities`
-    /// при подходе. O(голодные стоящие волки × дроп мяса) за тик, только
-    /// когда такие волки есть. Идущие волки цель не меняют (не дёргаются).
-    fn seek_wolf_meat(&mut self) {
+    /// Поведение животных после общего FSM.
+    ///
+    /// Снимки позиций волков и кроликов берутся один раз за тик: решения
+    /// принимаются по одному состоянию мира, без повторных сканов существ.
+    /// Стоимость — O(волки × кролики) в худшем случае; при текущих лимитах
+    /// спавна это дешевле, чем отдельные проходы на каждую механику.
+    ///
+    /// Волк: голодный (ниже `WOLF_SEEK_BELOW`), не спровоцированный и не
+    /// лежащий кусает кролика в досягаемости, иначе идёт к мясу (мясо
+    /// важнее), иначе — к ближайшему кролику в радиусе поиска.
+    /// Кролик: убегает от волка в радиусе `RABBIT_FLEE_RADIUS_TILES`,
+    /// иначе при голоде ест траву под собой или идёт к ближайшей траве.
+    fn tick_fauna(&mut self, tick: u64, player_controlled: Option<u64>) {
         use super::item_entity::{WOLF_MEAT_SEEK_RADIUS, WOLF_SEEK_BELOW};
 
+        let mut rabbits: Vec<(u64, WorldPos)> = self
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Rabbit)
+            .map(|e| (e.id, e.pos))
+            .collect();
+        let wolves: Vec<(u64, WorldPos)> = self
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Wolf)
+            .map(|e| (e.id, e.pos))
+            .collect();
+
+        // --- Волки: охота на кроликов и поиск мяса. ---
         let hungry: Vec<u64> = self
             .entities
             .iter()
             .filter(|e| {
                 e.kind == EntityKind::Wolf
-                    && e.state == EntityState::Standing
+                    && e.state != EntityState::Lying
                     && e.provoked_by.is_none()
+                    && Some(e.id) != player_controlled
                     && e.hunger.value() < WOLF_SEEK_BELOW
             })
             .map(|e| e.id)
             .collect();
-        if hungry.is_empty() {
-            return;
-        }
-        let meats: Vec<WorldPos> = self
-            .item_entities
-            .items
-            .iter()
-            .filter(|e| e.stack.kind.is_wolf_food() && e.fly.is_none())
-            .map(|e| e.pos)
-            .collect();
-        if meats.is_empty() {
-            return;
-        }
-        for id in hungry {
-            let Some(pos) = self.entities.get(id).map(|e| e.pos) else {
-                continue;
-            };
-            // Ближайшее мясо в радиусе поиска.
-            let Some(target) = meats
+        if !hungry.is_empty() {
+            let meats: Vec<WorldPos> = self
+                .item_entities
+                .items
                 .iter()
-                .copied()
-                .filter(|meat| pos.dist(*meat) <= WOLF_MEAT_SEEK_RADIUS)
-                .min_by(|a, b| pos.dist(*a).total_cmp(&pos.dist(*b)))
-            else {
-                continue;
-            };
-            let Some(entity) = self.entities.get_mut(id) else {
-                continue;
-            };
-            entity.state = EntityState::Walking;
-            entity.state_ticks = 0;
-            entity.state_duration = 10 * TICKS_PER_SEC as u64;
-            entity.target = target;
-            entity.stuck_ticks = 0;
-            if let Some(facing) = screen_facing(target.x - pos.x, target.y - pos.y) {
-                entity.facing = facing;
+                .filter(|e| e.stack.kind.is_wolf_food() && e.fly.is_none())
+                .map(|e| e.pos)
+                .collect();
+            for wolf_id in hungry {
+                let Some(wolf) = self.entities.get(wolf_id) else {
+                    continue;
+                };
+                let pos = wolf.pos;
+                let bite_ready = tick >= wolf.next_bite_tick;
+
+                // Ближайший кролик в радиусе охоты (детерминированный выбор).
+                let nearest_rabbit = rabbits
+                    .iter()
+                    .copied()
+                    .filter(|(_, rabbit_pos)| pos.dist(*rabbit_pos) <= WOLF_MEAT_SEEK_RADIUS)
+                    .min_by(|a, b| {
+                        pos.dist(a.1)
+                            .total_cmp(&pos.dist(b.1))
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+
+                // Добыча в досягаемости — кусь по кулдауну.
+                if let Some((rabbit_id, rabbit_pos)) = nearest_rabbit
+                    && bite_ready
+                    && pos.dist(rabbit_pos) <= WOLF_BITE_REACH_TILES
+                {
+                    let bitten = super::combat::wolf_bite_entity(self, wolf_id, rabbit_id, tick);
+                    if bitten {
+                        // Убитый кролик выбывает из снимка: остальные волки
+                        // не должны гнаться за трупом.
+                        if self.entities.get(rabbit_id).is_none() {
+                            rabbits.retain(|(id, _)| *id != rabbit_id);
+                        }
+                        continue;
+                    }
+                }
+
+                // Цель: мясо важнее живой добычи, иначе ближайший кролик.
+                let target = meats
+                    .iter()
+                    .copied()
+                    .filter(|meat| pos.dist(*meat) <= WOLF_MEAT_SEEK_RADIUS)
+                    .min_by(|a, b| pos.dist(*a).total_cmp(&pos.dist(*b)))
+                    .or_else(|| nearest_rabbit.map(|(_, rabbit_pos)| rabbit_pos));
+                let Some(target) = target else {
+                    continue;
+                };
+                let Some(wolf) = self.entities.get_mut(wolf_id) else {
+                    continue;
+                };
+                if wolf.state == EntityState::Lying {
+                    continue;
+                }
+                // Цель обновляется каждый тик, но анимация ходьбы не
+                // сбрасывается: `state_ticks` не трогаем.
+                set_walk_target(wolf, target, 10 * TICKS_PER_SEC as u64);
             }
         }
+
+        // --- Кролики: побег от волков, затем выпас. ---
+        let side = self.size.tiles() as f32;
+        for (rabbit_id, pos) in rabbits {
+            if Some(rabbit_id) == player_controlled {
+                continue;
+            }
+            let Some(rabbit) = self.entities.get(rabbit_id) else {
+                continue;
+            };
+            let state = rabbit.state;
+            let hunger = rabbit.hunger.value();
+            let next_graze_tick = rabbit.next_graze_tick;
+            let current_target = rabbit.target;
+
+            // Ближайший волк в радиусе побега.
+            let threat = wolves
+                .iter()
+                .filter(|(_, wolf_pos)| pos.dist(*wolf_pos) <= RABBIT_FLEE_RADIUS_TILES)
+                .min_by(|a, b| {
+                    pos.dist(a.1)
+                        .total_cmp(&pos.dist(b.1))
+                        .then_with(|| a.0.cmp(&b.0))
+                })
+                .map(|(_, wolf_pos)| *wolf_pos);
+            if let Some(wolf_pos) = threat {
+                let dx = pos.x - wolf_pos.x;
+                let dy = pos.y - wolf_pos.y;
+                let len = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+                let flee = WorldPos {
+                    x: (pos.x + dx / len * RABBIT_FLEE_DISTANCE_TILES).clamp(0.0, side),
+                    y: (pos.y + dy / len * RABBIT_FLEE_DISTANCE_TILES).clamp(0.0, side),
+                };
+                let Some(rabbit) = self.entities.get_mut(rabbit_id) else {
+                    continue;
+                };
+                // Лежание → стояние → ходьба: прямой переход запрещён.
+                if rabbit.state == EntityState::Lying {
+                    stand_up_for_action(rabbit);
+                    continue;
+                }
+                set_walk_target(rabbit, flee, 10 * TICKS_PER_SEC as u64);
+                continue;
+            }
+
+            if hunger >= RABBIT_GRAZE_BELOW || tick < next_graze_tick {
+                continue;
+            }
+
+            // На траве — едим, не меняя рельеф. Кулдаун не даёт
+            // восстанавливать сытость каждый тик.
+            if is_grass(super::actions::terrain_at(self, pos)) {
+                let Some(rabbit) = self.entities.get_mut(rabbit_id) else {
+                    continue;
+                };
+                rabbit.hunger.eat(RABBIT_GRAZE_AMOUNT);
+                rabbit.next_graze_tick = tick + RABBIT_GRAZE_COOLDOWN_TICKS;
+                if rabbit.state == EntityState::Walking {
+                    rabbit.state = EntityState::Standing;
+                    rabbit.state_ticks = 0;
+                    rabbit.state_duration = TICKS_PER_SEC as u64;
+                    rabbit.target = rabbit.pos;
+                    rabbit.stuck_ticks = 0;
+                }
+                continue;
+            }
+
+            // Уже идёт к травяному тайлу — не пересканируем окрестности
+            // каждый тик.
+            if state == EntityState::Walking
+                && is_grass(super::actions::terrain_at(self, current_target))
+            {
+                continue;
+            }
+
+            match self.nearest_grass(pos) {
+                Some(target) => {
+                    let Some(rabbit) = self.entities.get_mut(rabbit_id) else {
+                        continue;
+                    };
+                    if rabbit.state == EntityState::Lying {
+                        stand_up_for_action(rabbit);
+                        continue;
+                    }
+                    set_walk_target(rabbit, target, 10 * TICKS_PER_SEC as u64);
+                }
+                None => {
+                    // Травы рядом нет: не сканируем окрестности каждый тик.
+                    let Some(rabbit) = self.entities.get_mut(rabbit_id) else {
+                        continue;
+                    };
+                    rabbit.next_graze_tick = tick + RABBIT_GRASS_RETRY_TICKS;
+                }
+            }
+        }
+    }
+
+    /// Ближайший травяной тайл в радиусе `RABBIT_GRASS_SEARCH_TILES`.
+    /// Обход квадрата вокруг кролика; при равном расстоянии выбирается
+    /// меньший `(y, x)` — выбор детерминирован.
+    fn nearest_grass(&self, from: WorldPos) -> Option<WorldPos> {
+        let side = self.size.tiles() as i32;
+        let cx = (from.x.floor() as i32).clamp(0, side - 1);
+        let cy = (from.y.floor() as i32).clamp(0, side - 1);
+        let radius = RABBIT_GRASS_SEARCH_TILES;
+        let mut best: Option<(f32, i32, i32)> = None;
+        for y in (cy - radius).max(0)..=(cy + radius).min(side - 1) {
+            for x in (cx - radius).max(0)..=(cx + radius).min(side - 1) {
+                let tile = TilePos { x, y };
+                if !is_grass(Some(self.terrain_kind(tile))) {
+                    continue;
+                }
+                let center = WorldPos::of_tile_center(tile);
+                let distance = from.dist(center);
+                let better = best.is_none_or(|(best_distance, best_y, best_x)| {
+                    distance < best_distance
+                        || (distance == best_distance && (y, x) < (best_y, best_x))
+                });
+                if better {
+                    best = Some((distance, y, x));
+                }
+            }
+        }
+        best.map(|(_, y, x)| WorldPos::of_tile_center(TilePos { x, y }))
     }
 
     /// Поведение провоцированного волка: кусает обидчика в досягаемости
@@ -763,6 +985,39 @@ fn choose_from_standing(
     } else {
         enter_walking(entity, rng, terrain, side);
     }
+}
+
+/// Направляет существо к точке, не сбрасывая анимацию, если оно уже идёт.
+/// Нужно для погони/побега: цель обновляется каждый тик, а `state_ticks`
+/// продолжает листать кадры ходьбы.
+fn set_walk_target(entity: &mut SimEntity, target: WorldPos, duration: u64) {
+    if entity.state != EntityState::Walking {
+        entity.state = EntityState::Walking;
+        entity.state_ticks = 0;
+    }
+    entity.state_duration = duration;
+    entity.target = target;
+    entity.stuck_ticks = 0;
+    if let Some(facing) = screen_facing(target.x - entity.pos.x, target.y - entity.pos.y) {
+        entity.facing = facing;
+    }
+}
+
+/// Поднимает лежащее существо в стояние перед действием. Небольшая
+/// длительность не даёт FSM на следующем тике случайно лечь снова, но и
+/// не задерживает действие: `tick_fauna` сразу задаст цель. Прямой переход
+/// «лежание → ходьба» запрещён.
+fn stand_up_for_action(entity: &mut SimEntity) {
+    entity.state = EntityState::Standing;
+    entity.state_ticks = 0;
+    entity.state_duration = TICKS_PER_SEC as u64;
+    entity.target = entity.pos;
+    entity.stuck_ticks = 0;
+}
+
+/// Трава ли тайл (обычная или лесная) — корм кролика.
+fn is_grass(kind: Option<TileType>) -> bool {
+    matches!(kind, Some(TileType::Grass | TileType::ForestGrass))
 }
 
 /// Переводит существо в ходьбу и выбирает достижимую точку брожения.

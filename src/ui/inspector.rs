@@ -170,6 +170,7 @@ fn spawn_inspector_window(commands: &mut Commands, entity: &SimEntity, font: &Ui
     let title = match entity.kind {
         crate::simulation::EntityKind::Human => format!("Человек #{}", entity.id),
         crate::simulation::EntityKind::Wolf => format!("Волк #{}", entity.id),
+        crate::simulation::EntityKind::Rabbit => format!("Кролик #{}", entity.id),
     };
     let hp = entity.hp;
     let hunger = entity.hunger.value();

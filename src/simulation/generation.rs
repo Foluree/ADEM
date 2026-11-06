@@ -304,6 +304,8 @@ pub fn generate_world(size: WorldSize, seed: u64) -> World {
     // Существа — после рельефа и объектов: им нужна готовая карта,
     // чтобы не появиться в воде.
     spawn_wildlife(&mut world, &mut rng);
+    // Кролики — отдельным проходом: у них своя плотность и биом.
+    spawn_rabbits(&mut world, &mut rng);
 
     // Однородные чанки (океаны, пустыни) схлопываем в Uniform —
     // экономия ОЗУ сразу после генерации.
@@ -347,6 +349,40 @@ fn spawn_wildlife(world: &mut World, rng: &mut StdRng) {
         world
             .entities
             .spawn(EntityKind::Wolf, WorldPos::of_tile_center(pos));
+        placed += 1;
+    }
+}
+
+/// Плотность кроликов: одно существо на столько тайлов площади.
+/// На стартовом мире 256×256 это 16 кроликов; на больших картах
+/// количество растёт, но ограничено сверху.
+const TILES_PER_RABBIT: u32 = 4096;
+const MAX_RABBITS: u32 = 128;
+
+/// Заселяет мир кроликами на травяных биомах. Кролик — травоядное:
+/// появляется только там, где есть корм (обычная или лесная трава).
+fn spawn_rabbits(world: &mut World, rng: &mut StdRng) {
+    let tiles = world.size.tiles();
+    let count = (tiles * tiles / TILES_PER_RABBIT).clamp(1, MAX_RABBITS);
+    let side = tiles as i32;
+    let mut placed = 0_u32;
+    let mut attempts = 0_u32;
+
+    while placed < count && attempts < count * 100 {
+        attempts += 1;
+        let pos = TilePos {
+            x: rng.random_range(0..side),
+            y: rng.random_range(0..side),
+        };
+        if !matches!(
+            world.terrain_kind(pos),
+            TileType::Grass | TileType::ForestGrass
+        ) {
+            continue;
+        }
+        world
+            .entities
+            .spawn(EntityKind::Rabbit, WorldPos::of_tile_center(pos));
         placed += 1;
     }
 }

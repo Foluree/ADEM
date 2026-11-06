@@ -353,3 +353,185 @@ fn wolf_slows_down_on_mountain_and_in_shallow_water() {
         wolf.pos.x
     );
 }
+
+/// Кролик появляется с HP вида (40) и тремя прыжковыми кадрами ходьбы.
+#[test]
+fn rabbit_spawns_with_hp_and_three_walk_frames() {
+    use crate::simulation::entities::{EntityKind, EntityState};
+    use crate::simulation::world::WorldPos;
+
+    let mut world = World::new(WorldSize::new(256), 1);
+    world
+        .entities
+        .spawn(EntityKind::Rabbit, WorldPos { x: 50.5, y: 50.5 });
+    let rabbit = &mut world.entities.entities[0];
+    assert_eq!(rabbit.hp, 40.0);
+    assert_eq!(rabbit.kind.max_hp(), 40.0);
+    assert!(rabbit.mind.is_none(), "кролик неразумный");
+    assert!((rabbit.kind.walk_speed() - 0.18).abs() < 1e-6);
+
+    rabbit.state = EntityState::Walking;
+    for tick in 0..30_u64 {
+        rabbit.state_ticks = tick;
+        let expected = ((tick / 5) % 3) as u8;
+        assert_eq!(rabbit.walk_frame(), expected, "кадр на тике {tick}");
+    }
+}
+
+/// Голодный кролик ест траву под собой: +15 сытости, затем кулдаун
+/// 50 тиков, в течение которого повторного поедания нет.
+#[test]
+fn rabbit_grazes_on_grass_with_cooldown() {
+    use crate::simulation::entities::{EntityKind, EntityState};
+    use crate::simulation::hunger::Hunger;
+    use crate::simulation::world::WorldPos;
+
+    let mut world = World::new(WorldSize::new(256), 1);
+    let tile = TilePos { x: 10, y: 10 };
+    world.set_terrain(tile, TileType::Grass);
+    let rabbit = world
+        .entities
+        .spawn(EntityKind::Rabbit, WorldPos::of_tile_center(tile));
+    {
+        let entity = world.entities.get_mut(rabbit).unwrap();
+        entity.hunger = Hunger::with_value(50.0);
+        entity.state = EntityState::Standing;
+        entity.state_duration = u64::MAX;
+    }
+
+    world.tick_entities(1, None);
+    let after_first = world.entities.get(rabbit).unwrap();
+    let first_hunger = after_first.hunger.value();
+    assert!(
+        (64.9..65.1).contains(&first_hunger),
+        "после поедания должно быть ~65, а не {first_hunger}"
+    );
+    assert_eq!(after_first.next_graze_tick, 51, "кулдаун 50 тиков");
+
+    // Внутри кулдауна кролик не ест: сытость только тратится.
+    world.tick_entities(2, None);
+    let second_hunger = world.entities.get(rabbit).unwrap().hunger.value();
+    assert!(
+        second_hunger < first_hunger,
+        "внутри кулдауна не должно быть прибавки"
+    );
+
+    // На границе кулдауна — снова ест.
+    world.tick_entities(51, None);
+    let third_hunger = world.entities.get(rabbit).unwrap().hunger.value();
+    assert!(
+        third_hunger > 79.0,
+        "на тике 51 кролик должен снова поесть, а не {third_hunger}"
+    );
+}
+
+/// Кролик убегает от волка в радиусе шести тайлов: цель — прочь от хищника.
+#[test]
+fn rabbit_flees_from_nearby_wolf() {
+    use crate::simulation::entities::{EntityKind, EntityState};
+    use crate::simulation::world::WorldPos;
+
+    let mut world = World::new(WorldSize::new(256), 1);
+    let rabbit = world
+        .entities
+        .spawn(EntityKind::Rabbit, WorldPos { x: 10.5, y: 10.5 });
+    {
+        let entity = world.entities.get_mut(rabbit).unwrap();
+        entity.state = EntityState::Standing;
+        entity.state_duration = u64::MAX;
+    }
+    // Волк справа в четырёх тайлах — в радиусе побега.
+    world
+        .entities
+        .spawn(EntityKind::Wolf, WorldPos { x: 14.5, y: 10.5 });
+
+    world.tick_entities(1, None);
+    let rabbit = world.entities.get(rabbit).unwrap();
+    assert_eq!(rabbit.state, EntityState::Walking, "кролик должен убегать");
+    assert!(
+        rabbit.target.x < rabbit.pos.x,
+        "цель побега должна быть прочь от волка, target.x={}",
+        rabbit.target.x
+    );
+}
+
+/// Голодный кролик не на траве ищет ближайший травяной тайл и идёт к нему.
+#[test]
+fn rabbit_seeks_grass_when_hungry_off_grass() {
+    use crate::simulation::entities::{EntityKind, EntityState};
+    use crate::simulation::hunger::Hunger;
+    use crate::simulation::world::WorldPos;
+
+    let mut world = World::new(WorldSize::new(256), 1);
+    let grass = TilePos { x: 12, y: 10 };
+    world.set_terrain(grass, TileType::ForestGrass);
+    let rabbit = world
+        .entities
+        .spawn(EntityKind::Rabbit, WorldPos { x: 10.5, y: 10.5 });
+    {
+        let entity = world.entities.get_mut(rabbit).unwrap();
+        entity.hunger = Hunger::with_value(50.0);
+        entity.state = EntityState::Standing;
+        entity.state_duration = u64::MAX;
+    }
+
+    world.tick_entities(1, None);
+    let rabbit = world.entities.get(rabbit).unwrap();
+    assert_eq!(rabbit.state, EntityState::Walking);
+    assert!(
+        (rabbit.target.x - 12.5).abs() < 1e-5 && (rabbit.target.y - 10.5).abs() < 1e-5,
+        "цель должна быть центром травяного тайла, target={:?}",
+        rabbit.target
+    );
+}
+
+/// Голодный волк идёт к кролику в радиусе поиска, а сытый — не охотится.
+#[test]
+fn hungry_wolf_hunts_rabbit() {
+    use crate::simulation::entities::{EntityKind, EntityState};
+    use crate::simulation::hunger::Hunger;
+    use crate::simulation::world::WorldPos;
+
+    let mut world = World::new(WorldSize::new(256), 1);
+    let wolf = world
+        .entities
+        .spawn(EntityKind::Wolf, WorldPos { x: 10.5, y: 10.5 });
+    {
+        let entity = world.entities.get_mut(wolf).unwrap();
+        entity.hunger = Hunger::with_value(50.0);
+        entity.state = EntityState::Standing;
+        entity.state_duration = u64::MAX;
+    }
+    let _rabbit = world
+        .entities
+        .spawn(EntityKind::Rabbit, WorldPos { x: 20.5, y: 10.5 });
+
+    world.tick_entities(1, None);
+    let wolf_entity = world.entities.get(wolf).unwrap();
+    assert_eq!(wolf_entity.state, EntityState::Walking);
+    assert!(
+        (wolf_entity.target.x - 20.5).abs() < 1e-5,
+        "волк должен идти к кролику, target={:?}",
+        wolf_entity.target
+    );
+
+    // Сытый волк не охотится: кролик в том же радиусе, но цель не меняется.
+    let mut full_world = World::new(WorldSize::new(256), 1);
+    let wolf = full_world
+        .entities
+        .spawn(EntityKind::Wolf, WorldPos { x: 10.5, y: 10.5 });
+    {
+        let entity = full_world.entities.get_mut(wolf).unwrap();
+        entity.state = EntityState::Standing;
+        entity.state_duration = u64::MAX;
+    }
+    full_world
+        .entities
+        .spawn(EntityKind::Rabbit, WorldPos { x: 20.5, y: 10.5 });
+    full_world.tick_entities(1, None);
+    assert_eq!(
+        full_world.entities.get(wolf).unwrap().state,
+        EntityState::Standing,
+        "сытый волк не должен начинать охоту"
+    );
+}

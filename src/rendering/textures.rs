@@ -49,6 +49,10 @@ pub(crate) struct TileTextures {
     wolf_standing: Handle<Image>,
     wolf_lying: Handle<Image>,
     wolf_walk: [Handle<Image>; 2],
+    /// Кролик: сидит (покой), лежит и три прыжковых кадра ходьбы.
+    rabbit_standing: Handle<Image>,
+    rabbit_lying: Handle<Image>,
+    rabbit_walk: [Handle<Image>; 3],
 }
 
 /// Текстуры одной станции-блока: верх и две видимые боковые грани
@@ -278,6 +282,13 @@ impl TileTextures {
                 nearest("textures/entities/wolf/wolf_walk1.png".into()),
                 nearest("textures/entities/wolf/wolf_walk2.png".into()),
             ],
+            rabbit_standing: nearest("textures/entities/rabit/rabit_sit.png".into()),
+            rabbit_lying: nearest("textures/entities/rabit/rabit_lying.png".into()),
+            rabbit_walk: [
+                nearest("textures/entities/rabit/rabbit_jump_2.png".into()),
+                nearest("textures/entities/rabit/rabbit_standing.png".into()),
+                nearest("textures/entities/rabit/rabit_jump.png".into()),
+            ],
         }
     }
 
@@ -347,6 +358,11 @@ impl TileTextures {
                 EntityState::Walking => &self.wolf_walk[entity.walk_frame() as usize],
             },
             EntityKind::Human => &self.player,
+            EntityKind::Rabbit => match entity.state {
+                EntityState::Standing => &self.rabbit_standing,
+                EntityState::Lying => &self.rabbit_lying,
+                EntityState::Walking => &self.rabbit_walk[entity.walk_frame() as usize],
+            },
         }
     }
 
@@ -360,6 +376,11 @@ impl TileTextures {
             &self.wolf_lying,
             &self.wolf_walk[0],
             &self.wolf_walk[1],
+            &self.rabbit_standing,
+            &self.rabbit_lying,
+            &self.rabbit_walk[0],
+            &self.rabbit_walk[1],
+            &self.rabbit_walk[2],
         ]
         .into_iter()
     }

@@ -228,6 +228,41 @@ fn save_roundtrip_entity_hp_and_water_ticks() {
     assert_eq!(wolf.water_ticks, 37);
 }
 
+/// Кролик переживает сохранение: вид, HP, голод; кулдаун выпаса — transient.
+#[test]
+fn save_roundtrip_rabbit() {
+    use crate::simulation::entities::EntityKind;
+    use crate::simulation::hunger::Hunger;
+    use crate::simulation::save::{load_game, save_game};
+    use crate::simulation::time::GameClock;
+    use crate::simulation::world::WorldPos;
+
+    let mut world = crate::simulation::World::new(WorldSize::new(256), 1);
+    let rabbit = world
+        .entities
+        .spawn(EntityKind::Rabbit, WorldPos { x: 7.5, y: 9.5 });
+    {
+        let entity = world.entities.get_mut(rabbit).unwrap();
+        entity.hp = 33.0;
+        entity.hunger = Hunger::with_value(55.0);
+        entity.next_graze_tick = 777;
+    }
+
+    let bytes = save_game(
+        &world,
+        &GameClock { tick: 0 },
+        &crate::simulation::Scheduler::default(),
+        "0.1.0",
+    );
+    let loaded = load_game(&bytes).expect("сохранение должно разбираться");
+    let entity = loaded.world.entities.get(rabbit).expect("кролик сохранился");
+    assert_eq!(entity.kind, EntityKind::Rabbit);
+    assert_eq!(entity.hp, 33.0);
+    assert_eq!(entity.hunger, Hunger::with_value(55.0));
+    assert!(entity.mind.is_none(), "кролик неразумный");
+    assert_eq!(entity.next_graze_tick, 0, "кулдаун выпаса не сохраняется");
+}
+
 /// Человек с «умом» переживает сохранение: позиция, hp, голод, выбранный
 /// слот хотбара, инвентарь со всеми секциями (включая надетую кольчугу и
 /// мусорку). Кулдауны и цель ИИ — transient: при загрузке сбрасываются.

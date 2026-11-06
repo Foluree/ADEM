@@ -24,7 +24,7 @@ pub struct UiIcons {
     /// По дискриминанту `ObjectKind` (включая постройки и станции).
     objects: [Handle<Image>; 11],
     items: [Handle<Image>; ITEM_KIND_COUNT],
-    entities: [Handle<Image>; 2],
+    entities: [Handle<Image>; 3],
     /// Текстуры пустых слотов брони в порядке `ARMOR_LAYOUT`
     /// (head, chest, legs, boots).
     empty_armor_slots: [Handle<Image>; EMPTY_ARMOR_SLOT_COUNT],
@@ -175,6 +175,7 @@ impl UiIcons {
             entities: [
                 nearest("textures/entities/wolf/wolf_standing.png"),
                 nearest("textures/entities/player.png"),
+                nearest("textures/entities/rabit/rabit_sit.png"),
             ],
             empty_armor_slots: [
                 nearest("textures/ui/inventory/empty_armor_slot_helmet.png"),

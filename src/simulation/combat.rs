@@ -413,16 +413,44 @@ pub fn wolf_bite(world: &mut World, actor: u64, target: TilePos, tick: u64) -> b
         return false;
     };
 
-    if let Some(wolf) = world.entities.get_mut(actor) {
+    wolf_bite_entity(world, actor, victim, tick)
+}
+
+/// Укус волка по конкретному существу (ИИ охоты): жертва задана id, без
+/// прицеливания тайлом. Кулдаун живёт на волке и общий с ручным укусом и
+/// ответными кусами. `false` — не волк, кулдаун не истёк, жертвы нет или
+/// она вне досягаемости.
+pub(crate) fn wolf_bite_entity(
+    world: &mut World,
+    wolf_id: u64,
+    victim_id: u64,
+    tick: u64,
+) -> bool {
+    let Some(wolf) = world.entities.get(wolf_id) else {
+        return false;
+    };
+    if wolf.kind != EntityKind::Wolf || tick < wolf.next_bite_tick {
+        return false;
+    }
+    let origin = wolf.pos;
+    let Some(victim_pos) = world.entities.get(victim_id).map(|e| e.pos) else {
+        return false;
+    };
+    if origin.dist(victim_pos) > WOLF_BITE_REACH_TILES {
+        return false;
+    }
+
+    if let Some(wolf) = world.entities.get_mut(wolf_id) {
         wolf.next_bite_tick = tick + WOLF_BITE_COOLDOWN_TICKS;
-        // Морда к жертве — как у ответного укуса ИИ (`tick_wolf_provocations`):
-        // стоящий волк разворачивается, идущий следующий тик повернёт ввод.
-        if let Some(facing) = super::entities::screen_facing(point.x - origin.x, point.y - origin.y)
-        {
+        // Морда к жертве — как у ответного укуса ИИ (`tick_wolf_provocations`).
+        if let Some(facing) = super::entities::screen_facing(
+            victim_pos.x - origin.x,
+            victim_pos.y - origin.y,
+        ) {
             wolf.facing = facing;
         }
     }
-    apply_damage(world, victim, WOLF_BITE_DAMAGE, tick, Some(actor));
+    apply_damage(world, victim_id, WOLF_BITE_DAMAGE, tick, Some(wolf_id));
     true
 }
 
@@ -512,6 +540,16 @@ pub(crate) fn drop_entity_loot(world: &mut World, entity_id: u64, tick: u64) {
         EntityKind::Human => {
             // Всё ценное уже упало инвентарём; тело и падаль — позже
             // (роадмап «Правила трупов/падали»).
+        }
+        EntityKind::Rabbit => {
+            // Кролик маленький: стабильно один кусок сырого мяса
+            // травоядного, без случайного разброса.
+            items.drop_stack(
+                seed,
+                pos,
+                ItemStack { kind: ItemKind::MeatHerbivoreRaw, count: 1 },
+                tick,
+            );
         }
     }
 }

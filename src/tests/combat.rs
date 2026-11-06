@@ -282,6 +282,30 @@ fn projectile_flight_is_bounded() {
     assert!(middle > 0.0 && middle <= projectile.arc_height + f32::EPSILON);
 }
 
+/// Укус волка по кролику: смерть и стабильный дроп сырого мяса травоядного.
+#[test]
+fn wolf_bite_entity_kills_rabbit_and_drops_meat() {
+    let mut world = flat_world();
+    let wolf = world
+        .entities
+        .spawn(EntityKind::Wolf, WorldPos { x: 10.0, y: 10.0 });
+    let rabbit = world
+        .entities
+        .spawn(EntityKind::Rabbit, WorldPos { x: 10.8, y: 10.0 });
+    world.entities.get_mut(rabbit).unwrap().hp = 1.0;
+
+    assert!(wolf_bite_entity(&mut world, wolf, rabbit, 100));
+    assert!(world.entities.get(rabbit).is_none(), "кролик погиб");
+    assert!(
+        world
+            .item_entities
+            .items
+            .iter()
+            .any(|drop| drop.stack.kind == ItemKind::MeatHerbivoreRaw),
+        "с кролика должно выпасть сырое мясо травоядного"
+    );
+}
+
 // Волк, убитый человеком в ближнем бою, роняет мясо хищника дроп-сущностью,
 // и человек рядом подбирает его автоподбором полного тика мира.
 //#[test] deleted

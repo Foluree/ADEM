@@ -273,6 +273,37 @@ fn generation_spawns_wolves_on_land() {
     }
 }
 
+/// Генерация заселяет мир кроликами только на траве и лесной траве.
+#[test]
+fn generation_spawns_rabbits_on_grass() {
+    use crate::simulation::entities::EntityKind;
+
+    let world = generate_world(WorldSize::new(256), 42);
+    let rabbits: Vec<_> = world
+        .entities
+        .iter()
+        .filter(|entity| entity.kind == EntityKind::Rabbit)
+        .collect();
+    assert!(!rabbits.is_empty(), "на карте нет кроликов");
+
+    for rabbit in rabbits {
+        let tile = TilePos {
+            x: rabbit.pos.x.floor() as i32,
+            y: rabbit.pos.y.floor() as i32,
+        };
+        assert!(
+            matches!(
+                world.terrain_kind(tile),
+                TileType::Grass | TileType::ForestGrass
+            ),
+            "кролик появился не на траве: {:?}",
+            tile
+        );
+        assert_eq!(rabbit.hp, 40.0);
+        assert_eq!(rabbit.kind.max_hp(), 40.0);
+    }
+}
+
 /// Генерация даёт яблоням запас плодов 4–10.
 #[test]
 fn generated_apple_trees_have_four_to_ten_fruits() {

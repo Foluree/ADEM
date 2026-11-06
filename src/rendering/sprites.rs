@@ -110,6 +110,11 @@ pub(crate) const OUTLINE_THICKNESS_PX: f32 = 0.33;
 /// зверя длиной примерно в тайл, сопоставимо с игроком.
 pub(crate) const WOLF_SPRITE_PX: f32 = TILE_SIZE * 2.0;
 
+/// Размер спрайта кролика в пикселях мира. Текстура 128×128, но рисунок
+/// заметно меньше волчьего (~25×24 px): при кваде в два тайла кролик
+/// выглядит примерно вдвое уже волка.
+pub(crate) const RABBIT_SPRITE_PX: f32 = TILE_SIZE * 2.0;
+
 /// Размер спрайта игрока в пикселях мира (текстура 256×256 масштабируется
 /// до тайла; объекты масштабируются отдельно — см. `object_sprite_size`).
 const PLAYER_SPRITE_PX: f32 = TILE_SIZE;
@@ -799,6 +804,7 @@ pub(crate) fn entity_sprite_size(kind: EntityKind) -> Vec2 {
         // Человек временно рисуется текстурой игрока (решение автора):
         // квадрат в один тайл, как раньше был спрайт игрока.
         EntityKind::Human => Vec2::splat(PLAYER_SPRITE_PX),
+        EntityKind::Rabbit => Vec2::splat(RABBIT_SPRITE_PX),
     }
 }
 
