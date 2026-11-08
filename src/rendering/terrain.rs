@@ -9,12 +9,16 @@
 //! спавнит `sprites.rs`; здесь блоки только собираются и перестраиваются.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
 use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::reflect::TypePath;
+use bevy::render::render_resource::{AsBindGroup, Extent3d, TextureDimension, TextureFormat};
+use bevy::shader::ShaderRef;
 
 use crate::app::camera::WorldCamera;
 use crate::app::state::GameState;
@@ -65,6 +69,23 @@ const BUILD_BLOCKS_MAX: usize = 32;
 /// Запас вокруг видимой области, в тайлах (деревья выступают за свой тайл).
 const VIEW_MARGIN_TILES: f32 = 10.0;
 
+const TERRAIN_LENS_SHADER_PATH: &str = "shaders/terrain_lens.wesl";
+
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+pub(crate) struct TerrainLensExtension {}
+
+impl MaterialExtension for TerrainLensExtension {
+    fn fragment_shader() -> ShaderRef {
+        TERRAIN_LENS_SHADER_PATH.into()
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+}
+
+pub(crate) type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainLensExtension>;
+
 /// Построенный terrain-блок: сущность и её меш (если в блоке есть тайлы).
 pub(crate) struct BuiltBlock {
     pub(crate) entity: Entity,
@@ -83,13 +104,15 @@ pub(crate) struct BlockPos {
 /// Состояние рендера мира: материал, активные блоки и переход LOD.
 #[derive(Resource, Default)]
 pub(crate) struct TerrainRender {
-    pub(crate) material: Option<Handle<StandardMaterial>>,
+    pub(crate) material: Option<Handle<TerrainMaterial>>,
     /// Готовая сцена текущего LOD: видимые блоки.
     pub(crate) active: HashMap<BlockPos, BuiltBlock>,
     /// Строящаяся сцена нового LOD; активная остаётся на экране до её готовности.
     pub(crate) incoming: Option<IncomingLod>,
     pub(crate) blocks_per_side: i32,
     pub(crate) lod: u32,
+    /// Множитель цвета terrain-тайлов по чанкам, задаваемый линзами.
+    pub(crate) lens_tints: Arc<HashMap<ChunkPos, [f32; 4]>>,
 }
 
 /// Сцена нового LOD, достраивающаяся на фоне активной.
@@ -128,7 +151,7 @@ pub(crate) fn ensure_ground_material(
     mut render: ResMut<TerrainRender>,
     textures: Res<TileTextures>,
     mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
 ) {
     if render.material.is_some() {
         return;
@@ -138,11 +161,14 @@ pub(crate) fn ensure_ground_material(
     };
 
     let atlas = images.add(atlas);
-    render.material = Some(materials.add(StandardMaterial {
-        base_color_texture: Some(atlas),
-        alpha_mode: AlphaMode::Opaque,
-        unlit: true,
-        ..default()
+    render.material = Some(materials.add(ExtendedMaterial {
+        base: StandardMaterial {
+            base_color_texture: Some(atlas),
+            alpha_mode: AlphaMode::Opaque,
+            unlit: true,
+            ..default()
+        },
+        extension: TerrainLensExtension {},
     }));
 }
 
@@ -237,6 +263,7 @@ pub(crate) fn render_world(
     mut metrics: ResMut<RenderMetrics>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    terrain_materials: Res<Assets<TerrainMaterial>>,
     mut sprite_assets: ResMut<super::sprites::WorldSpriteAssets>,
     images: Res<Assets<Image>>,
     textures: Res<TileTextures>,
@@ -269,20 +296,24 @@ pub(crate) fn render_world(
     let Some(material) = render.material.clone() else {
         return;
     };
+    if terrain_materials.get(&material).is_none() {
+        return;
+    }
     let Ok((camera, camera_transform, projection)) = camera.single() else {
         return;
     };
     let Projection::Orthographic(ortho) = projection else {
         return;
     };
+    let lens_tints = Arc::clone(&render.lens_tints);
     // Точечная перестройка terrain-блоков (инструменты редактора, добыча
     // травы, растительность): блок пересобирается целиком, вместе с
     // дочерними объектами.
     if !dirty.terrain.is_empty() {
         rebuild_dirty_blocks(
             &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world,
-            &material, camera_transform.rotation, &textures, &font, &dirty.terrain, &mut render,
-            &mut metrics,
+            &material, camera_transform.rotation, &textures, &font,
+            &dirty.terrain, &mut render, &mut metrics, &lens_tints,
         );
     }
     // Объекты и предметы (декор) не меняют геометрию меша: достаточно
@@ -324,7 +355,8 @@ pub(crate) fn render_world(
     });
     let visible_set: HashSet<BlockPos> = visible.iter().copied().collect();
 
-    let lod = lod_for_scale(ortho.scale);
+    let lenses_enabled = state.lenses.sentients || state.lenses.buildings;
+    let lod = lod_for_scale(ortho.scale).min(if lenses_enabled { 4 } else { MAX_LOD });
 
     // Управление переходом: активная сцена остаётся на экране, пока строится новая.
     match lod_transition_for(lod, render.lod, render.incoming.as_ref().map(|inc| inc.lod)) {
@@ -385,7 +417,8 @@ pub(crate) fn render_world(
             }
             let built = build_block(
                 &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world,
-                &material, camera_transform.rotation, &textures, &font, &mut metrics, block, lod,
+                &material, camera_transform.rotation, &textures, &font,
+                &mut metrics, block, lod, &lens_tints,
             );
             render.active.insert(block, built);
             built_now += 1;
@@ -413,8 +446,10 @@ pub(crate) fn render_world(
                 continue;
             }
             let built = build_block(
-                &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images, world, &material,
+                &mut commands, &mut meshes, &mut materials, &mut sprite_assets, &images,
+                world, &material,
                 camera_transform.rotation, &textures, &font, &mut metrics, block, incoming_lod,
+                &lens_tints,
             );
             commands.entity(built.entity).insert(Visibility::Hidden);
             blocks.insert(block, built);
@@ -502,13 +537,14 @@ fn rebuild_dirty_blocks(
     sprite_assets: &mut super::sprites::WorldSpriteAssets,
     images: &Assets<Image>,
     world: &World,
-    material: &Handle<StandardMaterial>,
+    material: &Handle<TerrainMaterial>,
     camera_rotation: Quat,
     textures: &TileTextures,
     font: &Res<UiFont>,
     dirty: &[TilePos],
     render: &mut TerrainRender,
     metrics: &mut RenderMetrics,
+    lens_tints: &HashMap<ChunkPos, [f32; 4]>,
 ) {
     let mut blocks: HashSet<BlockPos> = HashSet::with_capacity(dirty.len());
     for tile in dirty {
@@ -537,7 +573,9 @@ fn rebuild_dirty_blocks(
         if let Some(block) = render.active.remove(&pos) {
             despawn_block(commands, meshes, block);
             let built = build_block(
-                commands, meshes, materials, sprite_assets, images, world, material, camera_rotation, textures, font, metrics, pos, render.lod,
+                commands, meshes, materials, sprite_assets, images, world, material,
+                camera_rotation, textures, font, metrics, pos, render.lod,
+                lens_tints,
             );
             render.active.insert(pos, built);
             metrics.rebuilds += 1;
@@ -557,7 +595,9 @@ fn rebuild_dirty_blocks(
                 despawn_block(commands, meshes, block);
                 let built =
                     build_block(
-                        commands, meshes, materials, sprite_assets, images, world, material, camera_rotation, textures, font, metrics, pos, lod,
+                        commands, meshes, materials, sprite_assets, images, world,
+                        material, camera_rotation, textures, font, metrics, pos, lod,
+                        lens_tints,
                     );
                 commands.entity(built.entity).insert(Visibility::Hidden);
                 incoming.blocks.insert(pos, built);
@@ -657,16 +697,22 @@ fn build_block(
     sprite_assets: &mut super::sprites::WorldSpriteAssets,
     images: &Assets<Image>,
     world: &World,
-    material: &Handle<StandardMaterial>,
+    material: &Handle<TerrainMaterial>,
     camera_rotation: Quat,
     textures: &TileTextures,
     font: &Res<UiFont>,
     metrics: &mut RenderMetrics,
     block: BlockPos,
     lod: u32,
+    lens_tints: &HashMap<ChunkPos, [f32; 4]>,
 ) -> BuiltBlock {
     let started = std::time::Instant::now();
-    let mesh = build_block_mesh(world, block, lod).map(|mesh| meshes.add(mesh));
+    let mesh = build_block_mesh(world, block, lod).map(|mut mesh| {
+        if lod <= 4 && block_has_lens_tint(block, lens_tints) {
+            set_block_lens_colors(&mut mesh, block, lens_tints);
+        }
+        meshes.add(mesh)
+    });
     metrics.mesh_build_ms += started.elapsed().as_secs_f32() * 1000.0;
     let origin = block_origin(block);
 
@@ -698,11 +744,25 @@ fn build_block(
     }
 }
 
+fn block_has_lens_tint(block: BlockPos, tints: &HashMap<ChunkPos, [f32; 4]>) -> bool {
+    let chunks_per_block = BLOCK_TILES / CHUNK_SIZE as i32;
+    let chunk_x0 = (block.x * BLOCK_TILES).div_euclid(CHUNK_SIZE as i32);
+    let chunk_y0 = (block.y * BLOCK_TILES).div_euclid(CHUNK_SIZE as i32);
+    (0..chunks_per_block).any(|y| {
+        (0..chunks_per_block).any(|x| {
+            tints.contains_key(&ChunkPos {
+                x: (chunk_x0 + x) as u32,
+                y: (chunk_y0 + y) as u32,
+            })
+        })
+    })
+}
+
 fn build_fallback_block(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     world: &World,
-    material: &Handle<StandardMaterial>,
+    material: &Handle<TerrainMaterial>,
     block: BlockPos,
 ) -> BuiltBlock {
     let mesh = build_fallback_block_mesh(world, block).map(|mesh| meshes.add(mesh));
@@ -763,6 +823,7 @@ fn build_fallback_block_mesh(world: &World, block: BlockPos) -> Option<Mesh> {
         RenderAssetUsages::RENDER_WORLD,
     );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, points.to_vec());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[1.0; 4]; points.len()]);
     mesh.insert_attribute(
         Mesh::ATTRIBUTE_UV_0,
         atlas_uv_coordinates(index).to_vec(),
@@ -1026,15 +1087,58 @@ pub(crate) fn build_block_mesh(world: &World, block: BlockPos, lod: u32) -> Opti
 
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
-        RenderAssetUsages::RENDER_WORLD,
+        // Линзы переокрашивают вершины после extraction, поэтому terrain
+        // сохраняет атрибуты в MainWorld до удаления блока.
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
+    let vertex_count = positions.len();
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[1.0; 4]; vertex_count]);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(indices));
     // Нормали не считаем: материал terrain unlit, освещение по нормалям
     // не считается, а без атрибута Bevy не включает VERTEX_NORMALS в шейдере.
     // Это ~2/3 стоимости сборки меша (профиль: compute_normals был 1.38%).
     Some(mesh)
+}
+
+/// Обновляет только цвета terrain-квадов, не меняя геометрию, UV или
+/// глубину. При включённых линзах LOD не выше размера чанка, поэтому каждый
+/// квад полностью принадлежит ровно одному чанку.
+pub(crate) fn set_block_lens_colors(
+    mesh: &mut Mesh,
+    block: BlockPos,
+    tints: &HashMap<ChunkPos, [f32; 4]>,
+) {
+    let positions = mesh
+        .attribute(Mesh::ATTRIBUTE_POSITION)
+        .and_then(|attribute| attribute.as_float3())
+        .expect("terrain mesh has float3 positions");
+    assert_eq!(positions.len() % 4, 0, "terrain mesh consists of quads");
+    let block_x = (block.x * BLOCK_TILES) as f32;
+    let block_y = (block.y * BLOCK_TILES) as f32;
+    let mut colors = Vec::with_capacity(positions.len());
+    for quad in positions.chunks_exact(4) {
+        let center_x = quad.iter().map(|point| point[0]).sum::<f32>()
+            / (4.0 * WORLD_TILE_SIZE)
+            + block_x
+            + 1e-4;
+        let center_y = quad.iter().map(|point| point[1]).sum::<f32>()
+            / (4.0 * WORLD_TILE_SIZE)
+            + block_y
+            + 1e-4;
+        let tile = TilePos {
+            x: center_x.floor() as i32,
+            y: center_y.floor() as i32,
+        };
+        let chunk = ChunkPos {
+            x: tile.x.div_euclid(CHUNK_SIZE as i32) as u32,
+            y: tile.y.div_euclid(CHUNK_SIZE as i32) as u32,
+        };
+        let color = tints.get(&chunk).copied().unwrap_or([1.0; 4]);
+        colors.extend([color; 4]);
+    }
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
 }
 
 fn atlas_uv_coordinates(index: u8) -> [[f32; 2]; 4] {

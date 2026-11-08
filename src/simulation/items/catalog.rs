@@ -7,7 +7,7 @@ use crate::simulation::tile::ResourceKind;
 use super::{BodySlot, ItemClass, MAX_STACK};
 
 /// Число видов предметов (иконки UI, текстуры, массивы отображения).
-pub const ITEM_KIND_COUNT: usize = 90;
+pub const ITEM_KIND_COUNT: usize = 91;
 
 /// Вид предмета. Значения — стабильные идентификаторы (repr(u8));
 /// новые виды добавляются только в конец, чтобы не сдвигать существующие.
@@ -194,6 +194,8 @@ pub enum ItemKind {
     Coal,
     /// Древесный уголь (топливо печи).
     Charcoal,
+    /// Факел (крафтится жаркой палки в костре).
+    Torch,
 }
 
 impl ItemKind {
@@ -289,6 +291,7 @@ impl ItemKind {
         ItemKind::Cherry,
         ItemKind::Coal,
         ItemKind::Charcoal,
+        ItemKind::Torch,
     ];
 
     /// Вид предмета по стабильному значению u8 (сохранения).
@@ -385,6 +388,7 @@ impl ItemKind {
             87 => Some(Self::Cherry),
             88 => Some(Self::Coal),
             89 => Some(Self::Charcoal),
+            90 => Some(Self::Torch),
             _ => None,
         }
     }
@@ -482,6 +486,7 @@ impl ItemKind {
             ItemKind::Cherry => "cherry",
             ItemKind::Coal => "coal",
             ItemKind::Charcoal => "charcoal",
+            ItemKind::Torch => "torch",
         }
     }
 
@@ -591,7 +596,8 @@ impl ItemKind {
             | ItemKind::BeetrootRoasted
             | ItemKind::Cherry
             | ItemKind::Coal
-            | ItemKind::Charcoal => ItemClass::Misc,
+            | ItemKind::Charcoal
+            | ItemKind::Torch => ItemClass::Misc,
             ItemKind::HelmetChainmail => ItemClass::Armor(BodySlot::Head),
             ItemKind::ChestplateChainmail => ItemClass::Armor(BodySlot::Chest),
             ItemKind::LeggingsChainmail => ItemClass::Armor(BodySlot::Legs),
@@ -694,7 +700,8 @@ impl ItemKind {
             | ItemKind::BeetrootRoasted
             | ItemKind::Cherry
             | ItemKind::Coal
-            | ItemKind::Charcoal => MAX_STACK,
+            | ItemKind::Charcoal
+            | ItemKind::Torch => MAX_STACK,
         }
     }
 

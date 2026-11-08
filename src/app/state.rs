@@ -273,6 +273,9 @@ impl GameState {
     /// (`None` — наблюдатель). Единственная точка смены режима.
     /// Захват всегда начинается под полным контролем: ИИ выключен.
     pub fn set_controlled(&mut self, id: Option<u64>) {
+        if id.is_some() {
+            self.selected_tool = None;
+        }
         self.controlled = id;
         self.controlled_ai = false;
         self.mode = if id.is_some() {

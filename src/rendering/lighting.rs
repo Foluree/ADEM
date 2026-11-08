@@ -18,9 +18,9 @@ use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d};
 
 use crate::app::settings::Settings;
-use crate::app::state::{ClockRes, GameState};
+use crate::app::state::{ClockRes, GameMode, GameState};
 use crate::rendering::isometric::{WORLD_TILE_SIZE, world_position};
-use crate::simulation::{BuildingKind, ChunkPos, ObjectKind, TilePos, World, CHUNK_SIZE};
+use crate::simulation::{BuildingKind, ChunkPos, ItemKind, ObjectKind, TilePos, World, WorldPos, CHUNK_SIZE};
 
 /// Светлота мира глухой ночью как доля дневной освещённости.
 pub(crate) const NIGHT_DAYLIGHT: f32 = 0.08;
@@ -30,6 +30,13 @@ pub(crate) const LIGHT_RADIUS_TILES: f32 = 5.0;
 
 /// Радиус света в мировых пикселях.
 const LIGHT_RADIUS_PX: f32 = LIGHT_RADIUS_TILES * WORLD_TILE_SIZE;
+/// Радиус света факела в тайлах.
+const TORCH_LIGHT_RADIUS_TILES: f32 = 2.5;
+const TORCH_LIGHT_RADIUS_PX: f32 = TORCH_LIGHT_RADIUS_TILES * WORLD_TILE_SIZE;
+/// Сила света костра; shader нормализует силу к этому значению.
+const CAMPFIRE_LIGHT_STRENGTH: f32 = 5.0;
+/// Период обновления позиции факела, секунд.
+const TORCH_POSITION_INTERVAL_SECS: f32 = 0.05;
 
 /// Границы переходов суток в часах: рассвет 5–7, закат 18–20.
 const DAWN_START_H: f32 = 5.0;
@@ -85,6 +92,8 @@ impl Material2d for DarknessMaterial {
 #[derive(Resource, Default)]
 pub(crate) struct CampfireLights {
     positions: HashSet<TilePos>,
+    torch_position: Option<WorldPos>,
+    torch_refresh_secs: f32,
     /// Счётчик изменений реестра: оверлей тьмы по нему понимает, что набор
     /// огней изменился, не сравнивая множества каждый кадр.
     version: u64,
@@ -121,9 +130,31 @@ struct OverlayFrame {
 /// костёр — объект, но заодно проверяется и рельеф под ним). Запускается
 /// до `render_world`, который изымает dirty-тайлы.
 pub(crate) fn update_campfire_positions(
+    time: Res<Time>,
     state: Res<GameState>,
     mut lights: ResMut<CampfireLights>,
 ) {
+    let torch_position = (state.mode == GameMode::Player)
+        .then(|| state.controlled_entity())
+        .flatten()
+        .filter(|entity| {
+            entity
+                .mind
+                .as_ref()
+                .is_some_and(|mind| mind.selected_item() == Some(ItemKind::Torch))
+        })
+        .map(|entity| entity.pos);
+    lights.torch_refresh_secs -= time.delta_secs();
+    if lights.torch_position.is_some() != torch_position.is_some()
+        || lights.torch_refresh_secs <= 0.0
+    {
+        lights.torch_refresh_secs = TORCH_POSITION_INTERVAL_SECS;
+        if lights.torch_position != torch_position {
+            lights.torch_position = torch_position;
+            lights.version += 1;
+        }
+    }
+
     let Some(world) = state.world.as_ref() else {
         if !lights.positions.is_empty() {
             lights.positions.clear();
@@ -248,23 +279,38 @@ pub(crate) fn update_darkness_overlay(
     // света всё равно не дают вклада — отсекаем их до построения сетки.
     // Сортировка по X: фрагментный шейдер ищёт окно огней бинарным
     // поиском, а не перебирает все огни на каждый пиксель экрана.
-    let mut fires: Vec<Vec2> = lights
+    let mut fires: Vec<(Vec2, f32, f32)> = lights
         .positions
         .iter()
         .map(|tile| {
             let position = world_position(
                 world, Vec2::new(tile.x as f32 + 0.5, tile.y as f32 + 0.5),
             );
-            world_to_camera.transform_point3(position).truncate()
+            (
+                world_to_camera.transform_point3(position).truncate(),
+                LIGHT_RADIUS_PX,
+                CAMPFIRE_LIGHT_STRENGTH,
+            )
         })
         .filter(|fire| {
-            fire.x >= view_min.x - LIGHT_RADIUS_PX
-                && fire.x <= view_max.x + LIGHT_RADIUS_PX
-                && fire.y >= view_min.y - LIGHT_RADIUS_PX
-                && fire.y <= view_max.y + LIGHT_RADIUS_PX
+            fire.0.x >= view_min.x - fire.1
+                && fire.0.x <= view_max.x + fire.1
+                && fire.0.y >= view_min.y - fire.1
+                && fire.0.y <= view_max.y + fire.1
         })
         .collect();
-    fires.sort_by(|a, b| a.x.total_cmp(&b.x));
+    if let Some(position) = lights.torch_position {
+        let camera_position = world_position(world, Vec2::new(position.x, position.y));
+        let position = world_to_camera.transform_point3(camera_position).truncate();
+        if position.x >= view_min.x - TORCH_LIGHT_RADIUS_PX
+            && position.x <= view_max.x + TORCH_LIGHT_RADIUS_PX
+            && position.y >= view_min.y - TORCH_LIGHT_RADIUS_PX
+            && position.y <= view_max.y + TORCH_LIGHT_RADIUS_PX
+        {
+            fires.push((position, TORCH_LIGHT_RADIUS_PX, CAMPFIRE_LIGHT_STRENGTH));
+        }
+    }
+    fires.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
 
     let mesh = overlay
         .mesh
@@ -294,12 +340,18 @@ pub(crate) fn update_darkness_overlay(
         // Storage buffers cannot be bound with zero bytes.
         fire_buffer.extend([[0.0; 4]]);
     } else {
-        fire_buffer.extend(fires.iter().map(|fire| [fire.x, fire.y, 1.0, 0.0]));
+        fire_buffer.extend(
+            fires
+                .iter()
+                .map(|(position, radius, strength)| {
+                    [position.x, position.y, *radius, *strength]
+                }),
+        );
     }
 
     if overlay.material.is_none() {
         overlay.material = Some(materials.add(DarknessMaterial {
-            params: Vec4::new(darkness, LIGHT_RADIUS_PX, 0.0, 0.0),
+            params: Vec4::new(darkness, LIGHT_RADIUS_PX, CAMPFIRE_LIGHT_STRENGTH, 0.0),
             fire_positions,
         }));
     }
@@ -311,7 +363,7 @@ pub(crate) fn update_darkness_overlay(
     materials
         .get_mut(&material)
         .expect("darkness material asset must exist")
-        .params = Vec4::new(darkness, LIGHT_RADIUS_PX, 0.0, 0.0);
+        .params = Vec4::new(darkness, LIGHT_RADIUS_PX, CAMPFIRE_LIGHT_STRENGTH, 0.0);
 
     let transform = *camera_transform;
     match overlay.entity {

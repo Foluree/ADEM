@@ -119,6 +119,21 @@ pub(crate) const RABBIT_SPRITE_PX: f32 = TILE_SIZE * 2.0;
 /// до тайла; объекты масштабируются отдельно — см. `object_sprite_size`).
 const PLAYER_SPRITE_PX: f32 = TILE_SIZE;
 
+/// Наземные предметы рисуются заметно меньше существ и ниже относительно
+/// проекции тайла, ближе к его экранному центру.
+const GROUND_ITEM_SCALE: f32 = 0.75;
+const GROUND_ITEM_SCREEN_OFFSET: f32 = -TILE_SIZE * 0.25;
+
+fn ground_screen_vertical_offset(camera_rotation: Quat, pixels: f32) -> Vec3 {
+    let camera_up = camera_rotation * Vec3::Y;
+    let ground_up = camera_up.truncate();
+    let projected_length = ground_up.length_squared();
+    if projected_length <= f32::EPSILON {
+        return Vec3::ZERO;
+    }
+    Vec3::new(ground_up.x, ground_up.y, 0.0) * (pixels / projected_length)
+}
+
 /// Непрозрачная область рисунка в текстуре, в долях ширины/высоты
 /// (правая и нижняя границы — исключающие). Считается по альфа-каналу
 /// один раз на текстуру; из неё выводятся «ноги на землю», зона пикинга
@@ -476,10 +491,11 @@ pub(crate) fn update_item_entity_sprites(
             }
             continue;
         }
-        let pos = world_position(world, Vec2::new(entity.pos.x, entity.pos.y)) + camera_up * height;
+        let pos = world_position(world, Vec2::new(entity.pos.x, entity.pos.y))
+            + camera_up * height;
         let texture = textures.item_texture(entity.stack.kind);
         let material = world_sprite_material(texture, false, &mut sprite_assets, &mut materials);
-        let size = Vec2::splat(TILE_SIZE * 0.5);
+        let size = Vec2::splat(TILE_SIZE * 0.5 * GROUND_ITEM_SCALE);
         let mut transform = Transform::from_translation(pos)
             .with_rotation(camera_transform.rotation);
         transform.scale = Vec3::new(size.x, size.y, 1.0);
@@ -1199,11 +1215,16 @@ pub(crate) fn spawn_items(
                     let local = tile_world - origin;
                     let item_anchor = local + Vec3::Z;
                     let item_height = TILE_SIZE * 0.3;
+                    let item_offset = camera_rotation * Vec3::Y * item_height
+                        + ground_screen_vertical_offset(
+                            camera_rotation,
+                            GROUND_ITEM_SCREEN_OFFSET,
+                        );
                     let texture = textures.item_texture(stack.kind);
                     let material = world_sprite_material(texture, false, sprite_assets, materials);
-                    let item_size = Vec2::splat(TILE_SIZE * 0.6);
+                    let item_size = Vec2::splat(TILE_SIZE * 0.6 * GROUND_ITEM_SCALE);
                     let mut transform = Transform::from_translation(
-                        item_anchor + camera_rotation * Vec3::Y * item_height,
+                        item_anchor + item_offset,
                     )
                     .with_rotation(camera_rotation);
                     transform.scale = Vec3::new(item_size.x, item_size.y, 1.0);
@@ -1218,7 +1239,9 @@ pub(crate) fn spawn_items(
                         // нескольких пикселей и на экране выглядят мылом
                         // при любом зуме. 40 px с масштабом 0.1 дают тот же
                         // размер на экране, но с чёткой растеризацией.
-                        let label_anchor = local + Vec3::new(TILE_SIZE * 0.25, -TILE_SIZE * 0.25, 2.0);
+                        let label_anchor = item_anchor
+                            + item_offset
+                            + Vec3::new(TILE_SIZE * 0.25, -TILE_SIZE * 0.25, 2.0);
                         parent.spawn((
                             Text2d::new(stack.count.to_string()),
                             Visibility::Visible,
@@ -1238,4 +1261,23 @@ pub(crate) fn spawn_items(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod ground_item_tests {
+    use super::*;
+
+    #[test]
+    fn ground_item_offset_moves_down_on_screen_without_changing_height() {
+        let camera_rotation =
+            Quat::from_rotation_z(0.4) * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_6);
+        let camera_up = camera_rotation * Vec3::Y;
+        let camera_right = camera_rotation * Vec3::X;
+        let offset =
+            ground_screen_vertical_offset(camera_rotation, GROUND_ITEM_SCREEN_OFFSET);
+
+        assert!(offset.z.abs() < f32::EPSILON);
+        assert!((offset.dot(camera_up) - GROUND_ITEM_SCREEN_OFFSET).abs() < 1e-4);
+        assert!(offset.dot(camera_right).abs() < 1e-4);
+    }
 }

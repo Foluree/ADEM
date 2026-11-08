@@ -89,6 +89,7 @@
     { "id": "beetroot_roasted", "name": "Печёная свёкла" },
     { "id": "cherry", "name": "Вишня" },
     { "id": "coal", "name": "Уголь" },
-    { "id": "charcoal", "name": "Древесный уголь" }
+    { "id": "charcoal", "name": "Древесный уголь" },
+    { "id": "torch", "name": "Факел" }
   ]
 }

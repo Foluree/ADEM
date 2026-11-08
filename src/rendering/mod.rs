@@ -19,6 +19,7 @@
 //! - `combat`, `lighting`, `lenses` — боевые эффекты, оверлей тьмы, линзы карты.
 
 use bevy::prelude::*;
+use bevy::pbr::MaterialPlugin;
 use bevy::sprite_render::Material2dPlugin;
 
 use crate::app::state::SimTick;
@@ -57,7 +58,10 @@ pub struct RenderingPlugin;
 
 impl Plugin for RenderingPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(Material2dPlugin::<lighting::DarknessMaterial>::default())
+        app.add_plugins((
+            MaterialPlugin::<terrain::TerrainMaterial>::default(),
+            Material2dPlugin::<lighting::DarknessMaterial>::default(),
+        ))
             .add_systems(Startup, textures::load_tile_textures)
             .init_resource::<TerrainRender>()
             .init_resource::<RenderMetrics>()

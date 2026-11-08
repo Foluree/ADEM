@@ -32,10 +32,9 @@ fn fragment(in: DarknessInput) -> @location(0) vec4<f32> {
     let radius = material.params.y;
     var light_strength = 0.0;
 
-    // Окно поиска по X: свет с фиксированным радиусом даёт вклад только от огней, 
-    // чей центр не дальше radius по X, поэтому после бинарного поиска достаточно 
-    // идти вправо до первого огня за окном. Стоимость фрагмента зависит от числа 
-    // огней в колонке, а не от всех источников света буфера.
+    // radius — наибольший радиус источника и граница окна поиска по X.
+    // После бинарного поиска достаточно идти до первого огня за окном;
+    // стоимость фрагмента зависит от числа огней в его колонке.
     let count = arrayLength(&fire_positions);
     var i = first_fire_at_or_after(in.uv.x - radius);
     while (i < count) {
@@ -43,10 +42,10 @@ fn fragment(in: DarknessInput) -> @location(0) vec4<f32> {
         if (fire.x > in.uv.x + radius) {
             break;
         }
-        if (fire.z > 0.0) {
-            let remaining = 1.0 - distance(in.uv, fire.xy) / radius;
+        if (fire.z > 0.0 && fire.w > 0.0) {
+            let remaining = 1.0 - distance(in.uv, fire.xy) / fire.z;
             if (remaining > 0.0) {
-                light_strength = max(light_strength, remaining * remaining);
+                light_strength = max(light_strength, remaining * remaining * fire.w / material.params.z);
             }
         }
         i += 1u;
